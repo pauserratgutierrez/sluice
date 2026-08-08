@@ -1,0 +1,8 @@
+# Enforce LF line endings across the repo, regardless of each contributor's core.autocrlf.
+* text=auto eol=lf
+
+# Shell scripts must stay LF — CRLF makes them fail in Linux containers ("/bin/sh^M: bad interpreter").
+*.sh text eol=lf
+
+# Binary assets: never apply line-ending conversion.
+binary
