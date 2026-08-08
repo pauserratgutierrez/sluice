@@ -1,0 +1,87 @@
+# Sluice test-harness gateway.
+#
+# Two things here are load-bearing for Sluice and worth reading even if you
+# never use this file in production:
+#
+# 1. There is NO apikey-from-query translation. None. Sluice authenticates with
+#    `Authorization: Bearer`, because its stream is a POST whose response is
+#    text/event-stream rather than an `EventSource` or a WebSocket -- and those
+#    two browser APIs are the only reason tokens ever had to travel in URLs.
+#    The whole `apikey_from_query` / `translate_apikey_query` /
+#    `mirror_x_api_key` chain that a Supabase Realtime gateway needs simply
+#    does not exist here.
+#
+# 2. The Sluice route disables response buffering. Caddy gained content-type
+#    aware auto-flushing for text/event-stream in 2026-07-24, but
+#    `flush_interval -1` is explicit and works on every version.
+
+{
+	admin off
+	auto_https off
+	log {
+		level {$CADDY_LOG_LEVEL}
+	}
+}
+
+(cors) {
+	@preflight method OPTIONS
+	handle @preflight {
+		header {
+			Access-Control-Allow-Origin "{$CORS_ALLOWED_ORIGIN}"
+			Access-Control-Allow-Methods "GET, POST, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "{http.request.header.Access-Control-Request-Headers}"
+			Access-Control-Max-Age "3600"
+		}
+		respond 204
+	}
+	header {
+		defer
+		Access-Control-Allow-Origin "{$CORS_ALLOWED_ORIGIN}"
+		Access-Control-Expose-Headers "*"
+		# Without this, a shared cache could hand one user's stream to another.
+		# ElectricSQL hit exactly this bug.
+		Vary "Authorization"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+
+:8000 {
+	import cors
+
+	handle /auth/v1/* {
+		uri strip_prefix /auth/v1
+		reverse_proxy auth:9999
+	}
+
+	handle /rest/v1/* {
+		uri strip_prefix /rest/v1
+		reverse_proxy rest:3000
+	}
+
+	# Sluice. Long-lived SSE streams plus short control POSTs, all on the same
+	# HTTP/2 connection.
+	handle /sluice/v1/* {
+		reverse_proxy sluice:4000 {
+			# -1 disables response buffering entirely and flushes after every
+			# write. Without it (or Caddy's newer content-type detection) SSE
+			# events sit in a buffer until it fills.
+			flush_interval -1
+
+			# Keep streams alive across a config reload instead of dropping
+			# every client at once and inviting a reconnect stampede.
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	handle {
+		header Content-Type "application/json"
+		respond `{"error":"not_found"}` 404
+	}
+}

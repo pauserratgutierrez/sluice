@@ -1,0 +1,41 @@
+{
+  "name": "@pauserratgutierrez/sluice-js",
+  "version": "0.0.0",
+  "description": "Typed realtime client for Sluice: PostgreSQL row changes, broadcast and presence over one SSE connection.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pauserratgutierrez/sluice.git",
+    "directory": "packages/sluice-js"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --experimental-strip-types test/*.test.ts",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "@types/node": "^24.3.0"
+  }
+}

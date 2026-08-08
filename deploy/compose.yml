@@ -1,0 +1,228 @@
+# Sluice test harness.
+#
+# Deliberately minimal, and deliberately proves a design claim: `db` is the
+# PLAIN upstream postgres image. No custom build, no wal2json, no extensions,
+# no `_realtime` schema, no 81 migrations. Everything Sluice needs is four
+# `-c` flags, two roles and a publication.
+#
+# PostgREST is included on purpose: it is the authorization ORACLE for the
+# test suite. The invariant Sluice must satisfy is
+#
+#   a client receives a change for row R  <=>  that client could SELECT row R
+#
+# and having both in the harness makes that invariant directly testable.
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:18.4-trixie
+    container_name: sluice-db
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=8
+      -c max_wal_senders=8
+      -c max_slot_wal_keep_size=1GB
+      -c wal_sender_timeout=60s
+      -c logical_decoding_work_mem=64MB
+      -c log_min_messages=warning
+      -c log_min_duration_statement=200
+      -c password_encryption=scram-sha-256
+      -c track_commit_timestamp=on
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"
+      PGDATA: /var/lib/postgresql/data
+      # consumed by init.sql via \getenv, so secrets never land in SQL text
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?required}
+      PGRST_AUTH_PASSWORD: ${PGRST_AUTH_PASSWORD:?required}
+      SLUICE_REPL_PASSWORD: ${SLUICE_REPL_PASSWORD:?required}
+      SLUICE_AUTHZ_PASSWORD: ${SLUICE_AUTHZ_PASSWORD:?required}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [private_net]
+
+  # One-shot: applies the test fixtures after GoTrue has created auth.*.
+  fixtures:
+    image: postgres:18.4-trixie
+    container_name: sluice-fixtures
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+      auth: { condition: service_healthy }
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+    volumes:
+      - ./db/fixtures.sql:/fixtures.sql:ro
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql"]
+    networks: [private_net]
+
+  auth:
+    image: supabase/auth:v2.195.0
+    container_name: sluice-auth
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${AUTH_DB_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}?sslmode=disable
+      GOTRUE_DB_MAX_POOL_SIZE: 10
+      API_EXTERNAL_URL: ${PUBLIC_API_URL:-http://localhost:8000}/auth/v1
+      GOTRUE_SITE_URL: ${APP_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:?required}
+      GOTRUE_JWT_KEYS: ${JWT_KEYS:?required}
+      GOTRUE_JWT_EXP: ${JWT_EXP:-3600}
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_ISSUER: ${PUBLIC_API_URL:-http://localhost:8000}/auth/v1
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_LOG_LEVEL: ${GOTRUE_LOG_LEVEL:-warn}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://127.0.0.1:9999/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [private_net]
+
+  # The authorization oracle for the test suite.
+  rest:
+    image: postgrest/postgrest:v14.16
+    container_name: sluice-rest
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PGRST_SERVER_HOST: 0.0.0.0
+      PGRST_SERVER_PORT: 3000
+      # `postgrest --ready` probes the admin server, so the healthcheck below
+      # only works if it is enabled.
+      PGRST_ADMIN_SERVER_HOST: 127.0.0.1
+      PGRST_ADMIN_SERVER_PORT: 3001
+      PGRST_DB_URI: postgres://authenticator:${PGRST_AUTH_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_POOL: 10
+      PGRST_JWT_SECRET: ${JWT_JWKS:?required}
+      PGRST_LOG_LEVEL: ${PGRST_LOG_LEVEL:-warn}
+    healthcheck:
+      test: ["CMD", "postgrest", "--ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [private_net]
+
+  sluice:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sluice:dev
+    container_name: sluice
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+      auth: { condition: service_healthy }
+      fixtures: { condition: service_completed_successfully }
+    environment:
+      SLUICE_LISTEN_ADDR: 0.0.0.0:4000
+      SLUICE_PATH_PREFIX: /sluice/v1
+      SLUICE_LOG_LEVEL: ${SLUICE_LOG_LEVEL:-info}
+      SLUICE_LOG_FORMAT: ${SLUICE_LOG_FORMAT:-text}
+
+      SLUICE_DB_REPL_URL: postgres://sluice_repl:${SLUICE_REPL_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}?replication=database
+      SLUICE_DB_AUTHZ_URL: postgres://sluice_authz:${SLUICE_AUTHZ_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+
+      SLUICE_SLOT_NAME: sluice
+      SLUICE_PUBLICATION: sluice
+      SLUICE_PROTO_VERSION: "4"
+      SLUICE_STREAMING: "off"
+      SLUICE_BINARY: "false"
+      SLUICE_MESSAGES: "true"
+      SLUICE_MESSAGE_PREFIX: "sluice:"
+
+      SLUICE_JWKS_URL: http://auth:9999/.well-known/jwks.json
+      SLUICE_JWT_ALG: ES256
+      SLUICE_JWT_AUDIENCE: authenticated
+
+      SLUICE_TIER_C: allow
+      SLUICE_REPLICA_IDENTITY: warn
+      SLUICE_SNAPSHOT_ENABLED: "true"
+
+      SLUICE_CHANNELS: "room:public,notify:owner"
+      SLUICE_HEARTBEAT: 20s
+
+      SLUICE_REVOCATION_ENABLED: "true"
+      SLUICE_REVOCATION_SESSIONS_TABLE: auth.sessions
+      SLUICE_REVOCATION_USERS_TABLE: auth.users
+    healthcheck:
+      test: ["CMD", "/sluice", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks: [private_net]
+
+  gateway:
+    image: caddy:2.11.4-alpine
+    container_name: sluice-gateway
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      auth: { condition: service_healthy }
+      rest: { condition: service_healthy }
+      sluice: { condition: service_healthy }
+    environment:
+      CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-*}
+      CADDY_LOG_LEVEL: ${CADDY_LOG_LEVEL:-INFO}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    networks: [private_net, public_net]
+
+volumes:
+  db_data:
+  caddy_data:
+
+networks:
+  public_net:
+    driver: bridge
+  private_net:
+    driver: bridge
+    internal: true
