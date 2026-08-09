@@ -1,10 +1,5 @@
 # Sluice — Design Document
 
-**Status:** draft, pre-implementation
-**Version:** 0.1.0
-**Date:** 2026-08-08
-**Author:** Pau Serra Gutiérrez
-
 A sluice is a gate on a channel. It takes one flow — the PostgreSQL write-ahead log — and meters it out to each consumer, giving every subscriber exactly what it is entitled to and nothing more. That is the whole design in one word.
 
 Sluice is a realtime data-streaming server for PostgreSQL. It replaces `supabase/realtime` in a self-hosted stack, is not protocol-compatible with it, and is built from zero with no legacy layers.
@@ -399,7 +394,7 @@ Supabase's equivalent is *"Client access policies are cached for the duration of
 
 Then `P` is compiled to a Go evaluator and evaluated **against the tuple already delivered by the WAL**. Cost is nanoseconds and **zero database round trips**.
 
-Parsing uses `libpg_query` (via `pganalyze/pg_query_go`) — the real PostgreSQL parser — so the purity analysis is sound rather than regex-based. Anything outside the whitelist falls to Tier C. **Fail closed:** an unrecognised node type means Tier C, never Tier A.
+Parsing uses a **hand-written parser over a whitelisted grammar** (pure Go, no cgo / no `libpg_query`). Anything outside the whitelist falls to Tier C. **Fail closed:** an unrecognised construct means Tier C, never Tier A. Runtime cross-checks against PostgreSQL (`SLUICE_TIER_B_VERIFY`) catch residual misparses by downgrading the subscription.
 
 Tier B is what makes `DELETE` correct ([§7.4](#74-delete-and-why-sluice-is-correct-where-supabase-is-not)).
 
@@ -1529,63 +1524,37 @@ SLUICE_DIAGNOSTICS_ENABLED=true
 
 ```
 sluice/
-├── cmd/sluice/main.go              wiring, signal handling, graceful shutdown
+├── cmd/sluice/                     server wiring, startup validation, graceful shutdown
+├── cmd/keygen/                     harness secrets and ES256 API keys
+├── cmd/smoke/                      end-to-end harness validation (~36 assertions)
 ├── internal/
 │   ├── config/                     env parsing, validation, defaults
-│   ├── auth/
-│   │   ├── jwt.go                  ES256/JWKS verification, alg pinning
-│   │   ├── claims.go               tolerant of both user and apikey token shapes
-│   │   └── sessions.go             revocation registry fed by the reader
-│   ├── pg/
-│   │   ├── pool.go                 pgxpool + transaction-scoped impersonation
-│   │   ├── catalog.go              policies, grants, columns, RI, indexes (cached)
-│   │   ├── validate.go             startup validation (§19)
-│   │   ├── snapshot.go             consistent initial reads (§13)
-│   │   ├── replication.go          slot mgmt, START_REPLICATION, LSN feedback
-│   │   └── pgoutput/
-│   │       ├── messages.go         message types, TupleData, 'u'/'n'/'t'/'b'
-│   │       ├── decode.go           full v1–v4 decoder
-│   │       └── relation.go         relation cache, typed value decoding
-│   ├── authz/
-│   │   ├── predicate.go            pg_policy → combined predicate
-│   │   ├── parse.go                libpg_query wrapper, column extraction
-│   │   ├── compile.go              purity analysis + Go evaluator (Tier B)
-│   │   ├── reduce.go               constant substitution + reduction (Tier A)
-│   │   ├── probe.go                impersonated prepared-statement probe (Tier C)
-│   │   ├── lease.go                background re-evaluation of volatile predicates
-│   │   └── authorizer.go           tier selection, the public entry point
-│   ├── shape/
-│   │   ├── filter.go               grammar, parse, type-check, narrowing
-│   │   ├── shape.go                shape validation against the catalog
-│   │   └── eval.go                 in-process filter evaluation
-│   ├── registry/
-│   │   ├── index.go                relOID → column → constant → subscriptions
-│   │   └── subscription.go         subscription state, pointer-light
-│   ├── hub/
-│   │   ├── hub.go                  sharded fan-out
-│   │   ├── ring.go                 per-relation bounded ring buffer
-│   │   ├── broadcast.go
-│   │   ├── presence.go
-│   │   └── bus.go                  Bus interface; in-process impl for v1
-│   ├── transport/
-│   │   ├── sse.go                  writer, framing, heartbeat, deadlines
-│   │   ├── stream.go               stream lifecycle, bounded queue, policies
-│   │   ├── control.go              POST endpoints
-│   │   └── httperr.go              error taxonomy → JSON
-│   ├── timer/wheel.go              shared jittered timer wheel
-│   └── metrics/metrics.go          Prometheus collectors
-├── deploy/                         test harness: compose, db bootstrap, Caddy
-├── sdk/typescript/                 the client (later)
+│   ├── auth/                       JWT/JWKS verification, alg pinning, revocation
+│   ├── catalog/                    policies, grants, columns, RI, indexes (cached)
+│   ├── authz/                      three-tier authorizer, probes, leases, Tier B verify
+│   ├── expr/                       hand-written parse / analyze / fold / evaluate
+│   ├── shape/                      filter grammar, routing-key selection
+│   ├── registry/                   constant-indexed subscription index
+│   ├── pgoutput/                   logical replication decoder (owns the 'u' marker)
+│   ├── reader/                     single replication connection, LSN feedback, leader lock
+│   ├── hub/                        streams, fan-out, ring buffers, presence
+│   ├── server/                     HTTP surface, SSE, dispatch, snapshots, hooks, diagnostics
+│   ├── event/                      shared event types
+│   ├── timer/                      shared jittered wheel (one timer for every stream)
+│   └── metrics/                    Prometheus collectors
+├── deploy/                         compose harness: db bootstrap, fixtures, Caddy
+├── packages/sluice-js/             typed TypeScript client
 └── design_doc.md
 ```
 
 Rules the code follows:
 
-- **Per-connection state is pointer-light.** Integer handles into slabs rather than `map[string]*Subscriber`, because Go's GC marking cost scales with live pointer-bearing objects and a fan-out server is exactly that shape.
+- **Per-connection state is pointer-light** where it matters for fan-out (ring buffers, registry indexing), because Go's GC marking cost scales with live pointer-bearing objects.
 - **`sync.Pool` for encode buffers.**
 - **No `time.Ticker` per connection** — the shared wheel.
-- **`pglogrepl` is vendored, not imported.** It has no tagged release, one commit in 2026, and parses only v1/v2. Sluice needs v4 and needs to own that code. It is ~50 KB.
-- **`libpg_query` is the only cgo dependency.** If that becomes a problem, the fallback is to restrict Tier B to a hand-written parser for a whitelisted grammar and send everything else to Tier C — correctness is preserved either way.
+- **`pgoutput` decoding is owned in-tree.** `jackc/pglogrepl` is used for the replication protocol handshake; message decoding for the versions Sluice needs lives in `internal/pgoutput`.
+- **Pure Go, no cgo.** Tier B uses the hand-written `internal/expr` parser; anything unrecognised fails closed to Tier C. There is no `libpg_query` dependency.
+- **Horizontal scale seam (`Bus`) is designed (§22) but not built.** Single-node `hub` only.
 
 ---
 
@@ -1610,7 +1579,7 @@ The goal was to prove the design against a real database, not to ship.
 - [x] Session revocation via `auth.sessions`
 - [x] Metrics + `/diagnostics`
 - [x] Test harness: PostgreSQL 18.4, GoTrue, PostgREST, Caddy, Sluice
-- [x] End-to-end validation: 18 assertions, 0 failures
+- [x] End-to-end validation of the critical path (later expanded to 36 assertions; see v0.2)
 
 Validated end-to-end against the live harness (`cmd/smoke`):
 
@@ -1623,73 +1592,42 @@ metrics                A     no                     warn:unindexed_shape
 articles               A     yes      owner_id      warn:replica_identity_insufficient
 ```
 
-with the load-bearing assertions passing: own-rows-only delivery under Tier A,
-per-row evaluation under Tier B, **`DELETE` authorized correctly with the full old
-row**, another user's `DELETE` withheld, `unchanged: ["body"]` on an untouched
-TOASTed column, a transactional `pg_logical_emit_message` broadcast delivered and
-a rolled-back one never delivered, agreement with PostgREST as the authorization
-oracle, and an unauthorized shape refused at subscribe time.
+with the load-bearing assertions passing: own-rows-only delivery under Tier A, per-row evaluation under Tier B, **`DELETE` authorized correctly with the full old row**, another user's `DELETE` withheld, `unchanged: ["body"]` on an untouched TOASTed column, a transactional `pg_logical_emit_message` broadcast delivered and a rolled-back one never delivered, agreement with PostgREST as the authorization oracle, and an unauthorized shape refused at subscribe time. The current suite also covers snapshots, differential evaluation vs PostgreSQL, security negatives, and a small fan-out load — **36 checks, 0 failures** on a healthy harness.
 
-Two bugs were found by the tests rather than in production, which is the point of
-writing them: the expression lexer omitted `:` so no `::` cast ever tokenized, and
-`ParseText` turned `numeric 'NaN'` into a float that is not valid JSON. Startup
-validation also caught a bug in itself — `pg_has_role` needs `MEMBER`, not
-`USAGE`, to test whether a `NOINHERIT` role can `SET ROLE`.
+Two bugs were found by the tests rather than in production, which is the point of writing them: the expression lexer omitted `:` so no `::` cast ever tokenized, and `ParseText` turned `numeric 'NaN'` into a float that is not valid JSON. Startup validation also caught a bug in itself — `pg_has_role` needs `MEMBER`, not `USAGE`, to test whether a `NOINHERIT` role can `SET ROLE`.
 
 ### v0.2 — gaps closed (done)
 
-Everything listed as a v0.1 gap has been resolved, and the resolutions changed
-the design in two places worth recording.
+Everything listed as a v0.1 gap has been resolved, and the resolutions changed the design in two places worth recording.
 
-- [x] **Tier C `DELETE` is now correct.** Rather than marking it degraded, the
-      predicate is evaluated against the tuple the WAL delivered, using
-      `jsonb_populate_record` to reconstitute the row. This works even for a
-      policy containing a subquery against another table. It requires a complete
-      tuple, so it applies when `REPLICA IDENTITY FULL` is set; otherwise the
-      event is **withheld** by default (`SLUICE_DEGRADED_DELETES=withhold`), not
-      delivered, because telling a subscriber that a row they may not see was
-      deleted is the leak walrus avoided by truncating to primary keys.
-- [x] **Tier B is now verified against PostgreSQL at runtime.** The first
-      `SLUICE_TIER_B_VERIFY` (default 5) decisions on each subscription are also
-      evaluated by PostgreSQL on the same tuple and the verdicts compared. A
-      disagreement downgrades the subscription to Tier C, logs at ERROR and
-      increments `sluice_authz_downgrades_total`. This converts "trust the
-      hand-written parser" into "verify it against PostgreSQL, per policy, at
-      runtime", at a cost bounded per subscription rather than per change.
+- [x] **Tier C `DELETE` is now correct.** Rather than marking it degraded, the predicate is evaluated against the tuple the WAL delivered, using `jsonb_populate_record` to reconstitute the row. This works even for a policy containing a subquery against another table. It requires a complete tuple, so it applies when `REPLICA IDENTITY FULL` is set; otherwise the event is **withheld** by default (`SLUICE_DEGRADED_DELETES=withhold`), not delivered, because telling a subscriber that a row they may not see was deleted is the leak walrus avoided by truncating to primary keys.
+- [x] **Tier B is now verified against PostgreSQL at runtime.** The first `SLUICE_TIER_B_VERIFY` (default 5) decisions on each subscription are also evaluated by PostgreSQL on the same tuple and the verdicts compared. A disagreement downgrades the subscription to Tier C, logs at ERROR and increments `sluice_authz_downgrades_total`. This converts "trust the hand-written parser" into "verify it against PostgreSQL, per policy, at runtime", at a cost bounded per subscription rather than per change.
 - [x] `initial: "snapshot"` implemented (§13), including the gapless replay floor.
-- [x] Channel `hook` mode implemented, fail-closed, with a bounded TTL cache and
-      a short negative TTL so a blip does not become an outage.
+- [x] Channel `hook` mode implemented, fail-closed, with a bounded TTL cache and a short negative TTL so a blip does not become an outage.
 - [x] Shared jittered timer wheel replaces the per-stream ticker (§17).
-- [x] Lease refresh implemented: volatile predicates are re-evaluated on a timer
-      and revoked access drops the subscription. Without this, resolving once
-      would have meant never revoking.
+- [x] Lease refresh implemented: volatile predicates are re-evaluated on a timer and revoked access drops the subscription. Without this, resolving once would have meant never revoking.
+- [x] Typed TypeScript client (`packages/sluice-js`): shapes, channels, presence, reconnect/resume, zero runtime deps.
+- [x] Expanded smoke suite: differential expr vs PostgreSQL, security negatives, load — **36 assertions**.
 
 **Remaining gaps**, deliberate:
 
-- Tier B uses a hand-written parser over a whitelisted grammar rather than
-  `libpg_query`, keeping the binary pure Go with no cgo. Anything unrecognised
-  fails closed to Tier C, and the runtime cross-check above covers the residual
-  risk of a misparse. 105 differential evaluations against PostgreSQL currently
-  agree, with none skipped.
+- Tier B uses a hand-written parser over a whitelisted grammar rather than `libpg_query`, keeping the binary pure Go with no cgo. Anything unrecognised fails closed to Tier C, and the runtime cross-check above covers the residual risk of a misparse.
 - The `Bus` seam of §22 exists conceptually but there is no interface type yet.
-- Resurrect-and-rollback (§7.4) is still unimplemented; the synthetic-record path
-  covers the same cases at lower cost.
+- Resurrect-and-rollback (§7.4) is still unimplemented; the **synthetic-record** path (via `jsonb_populate_record`) covers Tier C `DELETE` at lower cost when the WAL tuple is complete.
 
-PostgREST is in the harness deliberately: it is the **authorization oracle**. The
-correctness invariant Sluice must satisfy is *"a client receives a change for row R if
-and only if that client could `SELECT` row R through PostgREST"*, and having both in the
-harness makes that invariant directly testable.
+PostgREST is in the harness deliberately: it is the **authorization oracle**. The correctness invariant Sluice must satisfy is *"a client receives a change for row R if and only if that client could `SELECT` row R through PostgREST"*, and having both in the harness makes that invariant directly testable.
 
-### v0.2 — hardening
+### Next — hardening (not done)
 
-- Property-based authorization tests: generate policies and shapes, assert Sluice's tier
-  decision agrees with PostgREST's visibility for every row.
+- CI: build, vet, `-race` tests, and harness smoke on every push.
+- Published, versioned container image and an SDK release (SDK is still `0.0.0`).
+- Property-based authorization tests: generate policies and shapes, assert Sluice's tier decision agrees with PostgREST's visibility for every row.
 - Resume/ring-buffer correctness under reader restarts.
-- Load harness: 10k streams, measured changes/sec by tier.
-- TypeScript SDK.
+- Larger load harness: 10k streams, measured changes/sec by tier.
 - `two_phase` and `streaming=on` exercised.
+- Operational burn-in and backup/restore / slot-lifecycle runbooks.
 
-### v0.3 — scale seams
+### Later — scale seams
 
 - `Bus` backed by NATS.
 - Multi-node with forwarded control messages.
@@ -1697,12 +1635,9 @@ harness makes that invariant directly testable.
 
 ### Deliberately deferred
 
-- Tier C `DELETE` authorization (resurrect-and-rollback / synthetic-record). Both verified
-  to work; neither fixes throughput; Tier A/B covers the cases that matter.
-- WebTransport transport. Revisit when the draft is an RFC, `webtransport-go` has flow
-  control, and a browser implements the h2 fallback.
-- Batch authorization helper functions in the database. Verified to be worth only 2–3×
-  against a 100× gap, and it would violate the zero-database-objects goal.
+- Resurrect-and-rollback for Tier C `DELETE` (synthetic-record already ships). Neither path fixes Tier C throughput; Tier A/B covers the cases that matter.
+- WebTransport transport. Revisit when the draft is an RFC, `webtransport-go` has flow control, and a browser implements the h2 fallback.
+- Batch authorization helper functions in the database. Verified to be worth only 2–3× against a 100× gap, and it would violate the zero-database-objects goal.
 
 ---
 
@@ -1731,9 +1666,7 @@ harness makes that invariant directly testable.
 
 ## Appendix B — evidence index
 
-Every non-obvious claim in this document traces to a verified source. The full research
-archive, including raw command output, lives in the `supabase-headless` repository under
-`docs/` (gitignored).
+Every non-obvious claim in this document traces to a verified source. The full research archive, including raw command output, lives in the `supabase-headless` repository under `docs/` (gitignored).
 
 | Claim | Evidence |
 | --- | --- |

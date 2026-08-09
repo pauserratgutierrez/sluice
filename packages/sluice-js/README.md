@@ -5,14 +5,16 @@ Typed realtime client for [Sluice](../../README.md). PostgreSQL row changes, eph
 Zero runtime dependencies. ESM. Works in browsers, Node ≥ 20, Deno and workers.
 
 ```bash
-npm install @pauserratgutierrez/sluice-js
+# not published yet — from packages/sluice-js:
+npm install
+npm run build
 ```
 
 ## Quick start
 
 ```ts
 import { createClient } from '@pauserratgutierrez/sluice-js'
-import type { Database } from '@gatherpeers/database-types'
+import type { Database } from './database.types' // your generated PostgREST types
 
 const sluice = createClient<Database>('https://api.example.com/sluice/v1', {
   accessToken: async () => (await supabase.auth.getSession()).data.session?.access_token,

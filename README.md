@@ -100,7 +100,7 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
   alpine:3.22 /b/smoke
 ```
 
-It signs a user up through GoTrue, opens a stream, and asserts the design's claims:
+It signs a user up through GoTrue, opens a stream, and asserts the design's claims — tier selection, RLS delivery including `DELETE`, TOAST `unchanged` markers, transactional broadcast, PostgREST agreement, snapshots, differential evaluation against PostgreSQL, security negatives, and a small fan-out load:
 
 ```
 subscription           tier  indexed  routing key   note
@@ -120,8 +120,12 @@ articles               A     yes      owner_id      warn:replica_identity_insuff
   PASS  a message emitted in a rolled-back transaction never arrives
   PASS  PostgREST sees exactly the pre-existing rows plus the ones Sluice streamed
   PASS  a shape whose predicate reduces to FALSE is refused at subscribe time
+  …
+  PASS  compiled evaluator agrees with PostgreSQL on N evaluations
+  PASS  another user's token cannot drive someone else's stream
+  …
 
-== 18 checks, 0 failures ==
+== 36 checks, 0 failures ==
 ```
 
 ## Using it from a client
@@ -218,30 +222,34 @@ End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
 
 Sluice is a working prototype with good test coverage, not production software. In rough order of importance:
 
-1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
+1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **A published, versioned image** (see below) and an SDK release.
-5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed (§22) but not built.
+4. **A published, versioned image** and an SDK release (`packages/sluice-js` is still `0.0.0`).
+5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed (design doc §22) but not built.
 6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
 
 ## Layout
 
 ```
-cmd/sluice        the server
-cmd/keygen        harness secrets and ES256 API keys
-cmd/smoke         end-to-end validation
-internal/expr     the expression engine: parse, analyze, fold, reduce, evaluate
-internal/authz    the three-tier authorization model
-internal/pgoutput the logical replication decoder (owns the 'u' marker)
-internal/reader   the single replication connection and LSN feedback
-internal/catalog  cached policies, grants, replica identity, index coverage
-internal/shape    filter grammar and routing-key selection
-internal/registry the constant-indexed subscription index
-internal/hub      streams, fan-out, ring buffers, presence
-internal/server   HTTP surface, SSE, dispatch, snapshots, hooks, diagnostics
-internal/timer    shared jittered wheel: one timer for every stream on the node
-deploy/           compose harness: db bootstrap, fixtures, Caddy
+cmd/sluice          the server
+cmd/keygen          harness secrets and ES256 API keys
+cmd/smoke           end-to-end validation (~36 assertions)
+internal/expr       the expression engine: parse, analyze, fold, reduce, evaluate
+internal/authz      the three-tier authorization model
+internal/auth       JWT/JWKS verification and session revocation
+internal/pgoutput   the logical replication decoder (owns the 'u' marker)
+internal/reader     the single replication connection and LSN feedback
+internal/catalog    cached policies, grants, replica identity, index coverage
+internal/shape      filter grammar and routing-key selection
+internal/registry   the constant-indexed subscription index
+internal/hub        streams, fan-out, ring buffers, presence
+internal/server     HTTP surface, SSE, dispatch, snapshots, hooks, diagnostics
+internal/timer      shared jittered wheel: one timer for every stream on the node
+internal/metrics    Prometheus collectors
+internal/config     env parsing and defaults
+internal/event      shared event types
+deploy/             compose harness: db bootstrap, fixtures, Caddy
 packages/sluice-js  the typed TypeScript client
 ```
 
@@ -251,7 +259,3 @@ packages/sluice-js  the typed TypeScript client
 - **`REPLICA IDENTITY USING INDEX`, not `FULL`.** A unique index on `(filter columns…, pk)` puts the columns you filter on into old tuples at ~1/15 the WAL cost and ~1/3200 the message size of `FULL`, which inlines entire TOASTed values on every update.
 - **No `LISTEN/NOTIFY`.** Identical payloads in one transaction are silently deduplicated, throughput collapses 32× at 100 idle listeners on PostgreSQL 18, and a disconnected listener misses everything permanently.
 - **Fail closed everywhere.** An unrecognised expression node means Tier C, never Tier A. A value the WAL did not carry means *unknown*, never *visible*.
-
-## Licence
-
-Not yet chosen.
