@@ -151,6 +151,31 @@ articles               A     yes      owner_id      warn:replica_identity_insuff
 
 ## Using it from a client
 
+### JavaScript / TypeScript
+
+Use [`@pauserratgutierrez/sluice-js`](packages/sluice-js/README.md) — one client, one SSE connection, typed against the same generated `Database` types as PostgREST:
+
+```ts
+import { createClient } from '@pauserratgutierrez/sluice-js'
+import type { Database } from './database.types'
+
+const sluice = createClient<Database>('https://api.example.com/sluice/v1', {
+  accessToken: async () => (await supabase.auth.getSession()).data.session?.access_token,
+})
+
+const docs = await sluice
+  .from('documents')
+  .eq('owner_id', userId)               // pins the policy column -> Tier A
+  .select('id', 'title', 'updated_at')
+  .withInitialSnapshot()
+  .on('*', ({ op, record }) => console.log(op, record?.title))
+  .subscribe()
+```
+
+Full API, filters, broadcast, presence, and reconnection: [`packages/sluice-js/README.md`](packages/sluice-js/README.md).
+
+### Wire protocol (any language)
+
 One long-lived `POST` whose response is `text/event-stream`, plus short control POSTs. Over HTTP/2 that is **one connection**, not two: the stream is one multiplexed stream and each POST is another.
 
 ```js
@@ -165,7 +190,7 @@ const res = await fetch('/sluice/v1/stream', {
     subscriptions: [
       { sub: 'docs', shape: {
           schema: 'public', table: 'documents',
-          filter: `owner_id=eq.${userId}`,     // pins the policy column -> Tier A
+          filter: `owner_id=eq.${userId}`,
           columns: ['id', 'title', 'updated_at'],
           transitions: true,
       }},

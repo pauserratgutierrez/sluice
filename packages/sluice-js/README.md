@@ -4,6 +4,8 @@ Typed realtime client for [Sluice](../../README.md). PostgreSQL row changes, eph
 
 Zero runtime dependencies. ESM. Works in browsers, Node ≥ 20, Deno and workers.
 
+For the raw HTTP/SSE contract (any language, no client library), see [Wire protocol](../../README.md#wire-protocol-any-language) in the main README.
+
 ```bash
 # not published yet — from packages/sluice-js:
 npm install
