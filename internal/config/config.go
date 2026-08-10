@@ -179,11 +179,12 @@ func Load() (*Config, error) {
 		CatalogRefresh: envDur("SLUICE_CATALOG_REFRESH", 30*time.Second),
 		TierC:          env("SLUICE_TIER_C", "allow"),
 		TierCMaxProbes: envInt("SLUICE_TIER_C_MAX_PROBES_PER_SECOND", 2000),
-		// The Tier B compiler is a hand-written parser, so the first few decisions
-		// on each subscription are cross-checked against PostgreSQL evaluating the
-		// same predicate on the same tuple. A disagreement downgrades to Tier C.
-		// Cheap (bounded per subscription) and the only real defence against a
-		// parser that thinks it understands an expression and does not.
+		// Tier B reimplements PostgreSQL's evaluation semantics in Go, so the
+		// first few decisions on each subscription are cross-checked against
+		// PostgreSQL evaluating the same predicate on the same tuple. A
+		// disagreement downgrades to Tier C. Cheap (bounded per subscription)
+		// and the only real defence against a semantic difference that parsing
+		// correctly does not rule out.
 		TierBVerify:     envInt("SLUICE_TIER_B_VERIFY", 5),
 		UnindexedMax:    envInt("SLUICE_UNINDEXED_SHAPES_MAX", 200),
 		ReplicaIdentity: env("SLUICE_REPLICA_IDENTITY", "warn"),

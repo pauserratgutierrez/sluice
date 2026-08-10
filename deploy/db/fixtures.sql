@@ -18,6 +18,28 @@
 BEGIN;
 
 -- ===========================================================================
+-- A note on how these policies are written.
+--
+-- Every policy below follows the two rules that matter for RLS performance,
+-- because the fixtures are also the regression test that Sluice classifies the
+-- recommended spelling correctly:
+--
+--   1. Per-query functions are wrapped in a scalar subquery: `(select auth.uid())`
+--      rather than `auth.uid()`. The wrapper makes the planner evaluate the call
+--      once, as an InitPlan, instead of once per scanned row -- measured at 9 ms
+--      versus 179 ms over 100,000 rows. PostgreSQL renders it back as
+--      `( SELECT auth.uid() AS uid)`, and Sluice unwraps it, so the policy still
+--      reduces to a constant at subscribe time and still resolves to Tier A.
+--
+--   2. Every policy names its roles with TO. Without it the policy applies to
+--      PUBLIC, so PostgreSQL evaluates the whole predicate for anon before
+--      discovering anon was never eligible.
+--
+-- Both are reported by /diagnostics when a policy does not follow them:
+-- `policy_function_not_wrapped` and `policy_applies_to_public`.
+-- ===========================================================================
+
+-- ===========================================================================
 -- JWT helpers.
 --
 -- GoTrue's migration 00 creates auth.uid() and auth.role() reading the LEGACY
@@ -79,18 +101,19 @@ ALTER TABLE public.documents REPLICA IDENTITY USING INDEX documents_ri;
 ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
 CREATE POLICY documents_own ON public.documents
   FOR SELECT TO authenticated
-  USING (owner_id = auth.uid());
+  USING (owner_id = (select auth.uid()));
 
 -- Write access too, so the test suite can exercise the SDK end to end as a real
 -- user rather than as a superuser. Separate per-command policies keep the SELECT
 -- policy set clean: Sluice's combined predicate only reads polcmd 'r' and '*',
 -- so a FOR ALL policy here would needlessly duplicate the read predicate.
 CREATE POLICY documents_insert ON public.documents
-  FOR INSERT TO authenticated WITH CHECK (owner_id = auth.uid());
+  FOR INSERT TO authenticated WITH CHECK (owner_id = (select auth.uid()));
 CREATE POLICY documents_update ON public.documents
-  FOR UPDATE TO authenticated USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+  FOR UPDATE TO authenticated
+  USING (owner_id = (select auth.uid())) WITH CHECK (owner_id = (select auth.uid()));
 CREATE POLICY documents_delete ON public.documents
-  FOR DELETE TO authenticated USING (owner_id = auth.uid());
+  FOR DELETE TO authenticated USING (owner_id = (select auth.uid()));
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.documents TO authenticated;
 GRANT ALL ON public.documents TO service_role;
@@ -121,10 +144,14 @@ CREATE TABLE public.posts (
 -- know a column is small, only that it is TOAST-able.
 ALTER TABLE public.posts REPLICA IDENTITY FULL;
 
+-- The policy reads owner_id, so owner_id is indexed: an unindexed policy column
+-- makes PostgreSQL filter row by row on every snapshot and every Tier C probe.
+CREATE INDEX posts_owner_id ON public.posts (owner_id);
+
 ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;
 CREATE POLICY posts_visible ON public.posts
   FOR SELECT TO authenticated
-  USING (visibility = 'public' OR owner_id = auth.uid());
+  USING (visibility = 'public' OR owner_id = (select auth.uid()));
 
 GRANT SELECT ON public.posts TO authenticated;
 GRANT ALL    ON public.posts TO service_role;
@@ -161,7 +188,7 @@ CREATE POLICY invoices_team_member ON public.invoices
   USING (EXISTS (
     SELECT 1 FROM public.memberships m
      WHERE m.team_id = invoices.team_id
-       AND m.user_id = auth.uid()));
+       AND m.user_id = (select auth.uid())));
 
 CREATE POLICY invoices_no_zero ON public.invoices
   AS RESTRICTIVE FOR SELECT TO authenticated
@@ -170,7 +197,7 @@ CREATE POLICY invoices_no_zero ON public.invoices
 ALTER TABLE public.memberships ENABLE ROW LEVEL SECURITY;
 CREATE POLICY memberships_own ON public.memberships
   FOR SELECT TO authenticated
-  USING (user_id = auth.uid());
+  USING (user_id = (select auth.uid()));
 
 GRANT SELECT ON public.invoices, public.memberships TO authenticated;
 GRANT ALL    ON public.invoices, public.memberships TO service_role;
@@ -211,10 +238,12 @@ CREATE TABLE public.articles (
 );
 -- deliberately left at REPLICA IDENTITY DEFAULT
 
+CREATE INDEX articles_owner_id ON public.articles (owner_id);
+
 ALTER TABLE public.articles ENABLE ROW LEVEL SECURITY;
 CREATE POLICY articles_own ON public.articles
   FOR SELECT TO authenticated
-  USING (owner_id = auth.uid());
+  USING (owner_id = (select auth.uid()));
 
 GRANT SELECT ON public.articles TO authenticated;
 GRANT ALL    ON public.articles TO service_role;

@@ -17,15 +17,15 @@ import (
 // Differential testing: Sluice's compiled evaluator vs PostgreSQL itself
 // ===========================================================================
 
-// Sluice compiles RLS predicates with a hand-written parser over a whitelisted
-// grammar rather than binding libpg_query, which keeps the binary pure Go. The
-// residual risk is an expression the parser THINKS it understands and evaluates
-// differently from PostgreSQL.
+// Sluice parses RLS predicates with a pure-Go port of PostgreSQL's grammar, so
+// the parse tree matches. What it does not get for free is PostgreSQL's
+// evaluation semantics, which Tier B reimplements in Go. The residual risk is an
+// expression Sluice parses correctly and then evaluates differently.
 //
 // This phase attacks that directly: the same expression is evaluated against the
 // same row by both engines and the verdicts compared. Anything that disagrees is
-// a compiler bug, and anything the parser declines is fine because it fails
-// closed to an impersonated probe.
+// a compiler bug, and anything Sluice declines is fine because it fails closed
+// to an impersonated probe.
 func phaseDifferential(ctx context.Context) {
 	fmt.Println("\n-- differential: compiled evaluator vs PostgreSQL --")
 

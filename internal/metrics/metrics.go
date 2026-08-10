@@ -66,6 +66,11 @@ var (
 		Help: "Columns delivered as unchanged-TOAST placeholders.",
 	}, []string{"schema", "table", "column"})
 
+	ChangesTruncated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_changes_truncated_total",
+		Help: "Change events trimmed to their replica identity because they exceeded SLUICE_MAX_CHANGE_BYTES.",
+	}, []string{"schema", "table"})
+
 	// ---- authorization ---------------------------------------------------
 	Subscriptions = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "sluice_subscriptions",

@@ -31,6 +31,14 @@ type FuncCall struct {
 	Schema string
 	Name   string
 	Args   []Node
+
+	// Cached is true when the call arrived wrapped in a scalar subquery --
+	// `(select auth.uid())` -- which makes PostgreSQL evaluate it once per query
+	// as an InitPlan instead of once per row. It changes nothing about how
+	// Sluice evaluates the call; it is reported in /diagnostics so an operator
+	// can be told which calls are still costing a per-row invocation inside
+	// PostgreSQL itself.
+	Cached bool
 }
 
 // Unary is a prefix operator: NOT, -, +.
@@ -93,6 +101,14 @@ func And(nodes ...Node) Node {
 		if n == nil || isTrueLiteral(n) {
 			continue
 		}
+		// A constant FALSE anywhere in a conjunction decides it. This is the
+		// relation whose permissive policy set is empty but which still carries
+		// restrictive policies: PostgreSQL shows that caller nothing, and saying
+		// so here refuses the subscription at subscribe time instead of
+		// accepting one that silently withholds every row for its whole life.
+		if IsAlwaysFalse(n) {
+			return &Literal{Value: Bool(false)}
+		}
 		out = append(out, n)
 	}
 	switch len(out) {
@@ -118,6 +134,10 @@ func Or(nodes ...Node) Node {
 		}
 		if isTrueLiteral(n) {
 			return TrueNode
+		}
+		// A permissive policy that can never match contributes nothing.
+		if IsAlwaysFalse(n) {
+			continue
 		}
 		out = append(out, n)
 	}
@@ -150,6 +170,54 @@ func IsAlwaysTrue(n Node) bool { return isTrueLiteral(n) }
 func IsAlwaysFalse(n Node) bool {
 	l, ok := n.(*Literal)
 	return ok && l.Value.Kind == KindBool && !l.Value.Bool
+}
+
+// markCached records that every function call beneath n arrived wrapped in a
+// scalar subquery -- `(select auth.uid())`.
+//
+// It changes nothing about how Sluice evaluates the call. It exists so that
+// /diagnostics can distinguish a policy written the way Supabase's RLS
+// performance guide prescribes, where PostgreSQL hoists the call into an
+// InitPlan and evaluates it once per query, from one where PostgreSQL still
+// invokes it once per row.
+func markCached(n Node) {
+	Walk(n, func(c Node) {
+		if f, ok := c.(*FuncCall); ok {
+			f.Cached = true
+		}
+	})
+}
+
+// Walk calls fn for n and every node beneath it, in pre-order.
+func Walk(n Node, fn func(Node)) {
+	if n == nil {
+		return
+	}
+	fn(n)
+	switch t := n.(type) {
+	case *CastExpr:
+		Walk(t.Arg, fn)
+	case *FuncCall:
+		for _, a := range t.Args {
+			Walk(a, fn)
+		}
+	case *Unary:
+		Walk(t.Arg, fn)
+	case *Binary:
+		Walk(t.Left, fn)
+		Walk(t.Right, fn)
+	case *IsTest:
+		Walk(t.Arg, fn)
+	case *InList:
+		Walk(t.Arg, fn)
+		for _, i := range t.Items {
+			Walk(i, fn)
+		}
+	case *ArrayExpr:
+		for _, i := range t.Items {
+			Walk(i, fn)
+		}
+	}
 }
 
 // Format renders a node back to approximate SQL. Used only for diagnostics, so

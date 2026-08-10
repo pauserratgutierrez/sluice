@@ -41,7 +41,7 @@ type Subscription struct {
 	Columns     []string // projection, already intersected with column grants
 	Transitions bool
 
-	Decision *authz.Decision
+	Decision *authz.Handle
 
 	// RoutingKey is the column this subscription is indexed by, or "" when it is
 	// unindexed and therefore scanned for every change to the relation.
@@ -290,7 +290,9 @@ func (r *Registry) Stats() Stats {
 			st.Subscriptions++
 			t := authz.TierA
 			if s.Decision != nil {
-				t = s.Decision.Tier
+				if d := s.Decision.Load(); d != nil {
+					t = d.Tier
+				}
 			}
 			st.ByTier[t]++
 			name := s.Relation.FullName()

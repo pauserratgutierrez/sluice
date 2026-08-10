@@ -62,6 +62,9 @@ type Server struct {
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
+	// authzVer is the catalog.AuthzVersion the live decisions were resolved
+	// against. See RefreshLeases.
+	authzVer atomic.Uint64
 
 	// Revocation tables, resolved to OIDs on their first Relation message so the
 	// per-change check costs an integer comparison rather than string building.
@@ -85,7 +88,7 @@ type Options struct {
 }
 
 func New(ctx context.Context, o Options) *Server {
-	return &Server{
+	s := &Server{
 		cfg: o.Config, log: o.Logger, pool: o.Pool,
 		cat: o.Catalog, authz: o.Authz,
 		reg: registry.New(), hub: o.Hub,
@@ -97,6 +100,13 @@ func New(ctx context.Context, o Options) *Server {
 		snapSem: make(chan struct{}, max(1, o.Config.SnapshotMaxConc)),
 		hooks:   newHookCache(o.Config.HookTTL, o.Config.HookTimeout),
 	}
+	if o.Catalog != nil {
+		// The catalog is loaded before the server exists, so start level with it
+		// rather than spending the first tick re-resolving against a version
+		// nothing was resolved against.
+		s.authzVer.Store(o.Catalog.AuthzVersion())
+	}
+	return s
 }
 
 // Run drives the server's background loops until the context is cancelled.
@@ -361,6 +371,11 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !st.Allow("subscribe", s.cfg.SubscribeRate) {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may issue at most %d subscribe requests per second", s.cfg.SubscribeRate))
+		return
+	}
 	results := s.applySubscriptions(r.Context(), st, id, req.Subscriptions, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
@@ -411,7 +426,8 @@ func (s *Server) applySubscriptions(
 ) []subResult {
 
 	out := make([]subResult, 0, len(specs))
-	existing := len(s.reg.StreamSubscriptions(st.StreamID())) + len(st.Channels())
+	shapes := len(s.reg.StreamSubscriptions(st.StreamID()))
+	existing := shapes + len(st.Channels())
 
 	for _, spec := range specs {
 		if spec.Sub == "" {
@@ -427,10 +443,20 @@ func (s *Server) applySubscriptions(
 
 		switch {
 		case spec.Shape != nil:
+			// Shapes are capped separately from channels: a shape costs an
+			// authorization resolution and a registry entry consulted on every
+			// change to its relation, where a channel costs a map entry.
+			if shapes >= s.cfg.MaxShapesPerStream {
+				out = append(out, subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
+					Code: "too_many_shapes", Message: fmt.Sprintf(
+						"this stream is at its limit of %d shape subscriptions", s.cfg.MaxShapesPerStream)}})
+				continue
+			}
 			res := s.subscribeShape(ctx, st, id, spec, resume)
 			out = append(out, res)
 			if res.OK {
 				existing++
+				shapes++
 			}
 		case spec.Channel != "":
 			res := s.subscribeChannel(st, id, spec)
@@ -536,7 +562,7 @@ func (s *Server) subscribeShape(
 		Filter:      filter,
 		Columns:     allowed,
 		Transitions: sp.Transitions,
-		Decision:    decision,
+		Decision:    authz.NewHandle(decision),
 		RoutingKey:  filter.RoutingKey(rel),
 	}
 
@@ -606,6 +632,18 @@ func (s *Server) subscribeShape(
 			Effect:  "the APPLICATION's own UPDATE and DELETE statements on this table are failing, not just replication",
 			Remedy:  "ALTER TABLE " + rel.FullName() + " REPLICA IDENTITY FULL; -- or recreate the index named by relreplident",
 		})
+	}
+
+	// An unindexed shape is consulted for every change to its relation, so the
+	// cost of admitting one is paid by every other subscriber to that table.
+	// Past a threshold the node stops being O(1) in subscription count, which is
+	// the property the whole design rests on.
+	if sub.RoutingKey == "" && s.reg.Stats().Unindexed >= s.cfg.UnindexedMax {
+		res.Error = &event.Error{Code: "too_many_unindexed_shapes", Message: fmt.Sprintf(
+			"this node already has %d unindexed subscriptions, the configured maximum; "+
+				"filter on an indexed column with an equality, or index the filtered column",
+			s.cfg.UnindexedMax)}
+		return res
 	}
 
 	if !s.reg.Add(sub) {
@@ -755,6 +793,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 			"subscribe to a channel before publishing to it")
 		return
 	}
+	if !st.Allow("publish", s.cfg.PublishRate) {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may publish at most %d messages per second", s.cfg.PublishRate))
+		return
+	}
 	n := s.hub.PublishBroadcast(req.Channel, cmp.Or(req.Event, "message"),
 		id.Sub, "client", "", req.Payload, req.Self, st.StreamID())
 
@@ -790,6 +833,11 @@ func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
 	if _, subscribed := st.ChannelLabel(req.Channel); !subscribed {
 		writeErr(w, http.StatusForbidden, "channel_not_subscribed",
 			"subscribe to a channel before tracking presence on it")
+		return
+	}
+	if !st.Allow("presence", s.cfg.PresenceRate) {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may send at most %d presence updates per second", s.cfg.PresenceRate))
 		return
 	}
 	key := cmp.Or(req.Key, id.Sub)
@@ -919,12 +967,27 @@ func (s *Server) scheduleCatalogRefresh() {
 // that reads another table or the clock can flip without any row or claim
 // changing, so those decisions carry a lease; stable ones do not and are only
 // re-resolved when the catalog itself moves.
+//
+// "Moves" has to mean the catalog CONTENTS, not a WAL Relation message. DROP
+// POLICY and ALTER ROLE ... NOBYPASSRLS change what a caller may see and emit no
+// Relation message at all, so refreshAt alone never fires for them -- and the
+// decisions they affect are exactly the stable Tier A and Tier B ones that carry
+// no lease. That combination made a revoked policy unenforceable on an open
+// stream for as long as it stayed open. Comparing the catalog's authorization
+// version closes it; re-resolving is pure CPU, since Resolve reads the cached
+// catalog and makes no database round trip.
 func (s *Server) RefreshLeases(ctx context.Context) {
 	now := time.Now()
+	subs := s.reg.All()
 	catalogMoved := s.refreshAt.Swap(0) != 0
+	if v := s.cat.AuthzVersion(); s.authzVer.Swap(v) != v {
+		catalogMoved = true
+		s.log.Info("authorization catalog changed; re-resolving every subscription",
+			"authz_version", v, "subscriptions", len(subs))
+	}
 
-	for _, sub := range s.reg.All() {
-		if !catalogMoved && !sub.Decision.Expired(now) {
+	for _, sub := range subs {
+		if !catalogMoved && !sub.Decision.Load().Expired(now) {
 			continue
 		}
 		st := streamOf(sub)
@@ -997,12 +1060,12 @@ func (s *Server) resolveStream(w http.ResponseWriter, r *http.Request, bodyID st
 
 func (s *Server) incSubMetric(sub *registry.Subscription) {
 	metrics.Subscriptions.WithLabelValues(sub.Relation.Schema, sub.Relation.Name,
-		string(sub.Decision.Tier), boolLabel(sub.Indexed())).Inc()
+		string(sub.Decision.Load().Tier), boolLabel(sub.Indexed())).Inc()
 }
 
 func (s *Server) decSubMetric(sub *registry.Subscription) {
 	metrics.Subscriptions.WithLabelValues(sub.Relation.Schema, sub.Relation.Name,
-		string(sub.Decision.Tier), boolLabel(sub.Indexed())).Dec()
+		string(sub.Decision.Load().Tier), boolLabel(sub.Indexed())).Dec()
 }
 
 func missingFromReplicaIdentity(rel *catalog.Relation, needed []string) []string {

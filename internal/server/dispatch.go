@@ -365,8 +365,12 @@ func (s *Server) deliver(
 
 	// Authorization. Tier A is a field read; Tier B is an in-process evaluation;
 	// only Tier C touches the database.
-	tier := sub.Decision.EffectiveTier()
-	visible, unknown := s.authz.Visible(s.ctx, sub.Decision, id, sub.Relation, authRow, authTuple)
+	//
+	// Loaded once: a refresh can publish a new decision at any tick, and every
+	// field read for this change has to belong to the same generation.
+	dec := sub.Decision.Load()
+	tier := dec.EffectiveTier()
+	visible, unknown := s.authz.Visible(s.ctx, dec, id, sub.Relation, authRow, authTuple)
 	if tier == authz.TierC {
 		metrics.TierCProbes.WithLabelValues(rel.Namespace, rel.Name).Inc()
 		if unknown {
@@ -399,6 +403,17 @@ func (s *Server) deliver(
 	oldRec, _ := project(rel, m.Old, sub.Columns)
 	for _, c := range unchangedNew {
 		metrics.ToastUnchanged.WithLabelValues(rel.Namespace, rel.Name, c).Inc()
+	}
+
+	// One enormous row must not be able to evict a stream's whole queue. Trim to
+	// the replica identity so the client still learns which row changed and can
+	// refetch it, and say so rather than delivering a silently partial record.
+	if n := s.cfg.MaxChangeBytes; n > 0 && approxSize(rec)+approxSize(oldRec) > n {
+		rec = keyOnly(rec, sub.Relation.ReplicaIdentityColumns)
+		oldRec = keyOnly(oldRec, sub.Relation.ReplicaIdentityColumns)
+		unchangedNew = nil
+		degraded = "change_too_large"
+		metrics.ChangesTruncated.WithLabelValues(rel.Namespace, rel.Name).Inc()
 	}
 
 	ch := event.Change{
@@ -533,6 +548,39 @@ func project(rel *pgoutput.Relation, t *pgoutput.Tuple, columns []string) (map[s
 		}
 	}
 	return out, unchanged
+}
+
+// approxSize estimates the encoded size of a projected row without paying for a
+// marshal on the per-change path. Only strings and raw JSON can be large enough
+// to matter, so everything else is charged a flat few bytes.
+func approxSize(rec map[string]any) int {
+	n := 0
+	for k, v := range rec {
+		n += len(k) + 4
+		switch t := v.(type) {
+		case string:
+			n += len(t)
+		case json.RawMessage:
+			n += len(t)
+		default:
+			n += 8
+		}
+	}
+	return n
+}
+
+// keyOnly reduces a projected row to the columns that identify it.
+func keyOnly(rec map[string]any, keys []string) map[string]any {
+	if rec == nil {
+		return nil
+	}
+	out := make(map[string]any, len(keys))
+	for _, k := range keys {
+		if v, ok := rec[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // jsonValue converts a PostgreSQL text datum into a JSON-native value where that

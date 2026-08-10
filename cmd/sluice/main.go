@@ -198,7 +198,11 @@ func run() error {
 			}
 			// A policy change produces no Relation message, so the periodic
 			// refresh is the only way to notice one -- and a policy change must be
-			// able to REVOKE access, not just grant it.
+			// able to REVOKE access, not just grant it. Loading it into the cache
+			// is only half of that: RefreshLeases is what acts on it, by comparing
+			// the catalog's authorization version against the one the live
+			// decisions were resolved at. So these two calls belong together, in
+			// this order.
 			if err := cat.Refresh(ctx, cfg.Publication); err != nil {
 				log.Warn("catalog refresh failed", "err", err)
 			}

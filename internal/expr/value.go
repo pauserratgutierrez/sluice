@@ -8,9 +8,10 @@
 // the old tuple, so there is nothing to look up in a table the row has already
 // left.
 //
-// The grammar is deliberately a subset of PostgreSQL's. Anything outside it is
-// reported as unsupported and the caller falls back to an impersonated probe
-// (Tier C). Failing closed is the only acceptable direction here.
+// Parsing accepts all of PostgreSQL's expression grammar; what is deliberately a
+// subset is the set of constructs Sluice will *evaluate*. Anything outside that
+// set is reported as unsupported and the caller falls back to an impersonated
+// probe (Tier C). Failing closed is the only acceptable direction here.
 package expr
 
 import (
@@ -171,7 +172,7 @@ func normalizeType(t string) string {
 		return "float8"
 	case "decimal":
 		return "numeric"
-	case "character varying", "varchar", "character", "char", "citext", "name":
+	case "character varying", "varchar", "character", "char", "bpchar", "citext", "name":
 		return "text"
 	case "timestamp with time zone", "timestamptz":
 		return "timestamptz"

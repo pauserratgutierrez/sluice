@@ -6,6 +6,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pglogrepl v0.0.0-20260401131349-e37c41485510
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/pgplex/pgparser v0.2.0
 	github.com/prometheus/client_golang v1.23.2
 )
 

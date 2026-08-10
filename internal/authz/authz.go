@@ -65,21 +65,64 @@ type Decision struct {
 	// for Tier C evaluation and for the Tier B cross-check.
 	PredicateSQL string
 
-	// verifyLeft counts how many more Tier B decisions to cross-check against
+	// verify is the cross-check budget and outcome. It is a property of the
+	// subscription rather than of any one resolution, so it is shared by
+	// reference across generations instead of being copied into each.
+	verify *verifyState
+}
+
+// verifyState is the mutable half of an authorization decision, kept out of
+// Decision so that Decision itself can be immutable.
+type verifyState struct {
+	// left counts how many more Tier B decisions to cross-check against
 	// PostgreSQL. See Authorizer.Visible.
-	verifyLeft atomic.Int32
+	left atomic.Int32
 	// downgraded is set when a cross-check failed and the decision was forced to
-	// Tier C. Read without a lock on the dispatch path, so it is atomic.
+	// Tier C.
 	downgraded atomic.Bool
 }
 
+// Handle is the mutable holder a subscription keeps. The Decision inside it is
+// replaced wholesale, never edited.
+//
+// Every reader is on the per-change path, and re-resolution can happen under
+// them at any tick. Publishing a new Decision by storing a pointer is what makes
+// that safe, and the safety is not only about the struct: Predicate points at a
+// freshly built expression tree, and an unsynchronised pointer write would let a
+// reader follow it into nodes whose field writes it has no guarantee of seeing.
+// The atomic store/load pair supplies the happens-before edge that publishes the
+// whole tree, and it costs the reader a plain load rather than the shared-cache-
+// line traffic an RWMutex would put on the hottest path in the system.
+type Handle struct {
+	p atomic.Pointer[Decision]
+}
+
+// NewHandle publishes an initial decision.
+//
+// Verification state is filled in when absent, so that every Decision reachable
+// through a Handle has it and the readers of EffectiveTier need no nil check on
+// the hot path.
+func NewHandle(d *Decision) *Handle {
+	if d != nil && d.verify == nil {
+		d.verify = &verifyState{}
+	}
+	h := &Handle{}
+	h.p.Store(d)
+	return h
+}
+
+// Load returns the decision currently in force. Callers deciding one change
+// should load once and use that snapshot throughout, so every field they read
+// belongs to the same generation.
+func (h *Handle) Load() *Decision { return h.p.Load() }
+
 // Downgraded reports whether a Tier B decision was demoted to Tier C because the
 // in-process evaluator disagreed with PostgreSQL.
-func (d *Decision) Downgraded() bool { return d.downgraded.Load() }
+func (d *Decision) Downgraded() bool { return d.verify.downgraded.Load() }
 
 // EffectiveTier is the tier actually in force, accounting for a downgrade.
 func (d *Decision) EffectiveTier() Tier {
-	if d.downgraded.Load() {
+	if d.verify.downgraded.Load() {
 		return TierC
 	}
 	return d.Tier
@@ -218,14 +261,22 @@ func (a *Authorizer) Resolve(
 	equalities map[string]expr.Value,
 ) (*Decision, error) {
 
-	pred, parseIssue, predSQL := rel.Predicate(id.Role)
-	d := &Decision{Predicate: pred, PredicateSQL: predSQL}
+	bypass := a.cat.BypassesRLS(id.Role)
+	pred, parseIssue, predSQL := rel.Predicate(id.Role, bypass)
+	d := &Decision{Predicate: pred, PredicateSQL: predSQL, verify: &verifyState{}}
 
 	// A role with BYPASSRLS, or a table without RLS, has nothing to evaluate.
 	if expr.IsAlwaysTrue(pred) {
 		d.Tier = TierA
 		d.Granted = true
+		// Worth distinguishing: a Tier A grant on a table that does have RLS
+		// enabled looks alarming in /diagnostics until it says why.
 		d.Reason = "no row-level security applies"
+		if bypass && rel.RLSEnabled {
+			d.Reason = fmt.Sprintf(
+				"role %q bypasses row-level security, so every row of %s is visible to it",
+				id.Role, rel.FullName())
+		}
 		return d, nil
 	}
 	if expr.IsAlwaysFalse(pred) {
@@ -279,7 +330,7 @@ func (a *Authorizer) Resolve(
 		d.Tier = TierB
 		d.Predicate = folded
 		d.NeedsLease = info.Volatile
-		d.verifyLeft.Store(a.verifySamples)
+		d.verify.left.Store(a.verifySamples)
 		if d.NeedsLease {
 			d.LeaseUntil = time.Now().Add(a.lease)
 		}
@@ -378,26 +429,26 @@ func (a *Authorizer) Visible(
 
 // crossCheck verifies the in-process evaluator against PostgreSQL itself.
 //
-// Sluice's Tier B compiler is a hand-written parser over a whitelisted subset of
-// PostgreSQL's grammar, not a binding to libpg_query. That keeps the binary pure
-// Go, and anything the parser does not recognise already fails closed to Tier C.
-// The residual risk is narrower but sharper: an expression the parser *thinks* it
-// understands but evaluates differently -- an operator precedence mistake, a
-// coercion difference.
+// Sluice parses policy text with a pure-Go port of PostgreSQL's own grammar, so
+// the shape of the tree is not in question and anything Sluice declines to
+// evaluate already fails closed to Tier C. The residual risk is narrower but
+// sharper: an expression Sluice does parse correctly and then evaluates
+// differently -- a coercion difference, a collation-dependent comparison, a
+// three-valued-logic corner.
 //
 // So for the first N changes on each Tier B subscription, the same predicate is
 // also evaluated by PostgreSQL against the same tuple and the verdicts compared.
 // A disagreement downgrades the subscription to Tier C and shouts. The cost is
 // bounded and paid once per subscription, not per change.
 func (a *Authorizer) crossCheck(ctx context.Context, d *Decision, id Identity, rel *catalog.Relation, t *Tuple, goSaid bool) {
-	if d.verifyLeft.Load() <= 0 || d.downgraded.Load() {
+	if d.verify.left.Load() <= 0 || d.verify.downgraded.Load() {
 		return
 	}
 	js, complete := t.CompleteJSON()
 	if !complete {
 		return // an incomplete tuple would make PostgreSQL and Go disagree for a legitimate reason
 	}
-	if d.verifyLeft.Add(-1) < 0 {
+	if d.verify.left.Add(-1) < 0 {
 		return
 	}
 
@@ -411,7 +462,7 @@ func (a *Authorizer) crossCheck(ctx context.Context, d *Decision, id Identity, r
 
 	// Fail closed: from here on this subscription pays for an impersonated probe
 	// per change, which is slow but correct.
-	d.downgraded.Store(true)
+	d.verify.downgraded.Store(true)
 	if a.OnDowngrade != nil {
 		a.OnDowngrade(rel, d.PredicateSQL, goSaid, pgSaid)
 	}
@@ -471,25 +522,29 @@ func (a *Authorizer) queryAs(ctx context.Context, id Identity, sql string, args 
 	return ok, nil
 }
 
-// Refresh re-evaluates a leased decision in place. Returns false when access has
-// been revoked, so the caller can drop the subscription immediately.
+// Refresh re-resolves a subscription and publishes the result. Returns false
+// when access has been revoked, so the caller can drop the subscription
+// immediately.
 //
-// The fields are copied individually rather than with `*d = *nd`: Decision holds
-// atomics, and copying those wholesale would both trip the copylocks vet check
-// and silently reset a downgrade that a cross-check had already earned.
-func (a *Authorizer) Refresh(ctx context.Context, d *Decision, rel *catalog.Relation, id Identity, equalities map[string]expr.Value) (bool, error) {
+// The new decision replaces the old one wholesale rather than being written into
+// it field by field. Readers are on the per-change path and hold no lock, so an
+// edit in place would race them -- both on the scalar fields and, more seriously,
+// on the freshly built expression tree that Predicate points at.
+//
+// Cross-check state is carried across only when the predicate is unchanged. A
+// lease renewal on the same policy text must not forget a downgrade the
+// cross-check already earned; a genuinely new predicate must not inherit a
+// verdict reached about the old one, so it starts its sampling over.
+func (a *Authorizer) Refresh(ctx context.Context, h *Handle, rel *catalog.Relation, id Identity, equalities map[string]expr.Value) (bool, error) {
 	nd, err := a.Resolve(ctx, rel, id, equalities)
 	if err != nil {
 		return false, err
 	}
-	d.Tier = nd.Tier
-	d.Granted = nd.Granted
-	d.Predicate = nd.Predicate
-	d.NeedsLease = nd.NeedsLease
-	d.LeaseUntil = nd.LeaseUntil
-	d.Reason = nd.Reason
-	d.PredicateSQL = nd.PredicateSQL
-	return !(d.EffectiveTier() == TierA && !d.Granted), nil
+	if old := h.Load(); old != nil && old.PredicateSQL == nd.PredicateSQL {
+		nd.verify = old.verify
+	}
+	h.p.Store(nd)
+	return !(nd.EffectiveTier() == TierA && !nd.Granted), nil
 }
 
 // Expired reports whether a leased decision is due for re-evaluation.

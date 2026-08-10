@@ -5,11 +5,16 @@ import (
 	"testing"
 )
 
-// Operator precedence is the sharpest risk in a hand-written parser. A mistake
-// here does not fail loudly -- it produces an expression the evaluator is happy
-// to evaluate and that quietly disagrees with PostgreSQL, which is exactly the
-// class of bug the runtime cross-check exists to catch. These tests pin the
-// behaviour so it never has to.
+// Precedence now comes from PostgreSQL's own grammar rather than from a
+// precedence table maintained here, so these cases are no longer guarding
+// against an arithmetic slip. They are kept because a mistake in this area does
+// not fail loudly: it yields an expression the evaluator is happy to evaluate
+// and that quietly disagrees with PostgreSQL, which is the one class of bug the
+// Tier B cross-check exists to catch. Pinning the behaviour means it never has
+// to.
+//
+// They also pin the conversion from PostgreSQL's tree to Sluice's, which is
+// where a precedence-equivalent mistake could still be introduced.
 func TestPrecedence(t *testing.T) {
 	cases := []struct {
 		sql  string

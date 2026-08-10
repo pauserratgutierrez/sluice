@@ -180,6 +180,10 @@ services:
 
       SLUICE_TIER_C: allow
       SLUICE_REPLICA_IDENTITY: warn
+      # Well below the 30s default. A revocation only reaches open streams on
+      # this tick, so the harness would otherwise have to sit through half a
+      # minute per revocation assertion. Production should keep the default.
+      SLUICE_CATALOG_REFRESH: ${SLUICE_CATALOG_REFRESH:-5s}
       SLUICE_SNAPSHOT_ENABLED: "true"
 
       SLUICE_CHANNELS: "room:public,notify:owner"

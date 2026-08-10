@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -55,8 +56,11 @@ type Reader struct {
 	// after a change has been queued to every interested stream or deliberately
 	// withheld. That is the backpressure mechanism: a stalled Sluice retains WAL
 	// on disk rather than losing data.
-	confirmed uint64
-	received  uint64
+	//
+	// Atomic because the reader goroutine writes them while /diagnostics,
+	// /readyz and every snapshot read them.
+	confirmed atomic.Uint64
+	received  atomic.Uint64
 
 	// currentCommit carries the enclosing transaction's LSN and timestamp down to
 	// per-row handlers.
@@ -72,8 +76,30 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, h Handler) *R
 
 // ConfirmedLSN is the position Sluice has acknowledged. Snapshots use it as their
 // replay floor, which is what closes the subscribe race without gaps.
-func (r *Reader) ConfirmedLSN() uint64 { return r.confirmed }
-func (r *Reader) ReceivedLSN() uint64  { return r.received }
+func (r *Reader) ConfirmedLSN() uint64 { return r.confirmed.Load() }
+func (r *Reader) ReceivedLSN() uint64  { return r.received.Load() }
+
+// seedConfirmed adopts the slot's persisted position as the starting point.
+//
+// Without this, confirmed is zero until the first COMMIT of the session is
+// dispatched, and everything derived from it is wrong in the meantime: the
+// snapshot replay floor, /diagnostics, and -- worst -- the standby status
+// update, which would otherwise have nothing to report but the position the
+// server last told us about. Acknowledging that would discard a backlog this
+// process has received but not yet delivered.
+func (r *Reader) seedConfirmed(ctx context.Context) {
+	var lsn pglogrepl.LSN
+	err := r.pool.QueryRow(ctx,
+		`SELECT coalesce(confirmed_flush_lsn, '0/0') FROM pg_replication_slots WHERE slot_name = $1`,
+		r.cfg.SlotName).Scan(&lsn)
+	if err != nil {
+		r.log.Warn("could not read the slot's confirmed_flush_lsn", "err", err)
+		return
+	}
+	if uint64(lsn) > r.confirmed.Load() {
+		r.confirmed.Store(uint64(lsn))
+	}
+}
 
 // EnsureSlot creates the replication slot if it does not exist.
 //
@@ -160,6 +186,8 @@ func (r *Reader) stream(ctx context.Context) error {
 		return fmt.Errorf("reader: IDENTIFY_SYSTEM: %w", err)
 	}
 
+	r.seedConfirmed(ctx)
+
 	args := []string{
 		fmt.Sprintf("proto_version '%d'", r.cfg.ProtoVersion),
 		fmt.Sprintf("publication_names '%s'", strings.ReplaceAll(r.cfg.Publication, "'", "''")),
@@ -223,8 +251,8 @@ func (r *Reader) stream(ctx context.Context) error {
 				if err != nil {
 					return fmt.Errorf("reader: parse keepalive: %w", err)
 				}
-				if uint64(ka.ServerWALEnd) > r.received {
-					r.received = uint64(ka.ServerWALEnd)
+				if uint64(ka.ServerWALEnd) > r.received.Load() {
+					r.received.Store(uint64(ka.ServerWALEnd))
 				}
 				if ka.ReplyRequested {
 					if err := r.sendStatus(ctx, conn); err != nil {
@@ -238,8 +266,8 @@ func (r *Reader) stream(ctx context.Context) error {
 				if err != nil {
 					return fmt.Errorf("reader: parse XLogData: %w", err)
 				}
-				if uint64(xld.ServerWALEnd) > r.received {
-					r.received = uint64(xld.ServerWALEnd)
+				if uint64(xld.ServerWALEnd) > r.received.Load() {
+					r.received.Store(uint64(xld.ServerWALEnd))
 				}
 				if err := r.handle(xld); err != nil {
 					return err
@@ -253,10 +281,12 @@ func (r *Reader) stream(ctx context.Context) error {
 }
 
 func (r *Reader) sendStatus(ctx context.Context, conn *pgconn.PgConn) error {
-	lsn := r.confirmed
-	if lsn == 0 {
-		lsn = r.received
-	}
+	// Only ever the confirmed position. Reporting the received position instead
+	// would tell PostgreSQL it may recycle WAL this process has read but not yet
+	// dispatched, which is precisely the data loss the permanent slot exists to
+	// prevent. Zero is a truthful answer for a reader that has confirmed
+	// nothing; it simply does not advance the slot.
+	lsn := r.confirmed.Load()
 	if err := pglogrepl.SendStandbyStatusUpdate(ctx, conn,
 		pglogrepl.StandbyStatusUpdate{WALWritePosition: pglogrepl.LSN(lsn)}); err != nil {
 		return fmt.Errorf("reader: standby status update: %w", err)
@@ -283,8 +313,8 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 		// The whole transaction has been dispatched, so it is now safe to
 		// acknowledge it. Acknowledging mid-transaction would risk losing the
 		// remainder after a crash.
-		if m.EndLSN > r.confirmed {
-			r.confirmed = m.EndLSN
+		if m.EndLSN > r.confirmed.Load() {
+			r.confirmed.Store(m.EndLSN)
 		}
 		r.currentCommit, r.currentCommitTime = 0, time.Time{}
 

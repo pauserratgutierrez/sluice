@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -162,6 +163,60 @@ func (s *Server) diagnostics() []Diagnostic {
 				continue
 			}
 			info := expr.Analyze(node, rel.Name)
+
+			// Applies to PUBLIC, i.e. to anon as well. PostgreSQL evaluates the
+			// whole predicate before discovering the caller was never eligible.
+			if len(p.Roles) == 0 {
+				out = append(out, Diagnostic{
+					Code: "policy_applies_to_public", Severity: "medium",
+					Relation: rel.FullName(), Policy: p.Name,
+					Reason: "the policy has no TO clause, so it applies to PUBLIC",
+					Impact: "every role, including anon, evaluates this predicate in full before " +
+						"being rejected, and Sluice must resolve it for anonymous subscriptions too",
+					Remedy: fmt.Sprintf(
+						"ALTER POLICY %s ON %s TO authenticated;  -- or the roles that should actually match",
+						catalog.QuoteIdent(p.Name), rel.FullName()),
+				})
+			}
+
+			// Per-query functions that are not wrapped in a scalar subquery.
+			// Sluice folds them once regardless; PostgreSQL does not, and it is
+			// PostgreSQL that runs this predicate for every snapshot, every
+			// Tier C probe and every ordinary application query.
+			if len(info.UncachedCalls) > 0 {
+				calls := make([]string, 0, len(info.UncachedCalls))
+				for _, c := range info.UncachedCalls {
+					calls = append(calls, c+"()")
+				}
+				out = append(out, Diagnostic{
+					Code: "policy_function_not_wrapped", Severity: "medium",
+					Relation: rel.FullName(), Policy: p.Name,
+					Reason: "calls " + strings.Join(calls, ", ") + " directly rather than as a scalar subquery",
+					Impact: "PostgreSQL re-invokes the function for every row it scans instead of once " +
+						"per query as an InitPlan; measured at 179 ms versus 9 ms over 100,000 rows",
+					Remedy: fmt.Sprintf(
+						"rewrite the policy wrapping each call, e.g. `(select %s)`, then "+
+							"ALTER POLICY %s ON %s USING (...);",
+						calls[0], catalog.QuoteIdent(p.Name), rel.FullName()),
+				})
+			}
+
+			// A predicate column with no index makes PostgreSQL filter row by
+			// row on every snapshot and every probe.
+			for _, col := range info.Columns {
+				if rel.IndexedColumns[col] {
+					continue
+				}
+				out = append(out, Diagnostic{
+					Code: "unindexed_policy_column", Severity: "low",
+					Relation: rel.FullName(), Policy: p.Name,
+					Reason: fmt.Sprintf("the policy reads %q, which is not the leading column of any index", col),
+					Impact: "snapshots and Tier C probes scan the table instead of seeking; " +
+						"measured at 171 ms versus under 0.1 ms over 100,000 rows",
+					Remedy: fmt.Sprintf("CREATE INDEX ON %s (%s);", rel.FullName(), catalog.QuoteIdent(col)),
+				})
+			}
+
 			if info.Compilable() {
 				continue
 			}

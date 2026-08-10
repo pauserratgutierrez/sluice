@@ -9,7 +9,10 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -96,6 +99,11 @@ func (r *Relation) InReplicaIdentity(name string) bool {
 // policies OR'd, restrictive policies AND'ed. That combination order is not
 // cosmetic -- getting it backwards would turn a restriction into a grant.
 //
+// roleBypassesRLS must come from Cache.BypassesRLS. It is a parameter rather
+// than a lookup because a Relation is a plain snapshot with no way back to the
+// cache, and passing it explicitly keeps the one caller honest about the fact
+// that this is the input that can turn a denial into a full grant.
+//
 // The second return value carries a reason when a policy could not be parsed,
 // which forces Tier C rather than silently dropping the restriction.
 //
@@ -104,8 +112,18 @@ func (r *Relation) InReplicaIdentity(name string) bool {
 // matters: it is the text handed back to PostgreSQL for Tier C evaluation and
 // for the Tier B soundness cross-check, so it must be PostgreSQL's own spelling,
 // not Sluice's approximation of it.
-func (r *Relation) Predicate(role string) (expr.Node, string, string) {
-	if !r.RLSEnabled {
+func (r *Relation) Predicate(role string, roleBypassesRLS bool) (expr.Node, string, string) {
+	// PostgreSQL's own rule, from check_enable_rls(): a relation with RLS off,
+	// or a role holding BYPASSRLS, sees every row. FORCE ROW LEVEL SECURITY
+	// does not claw that back -- it only subjects the table's OWNER to RLS.
+	//
+	// The one bypass PostgreSQL grants that Sluice does not model is the
+	// owner's: an owner of a table without FORCE also sees every row. Deciding
+	// that faithfully means expanding role membership (PostgreSQL checks
+	// has_privs_of_role, not role identity), so it is left fail-closed. In a
+	// Supabase layout the owner is `postgres`, which is a superuser and so
+	// already bypasses above.
+	if !r.RLSEnabled || roleBypassesRLS {
 		return expr.TrueNode, "", "true"
 	}
 	var permissive, restrictive []expr.Node
@@ -165,7 +183,13 @@ type Cache struct {
 	mu     sync.RWMutex
 	byOID  map[uint32]*Relation
 	byName map[string]*Relation
+	bypass map[string]bool
 	loaded time.Time
+
+	// authzFP fingerprints everything an authorization decision reads, and
+	// authzVer counts the times it changed. See AuthzVersion.
+	authzFP  [32]byte
+	authzVer uint64
 }
 
 func New(pool *pgxpool.Pool) *Cache {
@@ -173,6 +197,7 @@ func New(pool *pgxpool.Pool) *Cache {
 		pool:   pool,
 		byOID:  map[uint32]*Relation{},
 		byName: map[string]*Relation{},
+		bypass: map[string]bool{},
 	}
 }
 
@@ -254,6 +279,14 @@ JOIN pg_namespace n ON n.nspname = pt.schemaname
 JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
 WHERE pt.pubname = $1`
 
+// bypassQuery lists the roles for which RLS is not enforced at all.
+//
+// This mirrors PostgreSQL's has_bypassrls_privilege(): the attribute itself, or
+// superuser, which implies it. Deliberately NOT a membership query --
+// PostgreSQL reads rolbypassrls off the role that is current, so a role merely
+// granted membership in a BYPASSRLS role does not inherit the bypass.
+const bypassQuery = `SELECT rolname FROM pg_roles WHERE rolbypassrls OR rolsuper`
+
 const policyQuery = `
 SELECT p.polrelid::oid,
        p.polname,
@@ -267,6 +300,11 @@ WHERE p.polcmd IN ('r','*') AND p.polqual IS NOT NULL
 
 // Refresh reloads every published relation.
 func (c *Cache) Refresh(ctx context.Context, publication string) error {
+	bypass, err := c.loadBypassRoles(ctx)
+	if err != nil {
+		return err
+	}
+
 	rows, err := c.pool.Query(ctx, relationQuery, publication)
 	if err != nil {
 		return fmt.Errorf("catalog: query relations: %w", err)
@@ -346,6 +384,7 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 			} else {
 				p.Parsed = node
 			}
+			sort.Strings(p.Roles)
 			rel.Policies = append(rel.Policies, p)
 		}
 		if err := prows.Err(); err != nil {
@@ -353,10 +392,144 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 		}
 	}
 
+	for _, rel := range byOID {
+		rel.sortPolicies()
+	}
+	fp := authzFingerprint(byOID, bypass)
+
 	c.mu.Lock()
-	c.byOID, c.byName, c.loaded = byOID, byName, time.Now()
+	if fp != c.authzFP {
+		c.authzFP = fp
+		c.authzVer++
+	}
+	c.byOID, c.byName, c.bypass, c.loaded = byOID, byName, bypass, time.Now()
 	c.mu.Unlock()
 	return nil
+}
+
+// sortPolicies puts the policies in a canonical order, because neither the
+// authorization fingerprint nor PredicateSQL -- which is assembled in this
+// order -- should depend on the order pg_policy rows came back in. Unstable
+// PredicateSQL would churn the fingerprint on every refresh and re-resolve
+// every subscription for nothing.
+func (r *Relation) sortPolicies() {
+	sort.Slice(r.Policies, func(i, j int) bool { return r.Policies[i].Name < r.Policies[j].Name })
+}
+
+// AuthzVersion changes whenever anything an authorization decision reads
+// changes: RLS flags, SELECT policies, or the set of roles that bypass RLS.
+//
+// It exists because a decision is resolved once, at subscribe time, and most
+// decisions carry no lease -- a stable Tier A or Tier B predicate is re-read
+// only when the catalog moves. DROP POLICY and ALTER ROLE ... NOBYPASSRLS emit
+// no WAL Relation message, so without this the periodic refresh would load the
+// revocation into the cache and nothing would ever act on it.
+//
+// It is a counter over a content hash rather than a bump per refresh, so a
+// refresh that changed nothing costs nothing.
+func (c *Cache) AuthzVersion() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.authzVer
+}
+
+// authzFingerprint hashes exactly the inputs Predicate and Resolve read. Fields
+// are length-prefixed so that no combination of policy, role or relation names
+// can be rearranged into the same byte stream.
+func authzFingerprint(byOID map[uint32]*Relation, bypass map[string]bool) [32]byte {
+	h := sha256.New()
+	var num [8]byte
+	put := func(s string) {
+		binary.LittleEndian.PutUint64(num[:], uint64(len(s)))
+		h.Write(num[:])
+		io.WriteString(h, s)
+	}
+	putUint := func(v uint64) {
+		binary.LittleEndian.PutUint64(num[:], v)
+		h.Write(num[:])
+	}
+	putBool := func(b bool) {
+		var v byte
+		if b {
+			v = 1
+		}
+		h.Write([]byte{v})
+	}
+
+	oids := make([]uint32, 0, len(byOID))
+	for oid := range byOID {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+
+	putUint(uint64(len(oids)))
+	for _, oid := range oids {
+		rel := byOID[oid]
+		putUint(uint64(oid))
+		put(rel.Schema)
+		put(rel.Name)
+		putBool(rel.RLSEnabled)
+		putUint(uint64(len(rel.Policies)))
+		for _, p := range rel.Policies {
+			put(p.Name)
+			putBool(p.Permissive)
+			putUint(uint64(len(p.Roles)))
+			for _, r := range p.Roles {
+				put(r)
+			}
+			put(p.Using)
+		}
+	}
+
+	roles := make([]string, 0, len(bypass))
+	for r := range bypass {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	putUint(uint64(len(roles)))
+	for _, r := range roles {
+		put(r)
+	}
+
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+func (c *Cache) loadBypassRoles(ctx context.Context) (map[string]bool, error) {
+	rows, err := c.pool.Query(ctx, bypassQuery)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: query bypassrls roles: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("catalog: scan bypassrls role: %w", err)
+		}
+		out[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: iterate bypassrls roles: %w", err)
+	}
+	// A failed refresh must never widen access, so the caller keeps the previous
+	// snapshot on error rather than falling back to an empty -- or stale-open --
+	// set. An empty set here is the safe direction: every role gets its policies
+	// evaluated.
+	return out, nil
+}
+
+// BypassesRLS reports whether RLS is skipped entirely for this role, because it
+// holds BYPASSRLS or is a superuser.
+//
+// Unknown roles, and a cache that has not loaded yet, answer false: the only
+// safe default is to evaluate the policies.
+func (c *Cache) BypassesRLS(role string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.bypass[role]
 }
 
 // HasColumnPrivilege checks SELECT access for a role on specific columns.

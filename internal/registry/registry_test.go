@@ -50,7 +50,7 @@ func sub(t *testing.T, sink Sink, label, filter string) *Subscription {
 	ops, _ := shape.ParseOps(nil)
 	return &Subscription{
 		Label: label, Sink: sink, Relation: r, Ops: ops, Filter: f,
-		Decision:   &authz.Decision{Tier: authz.TierA, Granted: true},
+		Decision:   authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}),
 		RoutingKey: f.RoutingKey(r),
 	}
 }

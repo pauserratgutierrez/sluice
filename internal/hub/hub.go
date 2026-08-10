@@ -35,6 +35,7 @@ type Stream struct {
 	// channel name -> subscription label
 	mu       sync.RWMutex
 	channels map[string]string
+	buckets  map[string]*bucket
 }
 
 func (s *Stream) StreamID() string { return s.id }

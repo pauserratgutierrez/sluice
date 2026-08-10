@@ -197,6 +197,12 @@ func parseTerm(s string) (Term, error) {
 				t.Values = append(t.Values, unquote(strings.TrimSpace(item)))
 			}
 		}
+		// An empty list matches nothing, so accepting it would register a
+		// subscription that can never deliver -- almost always a client bug, and
+		// indistinguishable from a working one once it is live.
+		if len(t.Values) == 0 {
+			return Term{}, fmt.Errorf("in.() needs at least one value: %q", s)
+		}
 		// PostgREST caps this at 100; the same cap keeps a single subscription
 		// from turning into an unbounded linear scan per change.
 		if len(t.Values) > 100 {

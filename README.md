@@ -51,6 +51,27 @@ Chosen automatically at subscribe time, reported back to the client, and visible
 
 **Tier C — impersonated probe.** Subqueries, joins, volatile functions. Correct, but ~13 µs per subscriber per change. Treated as a defect to surface, not a normal mode: rate-budgeted, counted in `sluice_authz_tier_c_probes_total`, and reported at `/diagnostics` with the offending policy and a concrete rewrite. Set `SLUICE_TIER_C=deny` to refuse such subscriptions outright.
 
+## How to write policies
+
+Two rules, both from Supabase's own RLS performance guide, both of which Sluice understands and checks.
+
+**Wrap per-query calls in a scalar subquery.** `auth.uid()` is `STABLE`, so PostgreSQL re-invokes it for every row it scans. `(select auth.uid())` becomes an InitPlan evaluated once per query — 9 ms instead of 179 ms over 100,000 rows.
+
+**Give every policy a `TO` clause**, so an ineligible role is rejected before the predicate runs rather than after.
+
+```sql
+CREATE POLICY documents_own ON public.documents
+  FOR SELECT TO authenticated
+  USING (owner_id = (select auth.uid()));
+
+CREATE INDEX ON public.documents (owner_id);   -- every column a policy reads
+```
+
+PostgreSQL stores that wrapper as a subquery — `(owner_id = ( SELECT auth.uid() AS uid))` — so a naive reader would call the recommended spelling uncompilable and drop it to Tier C. Sluice unwraps FROM-less selects, in all the positions PostgreSQL emits them, and the two spellings resolve to **exactly the same tier**. A select with a `FROM` is a real subquery and still Tier C.
+
+What you have not done is reported, with a runnable statement:
+`policy_function_not_wrapped`, `policy_applies_to_public`, `unindexed_policy_column`.
+
 ## What PostgreSQL must provide
 
 That's the whole contract:
@@ -258,4 +279,5 @@ packages/sluice-js  the typed TypeScript client
 - **`proto_version = 4`, `streaming = off`, `binary = false`.** All three look arbitrary and are not. The negotiated protocol version alone changes nothing on the wire (verified: 1, 4 and 4+parallel produce byte-identical output); the *options* determine the message set. `streaming = off` means everything received is already committed, so the reader forwards immediately and holds no buffer. And `binary = true` was measured **larger** than text (112 vs 88 bytes) while requiring per-type decoders.
 - **`REPLICA IDENTITY USING INDEX`, not `FULL`.** A unique index on `(filter columns…, pk)` puts the columns you filter on into old tuples at ~1/15 the WAL cost and ~1/3200 the message size of `FULL`, which inlines entire TOASTed values on every update.
 - **No `LISTEN/NOTIFY`.** Identical payloads in one transaction are silently deduplicated, throughput collapses 32× at 100 idle listeners on PostgreSQL 18, and a disconnected listener misses everything permanently.
-- **Fail closed everywhere.** An unrecognised expression node means Tier C, never Tier A. A value the WAL did not carry means *unknown*, never *visible*.
+- **PostgreSQL's grammar, Sluice's semantics.** Policy text is parsed by [`pgplex/pgparser`](https://github.com/pgplex/pgparser), a pure-Go port of PostgreSQL's `gram.y` — no cgo, no `libpg_query`, still a static binary. Sluice does *not* maintain a grammar subset, because a missing production does not fail, it misparses: with no rule for `CURRENT_USER` a hand-written parser falls through to its identifier rule, and the resulting "column" the WAL can never supply withholds every row in silence. What Sluice does maintain is the set of parsed nodes it will evaluate, in `internal/expr/convert.go`, where a gap is structurally unrepresentable and reported by name.
+- **Fail closed everywhere.** An unrecognised expression node means Tier C, never Tier A. A value the WAL did not carry means *unknown*, never *visible*. Every operator the parser accepts is checked against the set the evaluator implements, because an operator that parses but cannot be evaluated would compile to a predicate that returns *unknown* for every row — withholding everything, silently, with nothing in `/diagnostics` to explain it.

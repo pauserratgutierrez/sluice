@@ -27,6 +27,14 @@ type Info struct {
 	// process. It is the human-readable reason shown in /diagnostics, so it is
 	// written to be actionable rather than terse.
 	Unsupported string
+
+	// UncachedCalls names the per-query functions -- auth.uid() and friends --
+	// that are NOT wrapped in a scalar subquery. Sluice evaluates them once
+	// either way; PostgreSQL does not, and re-invokes them for every row it
+	// scans whenever the policy is evaluated in the database, which is every
+	// snapshot, every Tier C probe, and every ordinary query the application
+	// makes. Reported, never a reason to refuse.
+	UncachedCalls []string
 }
 
 // Compilable reports whether the predicate can be evaluated in process, i.e.
@@ -39,7 +47,12 @@ func (i Info) Compilable() bool { return i.Unsupported == "" }
 // self-references (fine) from correlated references into another table (not
 // fine). Pass "" to accept any qualifier.
 func Analyze(n Node, relation string) Info {
-	a := &analyzer{relation: strings.ToLower(relation), cols: map[string]bool{}, quals: map[string]bool{}}
+	a := &analyzer{
+		relation: strings.ToLower(relation),
+		cols:     map[string]bool{},
+		quals:    map[string]bool{},
+		uncached: map[string]bool{},
+	}
 	a.walk(n)
 
 	info := Info{
@@ -47,6 +60,10 @@ func Analyze(n Node, relation string) Info {
 		Volatile:    a.volatile,
 		Unsupported: a.unsupported,
 	}
+	for f := range a.uncached {
+		info.UncachedCalls = append(info.UncachedCalls, f)
+	}
+	sort.Strings(info.UncachedCalls)
 	for c := range a.cols {
 		info.Columns = append(info.Columns, c)
 	}
@@ -67,6 +84,7 @@ type analyzer struct {
 	relation    string
 	cols        map[string]bool
 	quals       map[string]bool
+	uncached    map[string]bool
 	subqueries  []string
 	volatile    bool
 	unsupported string
@@ -95,6 +113,44 @@ var volatileFuncs = map[string]bool{
 	"now": true, "current_timestamp": true,
 	"statement_timestamp": true, "transaction_timestamp": true,
 	"clock_timestamp": true, "random": true,
+}
+
+// perQueryFuncs are the calls whose value is fixed for a whole query, and which
+// therefore belong inside a `(select ...)` wrapper so PostgreSQL evaluates them
+// once rather than per scanned row.
+var perQueryFuncs = map[string]bool{
+	"auth.uid": true, "auth.role": true, "auth.email": true, "auth.jwt": true,
+	"current_setting": true,
+}
+
+// evaluableBinaryOps is exactly the set evalBinary implements.
+//
+// Analyze checks against it so that an operator the parser accepts but the
+// evaluator does not is reported as Tier C. Without this check such an operator
+// compiles to a predicate that returns unknown for every row -- which withholds
+// every row, silently, with nothing in /diagnostics to explain it. Adding a case
+// to evalBinary means adding it here too.
+var evaluableBinaryOps = map[string]bool{
+	"and": true, "or": true,
+	"=": true, "<>": true, "!=": true, "<": true, "<=": true, ">": true, ">=": true,
+	"isdistinct": true, "isnotdistinct": true,
+	"~~": true, "~~*": true, "!~~": true, "!~~*": true,
+	"->": true, "->>": true,
+	"||": true,
+	"+":  true, "-": true, "*": true, "/": true, "%": true,
+}
+
+// describeOp names an operator the way an operator would recognise it.
+func describeOp(op string) string {
+	switch op {
+	case "~", "~*", "!~", "!~*":
+		return "POSIX regular-expression operator " + op
+	case "@>", "<@":
+		return "containment operator " + op
+	case "#>", "#>>":
+		return "JSON path operator " + op
+	}
+	return "operator " + op
 }
 
 func (a *analyzer) walk(n Node) {
@@ -127,6 +183,9 @@ func (a *analyzer) walk(n Node) {
 		default:
 			a.fail("calls function " + name + "(), which is not in the compilable whitelist")
 		}
+		if perQueryFuncs[name] && !t.Cached {
+			a.uncached[name] = true
+		}
 		for _, arg := range t.Args {
 			a.walk(arg)
 		}
@@ -135,6 +194,10 @@ func (a *analyzer) walk(n Node) {
 		a.walk(t.Arg)
 
 	case *Binary:
+		if !evaluableBinaryOps[t.Op] {
+			a.fail("uses the " + describeOp(t.Op) +
+				", which Sluice cannot evaluate against the WAL tuple")
+		}
 		a.walk(t.Left)
 		a.walk(t.Right)
 
@@ -226,7 +289,7 @@ func mapChildren(n Node, f func(Node) Node) Node {
 	case *CastExpr:
 		return &CastExpr{Arg: f(t.Arg), Type: t.Type}
 	case *FuncCall:
-		out := &FuncCall{Schema: t.Schema, Name: t.Name, Args: make([]Node, len(t.Args))}
+		out := &FuncCall{Schema: t.Schema, Name: t.Name, Cached: t.Cached, Args: make([]Node, len(t.Args))}
 		for i, a := range t.Args {
 			out.Args[i] = f(a)
 		}

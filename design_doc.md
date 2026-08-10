@@ -394,7 +394,13 @@ Supabase's equivalent is *"Client access policies are cached for the duration of
 
 Then `P` is compiled to a Go evaluator and evaluated **against the tuple already delivered by the WAL**. Cost is nanoseconds and **zero database round trips**.
 
-Parsing uses a **hand-written parser over a whitelisted grammar** (pure Go, no cgo / no `libpg_query`). Anything outside the whitelist falls to Tier C. **Fail closed:** an unrecognised construct means Tier C, never Tier A. Runtime cross-checks against PostgreSQL (`SLUICE_TIER_B_VERIFY`) catch residual misparses by downgrading the subscription.
+**Parsing is separated from capability.** Policy text is parsed by [`pgplex/pgparser`](https://github.com/pgplex/pgparser), a pure-Go port of PostgreSQL's own `gram.y` whose nodes map 1:1 onto `parsenodes.h`. It is not a subset: it accepts every expression PostgreSQL accepts, with PostgreSQL's operator precedence, and it needs no cgo, so the binary stays static.
+
+What remains a whitelist is the *semantic* layer — which parsed nodes Sluice is willing to evaluate itself (the list above). That decision lives in one place, `internal/expr/convert.go`, and it **fails closed**: an unrecognised node becomes a non-evaluable marker, which `Analyze` reports as non-compilable, which routes the subscription to Tier C. Never to Tier A.
+
+The distinction matters, because the two layers fail differently. A gap in a *grammar* subset can silently produce the wrong tree: with no production for `CURRENT_USER`, a hand-written parser falls through to its identifier rule and yields a column reference — the predicate looks compilable, the WAL tuple has no such column, and every row is withheld with nothing in `/diagnostics` to explain it. A gap in the *semantic* whitelist cannot do that: the construct is structurally unrepresentable and is reported by name.
+
+Runtime cross-checks against PostgreSQL (`SLUICE_TIER_B_VERIFY`) cover what is left, which is no longer misparsing but *misevaluation*: a coercion difference, a collation-dependent comparison, a three-valued-logic corner.
 
 Tier B is what makes `DELETE` correct ([§7.4](#74-delete-and-why-sluice-is-correct-where-supabase-is-not)).
 
@@ -474,6 +480,35 @@ subscribe(shape, jwt)
 ```
 
 The response tells the client which tier it got and why, and Sluice records it.
+
+### 7.6 How policies should be written, and why Sluice reads them that way
+
+Two rules govern RLS performance inside PostgreSQL, and both interact with tier resolution. Sluice implements the first and reports on both.
+
+**Wrap per-query functions in a scalar subquery.** `auth.uid()` is `STABLE`, not `IMMUTABLE`, so the planner will not hoist it out of a sequential scan on its own: it is re-invoked for every row examined. Wrapping it — `(select auth.uid())` — makes the planner treat it as an InitPlan and evaluate it once for the whole query. Supabase measured 179 ms against 9 ms over 100,000 rows, and worse for policies wrapping a `SECURITY DEFINER` function.
+
+The catch is what that does to the stored predicate. PostgreSQL keeps `pg_get_expr(polqual, polrelid)` in its own normalised spelling, and the wrapper survives as a subquery node:
+
+```
+create policy p on documents for select to authenticated
+  using (owner_id = (select auth.uid()));
+
+pg_get_expr → (owner_id = ( SELECT auth.uid() AS uid))
+```
+
+A parser that treats every `SELECT` as opaque therefore classifies the *recommended* spelling as Tier C — the one path Sluice exists to avoid — and `/diagnostics` then advises denormalising a policy that is already optimal. So the parser unwraps a **FROM-less** select into the expression it contains, in all three positions PostgreSQL emits one: scalar, `IN (select …)`, and `= ANY (select …)`, the last two of which PostgreSQL normalises to the same `IN` form. Anything with a `FROM` is still a real subquery and still Tier C, because its value is not a function of the WAL tuple and the claim set. Wrapping therefore changes nothing about the tier: `(select auth.uid())` and `auth.uid()` resolve identically, and the fixtures assert exactly that.
+
+**Name the roles with `TO`.** A policy with no `TO` clause applies to `PUBLIC`, so PostgreSQL evaluates the whole predicate for `anon` before discovering `anon` was never eligible. `TO authenticated` skips it outright. Sluice already honours `polroles` when it combines predicates (a policy that does not apply to the caller's role is not part of their predicate), so this costs nothing here — but it costs the application on every ordinary query, so it is reported.
+
+Neither rule can be enforced from outside the database, so both are surfaced as diagnostics with a runnable `ALTER POLICY`, alongside a third that comes from the same guide: an index on every column a policy reads.
+
+| Code | Fires when |
+| --- | --- |
+| `policy_function_not_wrapped` | a per-query call (`auth.*`, `current_setting`) is not inside `(select …)` |
+| `policy_applies_to_public` | the policy has no `TO` clause |
+| `unindexed_policy_column` | a column the predicate reads leads no index |
+
+These are about the cost of the policy **inside PostgreSQL** — snapshots, Tier C probes, and every query the application itself makes. They never change a tier.
 
 ---
 
@@ -1404,11 +1439,27 @@ A `relreplident = 'i'` row with `adequate = false` means somebody dropped the in
 | Client too slow | `change`: closed with `stream_lagging`. `broadcast`: dropped oldest. `presence`: coalesced. |
 | JWT expires without refresh | Stream closed with `token_expired`. |
 | Session revoked | Stream closed with `session_revoked` within milliseconds. |
-| Policy changed to deny | Detected by lease refresh or catalog poll; affected subscriptions receive `error` and are removed. |
+| Policy changed to deny | Detected on the catalog tick; affected subscriptions receive `error{code:"shape_not_authorized"}` and are removed. Bounded by `SLUICE_CATALOG_REFRESH` (default `30s`), not instant — see [§21.1](#211-revocation-is-bounded-not-instant). |
+| Role loses `BYPASSRLS` | Same path: the bypass set is part of the authorization fingerprint, so the grant it produced is withdrawn on the next tick. |
+| Column privilege revoked | **Not detected.** Checked once at subscribe time; see [§21.1](#211-revocation-is-bounded-not-instant). |
 | Table dropped from publication | Subscriptions receive `error{code:"relation_unpublished"}`. |
 | Column dropped | Projection updated; `warning{code:"schema_changed"}`. |
 | Replica-identity index dropped | Startup/`Relation` validation turns fatal — because application deletes are already failing. |
 | Caddy config reload | `stream_close_delay` keeps streams alive; clients that do reconnect use `resume`. |
+
+### 21.1 Revocation is bounded, not instant
+
+Sluice authorizes a subscription once, at subscribe time. That is the decision the whole design rests on — it is what makes cost scale with the write rate instead of the subscriber count — and it is only sound if the authorization can also be *withdrawn*.
+
+Withdrawal cannot be pushed. PostgreSQL emits no notification when a policy is created or dropped, and none when a role attribute changes; `DROP POLICY` does not even produce a `Relation` message in the WAL. So Sluice polls: on every `SLUICE_CATALOG_REFRESH` tick (default `30s`) it reloads the catalog and compares `catalog.AuthzVersion()`, a counter over a hash of exactly what an authorization decision reads — each relation's `RLSEnabled`, every SELECT policy's name, permissiveness, roles and `USING` text, and the set of roles holding `BYPASSRLS` or superuser. When that moves, every subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`.
+
+Three consequences worth stating plainly rather than discovering in production:
+
+- **A dropped policy stays enforceable-but-unenforced for up to one tick.** Lower `SLUICE_CATALOG_REFRESH` to shorten the window; the check itself is a hash comparison, so the cost of a shorter tick is the catalog query, not the re-resolution.
+- **Column privileges are outside the fingerprint.** `has_column_privilege` is not part of the catalog snapshot, so `REVOKE SELECT (col)` never reaches an open stream at all. Including it would cost a round trip per subscription per tick rather than a hash comparison, which is a different order of expense; it is deferred deliberately and reported by the audit as `column_grants_not_revocable`.
+- **Re-resolution cannot fail open.** `Resolve` does no database I/O, so it can only return `ErrDenied` or `ErrTierCDisabled`. A database blip cannot manufacture a spurious revocation, which matters because the failure path drops the subscription.
+
+This is the same shape of residual as the Tier C snapshot skew ([§7.3](#73-tier-c--impersonated-probe-compatibility-fallback)), and for the same underlying reason: there is no push notification for a catalog change any more than there is an as-of-LSN snapshot. The two differ in direction, though, and the difference matters. Revocation lag errs toward over-delivering to someone who *was* authorized moments ago, and its window is a knob you control. Skew can deliver commit-time content to someone who was *not* authorized at commit time, and its window is replication lag.
 
 ---
 
@@ -1532,7 +1583,7 @@ sluice/
 │   ├── auth/                       JWT/JWKS verification, alg pinning, revocation
 │   ├── catalog/                    policies, grants, columns, RI, indexes (cached)
 │   ├── authz/                      three-tier authorizer, probes, leases, Tier B verify
-│   ├── expr/                       hand-written parse / analyze / fold / evaluate
+│   ├── expr/                       convert (pgparser AST) / analyze / fold / evaluate
 │   ├── shape/                      filter grammar, routing-key selection
 │   ├── registry/                   constant-indexed subscription index
 │   ├── pgoutput/                   logical replication decoder (owns the 'u' marker)
@@ -1552,8 +1603,9 @@ Rules the code follows:
 - **Per-connection state is pointer-light** where it matters for fan-out (ring buffers, registry indexing), because Go's GC marking cost scales with live pointer-bearing objects.
 - **`sync.Pool` for encode buffers.**
 - **No `time.Ticker` per connection** — the shared wheel.
+- **`authz.Decision` is immutable; `authz.Handle` publishes it with `atomic.Pointer`.** Re-resolution replaces the decision wholesale and dispatch loads it once per change, so every field read belongs to one generation. Editing in place raced the dispatch path on two levels: the scalar fields tore (`Predicate` is an interface, `PredicateSQL` a string — two words each), and assigning `Predicate` published a pointer to a freshly built expression tree with no release barrier, letting a reader follow it into nodes whose writes it had no guarantee of seeing. An `RWMutex` would also close both, but it would put shared-cache-line traffic on the per-change × per-subscriber path; an atomic load is free by comparison. Cross-check state (`verifyLeft`, `downgraded`) lives outside `Decision` and is carried across generations only when `PredicateSQL` is unchanged, so a lease renewal cannot forget an earned downgrade and a genuinely new predicate cannot inherit a verdict about the old one.
 - **`pgoutput` decoding is owned in-tree.** `jackc/pglogrepl` is used for the replication protocol handshake; message decoding for the versions Sluice needs lives in `internal/pgoutput`.
-- **Pure Go, no cgo.** Tier B uses the hand-written `internal/expr` parser; anything unrecognised fails closed to Tier C. There is no `libpg_query` dependency.
+- **Pure Go, no cgo.** Policy text is parsed by `pgplex/pgparser`, a Go port of PostgreSQL's grammar; there is no `libpg_query` binding and no cgo, so the binary is static. Anything `internal/expr` declines to *evaluate* fails closed to Tier C.
 - **Horizontal scale seam (`Bus`) is designed (§22) but not built.** Single-node `hub` only.
 
 ---
@@ -1601,7 +1653,7 @@ Two bugs were found by the tests rather than in production, which is the point o
 Everything listed as a v0.1 gap has been resolved, and the resolutions changed the design in two places worth recording.
 
 - [x] **Tier C `DELETE` is now correct.** Rather than marking it degraded, the predicate is evaluated against the tuple the WAL delivered, using `jsonb_populate_record` to reconstitute the row. This works even for a policy containing a subquery against another table. It requires a complete tuple, so it applies when `REPLICA IDENTITY FULL` is set; otherwise the event is **withheld** by default (`SLUICE_DEGRADED_DELETES=withhold`), not delivered, because telling a subscriber that a row they may not see was deleted is the leak walrus avoided by truncating to primary keys.
-- [x] **Tier B is now verified against PostgreSQL at runtime.** The first `SLUICE_TIER_B_VERIFY` (default 5) decisions on each subscription are also evaluated by PostgreSQL on the same tuple and the verdicts compared. A disagreement downgrades the subscription to Tier C, logs at ERROR and increments `sluice_authz_downgrades_total`. This converts "trust the hand-written parser" into "verify it against PostgreSQL, per policy, at runtime", at a cost bounded per subscription rather than per change.
+- [x] **Tier B is now verified against PostgreSQL at runtime.** The first `SLUICE_TIER_B_VERIFY` (default 5) decisions on each subscription are also evaluated by PostgreSQL on the same tuple and the verdicts compared. A disagreement downgrades the subscription to Tier C, logs at ERROR and increments `sluice_authz_downgrades_total`. This converts "trust the compiler" into "verify it against PostgreSQL, per policy, at runtime", at a cost bounded per subscription rather than per change.
 - [x] `initial: "snapshot"` implemented (§13), including the gapless replay floor.
 - [x] Channel `hook` mode implemented, fail-closed, with a bounded TTL cache and a short negative TTL so a blip does not become an outage.
 - [x] Shared jittered timer wheel replaces the per-stream ticker (§17).
@@ -1611,9 +1663,27 @@ Everything listed as a v0.1 gap has been resolved, and the resolutions changed t
 
 **Remaining gaps**, deliberate:
 
-- Tier B uses a hand-written parser over a whitelisted grammar rather than `libpg_query`, keeping the binary pure Go with no cgo. Anything unrecognised fails closed to Tier C, and the runtime cross-check above covers the residual risk of a misparse.
 - The `Bus` seam of §22 exists conceptually but there is no interface type yet.
 - Resurrect-and-rollback (§7.4) is still unimplemented; the **synthetic-record** path (via `jsonb_populate_record`) covers Tier C `DELETE` at lower cost when the WAL tuple is complete.
+
+### v0.3 — PostgreSQL's grammar replaces Sluice's (done)
+
+The hand-written lexer and recursive-descent parser (840 lines) are gone. Policy text is now parsed by [`pgplex/pgparser`](https://github.com/pgplex/pgparser) and converted to Sluice's evaluable AST by `internal/expr/convert.go` (525 lines, 391 of them code). Still pure Go, still no cgo, still a static binary — verified with `CGO_ENABLED=0`.
+
+The motivation was not line count. It was that a hand-maintained *grammar* subset has a failure mode a semantic whitelist does not: **a missing production does not fail, it misparses.** With no rule for `CURRENT_USER`, the old parser fell through to its identifier rule and produced a column reference. `Analyze` saw a predicate over a plain column, called it compilable, and put the subscription in Tier B — where the WAL tuple has no `current_user` column, every evaluation returns unknown, and every row is withheld silently, with `/diagnostics` reporting nothing wrong. The same shape of bug had already been found twice by tests (`::` never tokenizing because the lexer omitted `:`; `(select auth.uid())` classified as an opaque subquery, sending the single most common Supabase policy idiom to the slowest tier).
+
+Now the grammar is PostgreSQL's, so precedence, quoting (`E''`, `$$…$$`, `U&''`, quoted identifiers), and every operator form come for free, and the only thing Sluice maintains is the list of nodes it will evaluate — where a gap is structurally unrepresentable and reported by name.
+
+Two real gaps surfaced immediately and were fixed in the process:
+
+- **`NOT IN` was never being compiled.** `pg_get_expr` does not preserve `IN`/`NOT IN`; it deparses them as `= ANY (ARRAY[…])` and `<> ALL (ARRAY[…])`. Only the first was handled, so every `NOT IN` policy silently fell to Tier C.
+- **Array casts were evaluated as scalar casts.** `normalizeType` strips `[]`, so `(tags)::text[]` was treated as `::text`. Now an array cast is either pushed down into an `ARRAY[…]` literal (which is what PostgreSQL does) or declined.
+
+One duplication was removed rather than added to: `convert.go` initially carried its own operator whitelist, which already disagreed with `analyze.go`'s `evaluableBinaryOps` (the list documented as matching `evalBinary`). A mutation test — whitelisting `~` and expecting the suite to fail — exposed that the converter's copy was dead weight, since `Analyze` is what actually enforces. Deleting it left one list, and improved diagnostics: `describeOp` names "POSIX regular-expression operator ~" where the converter had said `operator "~"`.
+
+Test coverage grew from the swap: **106 new subtests** across grammar breadth (evaluated, not merely parsed, including three-valued-logic cases), fail-closed behaviour for 17 declined constructs, n-ary boolean flattening, and hostile input. The declined-construct suite asserts three things per case — not compilable, a non-empty reason for `/diagnostics`, and that `Eval` also refuses — so a caller ignoring `Compilable()` still cannot obtain a bogus visibility decision.
+
+The cost is binary size: the goyacc tables take the `sluice` binary to ~25 MB. For a server that is not a consideration.
 
 PostgREST is in the harness deliberately: it is the **authorization oracle**. The correctness invariant Sluice must satisfy is *"a client receives a change for row R if and only if that client could `SELECT` row R through PostgREST"*, and having both in the harness makes that invariant directly testable.
 
