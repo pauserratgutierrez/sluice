@@ -1692,7 +1692,6 @@ PostgREST is in the harness deliberately: it is the **authorization oracle**. Th
 ### Next — hardening (not done)
 
 - CI: build, vet, `-race` tests, and harness smoke on every push.
-- Published, versioned container image and an SDK release (SDK is still `0.0.0`).
 - Property-based authorization tests: generate policies and shapes, assert Sluice's tier decision agrees with PostgREST's visibility for every row.
 - Resume/ring-buffer correctness under reader restarts.
 - Larger load harness: 10k streams, measured changes/sec by tier.

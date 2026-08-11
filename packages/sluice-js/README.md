@@ -10,7 +10,7 @@ For the raw HTTP/SSE contract (any language, no client library), see [Wire proto
 npm install @pauserratgutierrez/sluice-js
 ```
 
-Published to npm on the same `v*.*.*` tags as the server image (see [`MAINTENANCE.md`](../../MAINTENANCE.md)).
+Install from [npm](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js). Versions are published on the same `v*.*.*` tags as the server image (see [`MAINTENANCE.md`](../../MAINTENANCE.md)). In git, `package.json` stays at `0.0.0`; CI sets the published version from the tag.
 
 ## Quick start
 

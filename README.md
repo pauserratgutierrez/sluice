@@ -170,7 +170,11 @@ articles               A     yes      owner_id      warn:replica_identity_insuff
 
 ### JavaScript / TypeScript
 
-Use [`@pauserratgutierrez/sluice-js`](packages/sluice-js/README.md) — one client, one SSE connection, typed against the same generated `Database` types as PostgREST:
+Use [`@pauserratgutierrez/sluice-js`](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js) — one client, one SSE connection, typed against the same generated `Database` types as PostgREST:
+
+```bash
+npm install @pauserratgutierrez/sluice-js
+```
 
 ```ts
 import { createClient } from '@pauserratgutierrez/sluice-js'
@@ -288,9 +292,11 @@ Sluice is a working prototype with good test coverage, not production software. 
 1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **An open-source license** (SDK is still `UNLICENSED`). Image and SDK release automation is in [`MAINTENANCE.md`](MAINTENANCE.md).
+4. **An open-source license** (SDK is still `UNLICENSED`).
 5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed ([design doc](design_doc.md) §22) but not built.
 6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
+
+Published artifacts are already cut from `v*.*.*` tags: the runtime image on GHCR (`ghcr.io/pauserratgutierrez/sluice`) and the SDK on npm. How to release is in [`MAINTENANCE.md`](MAINTENANCE.md).
 
 ## Layout
 
