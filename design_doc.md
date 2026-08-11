@@ -1527,8 +1527,10 @@ SLUICE_AUTHZ_LEASE=60s                # for volatile predicates only
 SLUICE_CATALOG_REFRESH=30s
 SLUICE_TIER_C=allow                   # allow | deny
 SLUICE_TIER_C_MAX_PROBES_PER_SECOND=2000
+SLUICE_TIER_B_VERIFY=5                # cross-checks per Tier B subscription; 0 disables
 SLUICE_UNINDEXED_SHAPES_MAX=200
 SLUICE_REPLICA_IDENTITY=warn          # warn | strict
+SLUICE_DEGRADED_DELETES=withhold      # withhold | deliver — incomplete DELETE tuples
 
 # ── snapshots ─────────────────────────────────────────────────────────────
 SLUICE_SNAPSHOT_ENABLED=true
