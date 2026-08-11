@@ -112,7 +112,7 @@ docker compose -f deploy/compose.yml --env-file .env ps
 
 ## Run the published image
 
-The runtime image is only the `sluice` binary (plus CA certs). It does not include Compose, Postgres, GoTrue, or the harness. Push a `v*` tag to publish to GHCR via [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml); the first package push is private until you mark it public in the GitHub Packages UI. Public pulls need no token.
+The runtime image is only the `sluice` binary (plus CA certs). It does not include Compose, Postgres, GoTrue, or the harness.
 
 ```bash
 docker pull ghcr.io/pauserratgutierrez/sluice:latest
@@ -288,7 +288,7 @@ Sluice is a working prototype with good test coverage, not production software. 
 1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **An SDK release** (`packages/sluice-js` is still `0.0.0`). The server image publishes to GHCR on `v*` tags via `.github/workflows/release-image.yml`.
+4. **An SDK release** (`packages/sluice-js` is still `0.0.0`). Server image releases are covered in [`MAINTENANCE.md`](MAINTENANCE.md).
 5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed ([design doc](design_doc.md) §22) but not built.
 6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
 
@@ -315,6 +315,7 @@ internal/event      shared event types
 deploy/             compose harness: db bootstrap, fixtures, Caddy; sluice.env.example lists every runtime SLUICE_* knob
 packages/sluice-js  the typed TypeScript client
 design_doc.md       full design: protocol, authz tiers, config, failure modes
+MAINTENANCE.md      how to cut a server image release
 ```
 
 ## Design decisions worth knowing before changing anything
