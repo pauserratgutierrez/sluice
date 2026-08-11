@@ -4,6 +4,7 @@
 .git
 .gitattributes
 .gitignore
+.github
 .dockerignore
 Dockerfile
 
