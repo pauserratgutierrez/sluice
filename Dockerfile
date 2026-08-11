@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Sluice is pure Go with no cgo, so the runtime image is a scratch-adjacent distroless-style alpine with just the binary and CA certificates. There is no libpg_query dependency: the Tier B predicate compiler uses a hand-written parser over a whitelisted grammar, and anything it does not recognise falls to Tier C. Correctness is preserved either way, and the binary stays static.
+# Sluice is pure Go with no cgo, so the runtime image is a scratch-adjacent distroless-style alpine with just the binary and CA certificates. There is no libpg_query dependency: the Tier B predicate compiler uses pgplex/pgparser, and anything it does not recognise falls to Tier C. Correctness is preserved either way, and the binary stays static.
 
 FROM golang:1.26-alpine AS builder
 
