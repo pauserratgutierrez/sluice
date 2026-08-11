@@ -288,7 +288,7 @@ Sluice is a working prototype with good test coverage, not production software. 
 1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **An SDK release** (`packages/sluice-js` is still `0.0.0`). Server image releases are covered in [`MAINTENANCE.md`](MAINTENANCE.md).
+4. **An open-source license** (SDK is still `UNLICENSED`). Image and SDK release automation is in [`MAINTENANCE.md`](MAINTENANCE.md).
 5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed ([design doc](design_doc.md) §22) but not built.
 6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
 
@@ -315,7 +315,7 @@ internal/event      shared event types
 deploy/             compose harness: db bootstrap, fixtures, Caddy; sluice.env.example lists every runtime SLUICE_* knob
 packages/sluice-js  the typed TypeScript client
 design_doc.md       full design: protocol, authz tiers, config, failure modes
-MAINTENANCE.md      how to cut a server image release
+MAINTENANCE.md      how to cut image and SDK releases
 ```
 
 ## Design decisions worth knowing before changing anything

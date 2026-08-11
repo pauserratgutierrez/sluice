@@ -1,0 +1,69 @@
+# Publish @pauserratgutierrez/sluice-js to the public npm registry.
+#
+# Same semver tags as the server image (v0.1.0, …). Auth is npm trusted
+# publishing over OIDC — no NPM_TOKEN (same approach as scraply).
+# Docs: https://docs.npmjs.com/trusted-publishers/
+#
+# One-time on npmjs.com for this package:
+#   Trusted Publisher → GitHub Actions →
+#   user pauserratgutierrez, repo sluice, workflow filename release-sdk.yml
+#   (filename only, not the path). Allow "npm publish".
+
+name: Release SDK
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+concurrency:
+  group: release-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    working-directory: packages/sluice-js
+
+jobs:
+  publish:
+    name: Test and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          # Never cache the package manager for release publishes (npm trusted-publishing docs).
+          package-manager-cache: false
+
+      # Trusted publishing needs npm CLI ≥ 11.5.1 (and Node ≥ 22.14).
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set package version from tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # --allow-same-version: package.json may already match the tag on the
+          # release commit; without it npm exits "Version not changed".
+          npm version "$version" --no-git-tag-version --allow-same-version
+          echo "Publishing @pauserratgutierrez/sluice-js@$version"
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm
+        # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates the publish.
+        # Provenance is generated automatically for public repos.
+        run: npm publish --access public

@@ -7,10 +7,10 @@ Zero runtime dependencies. ESM. Works in browsers, Node ≥ 20, Deno and workers
 For the raw HTTP/SSE contract (any language, no client library), see [Wire protocol](../../README.md#wire-protocol-any-language) in the main README.
 
 ```bash
-# not published yet — from packages/sluice-js:
-npm install
-npm run build
+npm install @pauserratgutierrez/sluice-js
 ```
+
+Published to npm on the same `v*.*.*` tags as the server image (see [`MAINTENANCE.md`](../../MAINTENANCE.md)).
 
 ## Quick start
 
