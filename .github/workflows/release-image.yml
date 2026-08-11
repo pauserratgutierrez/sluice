@@ -10,6 +10,8 @@
 
 name: Release image
 
+run-name: Release image ${{ github.ref_name }}
+
 on:
   push:
     # Semver-ish tags only (v0.1.0, v1.2.3-rc.1). Plain branch pushes do not publish.

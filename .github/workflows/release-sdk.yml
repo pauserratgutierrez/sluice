@@ -1,15 +1,14 @@
 # Publish @pauserratgutierrez/sluice-js to the public npm registry.
 #
-# Same semver tags as the server image (v0.1.0, …). Auth is npm trusted
-# publishing over OIDC — no NPM_TOKEN (same approach as scraply).
+# Same semver tags as the server image (v0.1.0, …).
+# Auth: npm trusted publishing (OIDC) once the package exists; optional
+# NPM_TOKEN secret only for the first create (npm returns E404 without auth
+# when the package is missing and no trusted publisher can be attached yet).
 # Docs: https://docs.npmjs.com/trusted-publishers/
-#
-# One-time on npmjs.com for this package:
-#   Trusted Publisher → GitHub Actions →
-#   user pauserratgutierrez, repo sluice, workflow filename release-sdk.yml
-#   (filename only, not the path). Allow "npm publish".
 
 name: Release SDK
+
+run-name: Release SDK ${{ github.ref_name }}
 
 on:
   push:
@@ -19,7 +18,10 @@ concurrency:
   group: release-sdk-${{ github.ref }}
   cancel-in-progress: false
 
-permissions: {}
+# Match scraply: OIDC at workflow scope. contents:read for checkout.
+permissions:
+  contents: read
+  id-token: write
 
 defaults:
   run:
@@ -30,9 +32,6 @@ jobs:
     name: Test and publish
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -64,6 +63,17 @@ jobs:
         run: npm test
 
       - name: Publish to npm
-        # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates the publish.
-        # Provenance is generated automatically for public repos.
-        run: npm publish --access public
+        env:
+          # Optional. Required only for the first publish of a new package name
+          # (trusted publisher is configured on an existing package page).
+          # After OIDC works, delete the repo secret so this stays empty —
+          # npm prefers OIDC when available, then falls back to the token.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            unset NODE_AUTH_TOKEN
+            echo "Auth: OIDC trusted publishing (no NPM_TOKEN)."
+          else
+            echo "Auth: NPM_TOKEN present (first-publish / fallback)."
+          fi
+          npm publish --access public

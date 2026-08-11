@@ -29,19 +29,23 @@ Workflow: [`.github/workflows/release-sdk.yml`](.github/workflows/release-sdk.ym
 
 Publishes [`@pauserratgutierrez/sluice-js`](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js) to the **public npm registry** (not GitHub Packages). The package version is taken from the git tag (`v0.1.1` → `0.1.1`).
 
-Auth: [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) over OIDC — **no `NPM_TOKEN`**. Pattern matches [scraply](https://github.com/pauserratgutierrez/scraply/blob/main/.github/workflows/npm-publish.yml).
+Steady-state auth: [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) over OIDC — **no long-lived token** (same idea as [scraply](https://github.com/pauserratgutierrez/scraply/blob/main/.github/workflows/npm-publish.yml)).
 
-### One-time npm setup
+### First publish (required once)
 
-1. Ensure the `@pauserratgutierrez` scope exists on [npmjs.com](https://www.npmjs.com/).
-2. For `@pauserratgutierrez/sluice-js` → **Settings → Trusted Publisher → GitHub Actions**:
+A brand-new package name has no npm package page yet, so you cannot attach a Trusted Publisher. Unauthenticated `npm publish` then fails with **`404 Not found`** on the PUT (npm’s usual “not allowed” response). Bootstrap once:
+
+1. On [npmjs.com](https://www.npmjs.com/) (logged in as `pauserratgutierrez`, so the `@pauserratgutierrez` scope is yours), create a **granular access token** with permission to publish that package (or the scope).
+2. Add it as a repository secret: **Settings → Secrets → Actions → `NPM_TOKEN`**.
+3. Re-run the failed **Release SDK** job (or push the next `v*.*.*` tag). Publish uses the token as a fallback.
+4. Open the new package → **Settings → Trusted Publisher → GitHub Actions**:
    - Organization or user: `pauserratgutierrez`
    - Repository: `sluice`
    - Workflow filename: `release-sdk.yml` (filename only)
    - Allowed action: `npm publish`
-3. If the package does not exist yet, create it with a first publish (trusted publisher can be attached once the package page exists; npm only validates the config when you publish). A one-off granular publish token is fine for that first create, then rely on OIDC afterward.
+5. **Delete** the `NPM_TOKEN` secret. Later tags publish with OIDC only; provenance is generated automatically for this public repository.
 
-The workflow runs `npm test` in `packages/sluice-js` before `npm publish --access public`. Provenance is generated automatically for this public repository.
+The workflow runs `npm test` in `packages/sluice-js` before `npm publish --access public`.
 
 ## Not covered here yet
 
