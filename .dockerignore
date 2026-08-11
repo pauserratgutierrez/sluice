@@ -1,0 +1,37 @@
+# Build context for the production image. The final stage only ships /sluice;
+# this file keeps the builder context small and keeps secrets out of the daemon.
+
+.git
+.gitattributes
+.gitignore
+.dockerignore
+Dockerfile
+
+# Host / harness secrets — never send these to the daemon.
+.env
+.env.*
+
+# Local / JS / editor noise
+.bin/
+node_modules/
+dist/
+**/.DS_Store
+
+# Docs and design notes (not compiled)
+*.md
+design_doc.md
+
+# Compose harness and sibling services (not part of the sluice binary)
+deploy/
+
+# TypeScript client SDK
+packages/
+
+# Dev / CI helpers — not linked into cmd/sluice
+cmd/keygen/
+cmd/smoke/
+cmd/audit/
+
+# Tests are unused by `go build` and only inflate the context
+**/*_test.go
+**/testdata/
