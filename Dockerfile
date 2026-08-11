@@ -33,4 +33,15 @@ COPY --from=builder /out/sluice /sluice
 USER 65532:65532
 EXPOSE 4000
 
+# The binary already implements -healthcheck: it GETs /healthz (registered both
+# prefixed and unprefixed) and exits 0/1. No curl/wget in the image.
+# Compose overrides these timings for the harness; this is the standalone default.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["/sluice", "-healthcheck"]
+
+LABEL org.opencontainers.image.title="sluice" \
+  org.opencontainers.image.description="Realtime data-streaming server for PostgreSQL" \
+  org.opencontainers.image.source="https://github.com/pauserratgutierrez/sluice" \
+  org.opencontainers.image.licenses="UNLICENSED"
+
 ENTRYPOINT ["/sluice"]
