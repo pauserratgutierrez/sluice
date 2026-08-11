@@ -5,9 +5,11 @@ Maintainer notes for releasing Sluice. Consumers should use the [README](README.
 Pushing a semver tag (`v0.1.0`, `v1.2.3`, …) runs **both** release workflows: the server image to GHCR and the JS SDK to npm.
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3
+git push origin v0.1.3
 ```
+
+Leave `packages/sluice-js/package.json` at `0.0.0` in git. The SDK workflow sets the published version from the tag (`v0.1.3` → `0.1.3`).
 
 ## Publish the server image
 
@@ -27,25 +29,28 @@ The same version string is stamped into the binary (`sluice -version`). The runt
 
 Workflow: [`.github/workflows/release-sdk.yml`](.github/workflows/release-sdk.yml).
 
-Publishes [`@pauserratgutierrez/sluice-js`](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js) to the **public npm registry** (not GitHub Packages). The package version is taken from the git tag (`v0.1.1` → `0.1.1`).
+Publishes [`@pauserratgutierrez/sluice-js`](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js) to the **public npm registry** (not GitHub Packages). The package version is taken from the git tag.
 
-Steady-state auth: [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) over OIDC — **no long-lived token** (same idea as [scraply](https://github.com/pauserratgutierrez/scraply/blob/main/.github/workflows/npm-publish.yml)).
+Auth: [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) over OIDC — **no `NPM_TOKEN`** (same idea as [scraply](https://github.com/pauserratgutierrez/scraply/blob/main/.github/workflows/npm-publish.yml)). Granular tokens hit `EOTP` under account 2FA and cannot publish from Actions.
 
-### First publish (required once)
+The workflow runs `npm test` in `packages/sluice-js` before `npm publish --access public`. Provenance is generated automatically for this public repository.
 
-A brand-new package name has no npm package page yet, so you cannot attach a Trusted Publisher. Unauthenticated `npm publish` then fails with **`404 Not found`** on the PUT (npm’s usual “not allowed” response). Bootstrap once:
+### Trusted Publisher (required once)
 
-1. On [npmjs.com](https://www.npmjs.com/) (logged in as `pauserratgutierrez`, so the `@pauserratgutierrez` scope is yours), create a **granular access token** with permission to publish that package (or the scope).
-2. Add it as a repository secret: **Settings → Secrets → Actions → `NPM_TOKEN`**.
-3. Re-run the failed **Release SDK** job (or push the next `v*.*.*` tag). Publish uses the token as a fallback.
-4. Open the new package → **Settings → Trusted Publisher → GitHub Actions**:
+The package page must already exist (bootstrap was a local `npm publish` of `0.0.0`). Then:
+
+1. Open [package Access](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js/access) → **Trusted Publisher → GitHub Actions**:
    - Organization or user: `pauserratgutierrez`
    - Repository: `sluice`
    - Workflow filename: `release-sdk.yml` (filename only)
    - Allowed action: `npm publish`
-5. **Delete** the `NPM_TOKEN` secret. Later tags publish with OIDC only; provenance is generated automatically for this public repository.
+2. Do **not** keep an `NPM_TOKEN` Actions secret.
 
-The workflow runs `npm test` in `packages/sluice-js` before `npm publish --access public`.
+After that, each new `v*.*.*` tag publishes via OIDC.
+
+### Bootstrap a brand-new package name again
+
+If you ever create a different package name: publish once from a machine with `npm login` (browser/2FA), then attach Trusted Publisher as above. Do not rely on CI tokens for the first create.
 
 ## Not covered here yet
 

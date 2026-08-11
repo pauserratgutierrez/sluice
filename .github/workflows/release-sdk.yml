@@ -1,9 +1,7 @@
 # Publish @pauserratgutierrez/sluice-js to the public npm registry.
 #
 # Same semver tags as the server image (v0.1.0, …).
-# Auth: npm trusted publishing (OIDC) once the package exists; optional
-# NPM_TOKEN secret only for the first create (npm returns E404 without auth
-# when the package is missing and no trusted publisher can be attached yet).
+# Auth: npm trusted publishing (OIDC) — no NPM_TOKEN.
 # Docs: https://docs.npmjs.com/trusted-publishers/
 
 name: Release SDK
@@ -63,17 +61,4 @@ jobs:
         run: npm test
 
       - name: Publish to npm
-        env:
-          # Optional. Required only for the first publish of a new package name
-          # (trusted publisher is configured on an existing package page).
-          # After OIDC works, delete the repo secret so this stays empty —
-          # npm prefers OIDC when available, then falls back to the token.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            unset NODE_AUTH_TOKEN
-            echo "Auth: OIDC trusted publishing (no NPM_TOKEN)."
-          else
-            echo "Auth: NPM_TOKEN present (first-publish / fallback)."
-          fi
-          npm publish --access public
+        run: npm publish --access public
