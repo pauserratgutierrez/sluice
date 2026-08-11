@@ -110,6 +110,23 @@ docker compose -f deploy/compose.yml --env-file .env up -d --build
 docker compose -f deploy/compose.yml --env-file .env ps
 ```
 
+## Run the published image
+
+The runtime image is only the `sluice` binary (plus CA certs). It does not include Compose, Postgres, GoTrue, or the harness. Push a `v*` tag to publish to GHCR via [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml); the first package push is private until you mark it public in the GitHub Packages UI. Public pulls need no token.
+
+```bash
+docker pull ghcr.io/pauserratgutierrez/sluice:latest
+
+docker run --rm -p 4000:4000 \
+  --env-file deploy/sluice.env.example \
+  -e SLUICE_DB_REPL_URL='postgres://sluice_repl:...@db:5432/postgres?replication=database' \
+  -e SLUICE_DB_AUTHZ_URL='postgres://sluice_authz:...@db:5432/postgres' \
+  -e SLUICE_JWKS_URL='http://auth:9999/.well-known/jwks.json' \
+  ghcr.io/pauserratgutierrez/sluice:latest
+```
+
+Required env vars are `SLUICE_DB_REPL_URL`, `SLUICE_DB_AUTHZ_URL`, and `SLUICE_JWKS_URL`. Every other knob and its default is listed in [`deploy/sluice.env.example`](deploy/sluice.env.example). The image healthcheck runs `/sluice -healthcheck` against `GET /healthz`.
+
 Run the end-to-end validation:
 
 ```bash
@@ -271,8 +288,8 @@ Sluice is a working prototype with good test coverage, not production software. 
 1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **A published, versioned image** and an SDK release (`packages/sluice-js` is still `0.0.0`).
-5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed (design doc §22) but not built.
+4. **An SDK release** (`packages/sluice-js` is still `0.0.0`). The server image publishes to GHCR on `v*` tags via `.github/workflows/release-image.yml`.
+5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed ([design doc](design_doc.md) §22) but not built.
 6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
 
 ## Layout
@@ -295,11 +312,14 @@ internal/timer      shared jittered wheel: one timer for every stream on the nod
 internal/metrics    Prometheus collectors
 internal/config     env parsing and defaults
 internal/event      shared event types
-deploy/             compose harness: db bootstrap, fixtures, Caddy
+deploy/             compose harness: db bootstrap, fixtures, Caddy; sluice.env.example lists every runtime SLUICE_* knob
 packages/sluice-js  the typed TypeScript client
+design_doc.md       full design: protocol, authz tiers, config, failure modes
 ```
 
 ## Design decisions worth knowing before changing anything
+
+The full rationale lives in [`design_doc.md`](design_doc.md). The short version:
 
 - **`proto_version = 4`, `streaming = off`, `binary = false`.** All three look arbitrary and are not. The negotiated protocol version alone changes nothing on the wire (verified: 1, 4 and 4+parallel produce byte-identical output); the *options* determine the message set. `streaming = off` means everything received is already committed, so the reader forwards immediately and holds no buffer. And `binary = true` was measured **larger** than text (112 vs 88 bytes) while requiring per-type decoders.
 - **`REPLICA IDENTITY USING INDEX`, not `FULL`.** A unique index on `(filter columns…, pk)` puts the columns you filter on into old tuples at ~1/15 the WAL cost and ~1/3200 the message size of `FULL`, which inlines entire TOASTed values on every update.
