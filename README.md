@@ -166,6 +166,21 @@ articles               A     yes      owner_id      warn:replica_identity_insuff
 == 36 checks, 0 failures ==
 ```
 
+Smoke's fan-out is a correctness check (200 streams × 25 changes by default). `cmd/load` is a separate soak on the same compose network, not a replay of the numbers in [Measured behaviour](#measured-behaviour). Default `LOAD_SCENARIO=all` is a laptop ladder: Tier A and no-RLS at 1500 streams × 80 changes, B capped at 800×60, C at 150×40, then multi-user, then extreme A at 4000×100. Not a CI check.
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
+  golang:1.26-alpine go build -o .bin/load ./cmd/load
+
+docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
+  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" \
+  alpine:3.22 /b/load
+```
+
+Knobs: `LOAD_SCENARIO` (`all` | `A` | `B` | `C` | `none` | `multi`), `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`. Same harness URLs as smoke (`SMOKE_AUTH_URL`, `SMOKE_SLUICE_URL`, `SMOKE_DB_URL`).
+
+`cmd/audit` is the production-readiness battery (RLS spectrum, WAL edges, `/diagnostics`). Same two-step build/run as smoke, targeting `./cmd/audit`.
+
 ## Using it from a client
 
 ### JavaScript / TypeScript
@@ -281,7 +296,7 @@ The design claim is that dispatch cost is flat in subscriber count. Measured on 
 | 400 | 8,000 | 359 ms | 22,297 |
 | 1,000 | 20,000 | 359 ms | 55,722 |
 
-Wall time is constant; only the event count scales. For comparison, `supabase/realtime`'s published figure for the RLS path is 5 database changes per second at 4,000 subscribers, because it authorizes every change against every subscriber.
+Wall time is constant; only the event count scales. That table is a small fan-out, not something `cmd/load` reproduces; use `cmd/load` when you want a laptop soak at much larger stream counts. For comparison, `supabase/realtime`'s published figure for the RLS path is 5 database changes per second at 4,000 subscribers, because it authorizes every change against every subscriber.
 
 End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
 
@@ -304,6 +319,8 @@ Published artifacts are already cut from `v*.*.*` tags: the runtime image on GHC
 cmd/sluice          the server
 cmd/keygen          harness secrets and ES256 API keys
 cmd/smoke           end-to-end validation (~36 assertions)
+cmd/audit           production-readiness battery
+cmd/load            realtime stress probe
 internal/expr       the expression engine: parse, analyze, fold, reduce, evaluate
 internal/authz      the three-tier authorization model
 internal/auth       JWT/JWKS verification and session revocation

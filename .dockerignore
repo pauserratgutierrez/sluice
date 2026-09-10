@@ -32,6 +32,7 @@ packages/
 cmd/keygen/
 cmd/smoke/
 cmd/audit/
+cmd/load/
 
 # Tests are unused by `go build` and only inflate the context
 **/*_test.go

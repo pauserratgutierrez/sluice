@@ -15,10 +15,13 @@
 //   - pg_logical_emit_message delivers a transactional broadcast with no table
 //   - PostgREST and Sluice agree on visibility (PostgREST is the oracle)
 //
-// Run it on the compose network:
+// Run it on the compose network (same two-step recipe as cmd/load and cmd/audit):
 //
-//	docker run --rm --network deploy_private_net -v "$PWD:/src" -w /src \
-//	  golang:1.26-alpine go run ./cmd/smoke
+//	docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
+//	  golang:1.26-alpine go build -o .bin/smoke ./cmd/smoke
+//
+//	docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
+//	  -e POSTGRES_PASSWORD=… alpine:3.22 /b/smoke
 package main
 
 import (

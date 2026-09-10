@@ -1580,6 +1580,8 @@ sluice/
 ├── cmd/sluice/                     server wiring, startup validation, graceful shutdown
 ├── cmd/keygen/                     harness secrets and ES256 API keys
 ├── cmd/smoke/                      end-to-end harness validation (~36 assertions)
+├── cmd/audit/                      production-readiness battery (RLS spectrum, WAL edges, diagnostics)
+├── cmd/load/                       realtime stress probe against the harness
 ├── internal/
 │   ├── config/                     env parsing, validation, defaults
 │   ├── auth/                       JWT/JWKS verification, alg pinning, revocation

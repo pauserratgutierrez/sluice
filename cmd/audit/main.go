@@ -3,6 +3,14 @@
 // It applies a broad SQL/RLS spectrum, classifies expected Tier A/B/C outcomes,
 // exercises live subscribe+DML delivery, probes rare WAL edge cases, and
 // scrapes /diagnostics + /metrics for Tier-C remediation quality.
+//
+// Build and run it on the compose network the same way as cmd/smoke:
+//
+//	docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
+//	  golang:1.26-alpine go build -o .bin/audit ./cmd/audit
+//
+//	docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
+//	  -e POSTGRES_PASSWORD=… alpine:3.22 /b/audit
 package main
 
 import (
