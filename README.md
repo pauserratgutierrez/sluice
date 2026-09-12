@@ -377,7 +377,7 @@ design_doc.md       full design: protocol, authz tiers, config, failure modes
 MAINTENANCE.md      how to cut image and SDK releases
 ```
 
-## Design decisions worth knowing before changing anything
+## Design decisions
 
 The full rationale lives in [`design_doc.md`](design_doc.md). The short version:
 
