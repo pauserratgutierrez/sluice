@@ -266,8 +266,10 @@ func (x *Index) RefreshRels(streamID, label string, rels []*catalog.Relation) {
 
 // OnChange returns watches whose hold on this relation no longer holds after
 // the WAL change. DELETE of a matching row, or UPDATE that leaves the filter,
-// cuts. The watch is removed from the index here so a later change cannot
-// recut; the caller still drops the shape from the registry.
+// cuts. An UPDATE that omits the old tuple (replica identity unchanged) is
+// decided from the new row only; omitting old is not unknown. The watch is
+// removed from the index here so a later change cannot recut; the caller still
+// drops the shape from the registry.
 func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -344,9 +346,16 @@ func watchBroken(w *Watch, oid uint32, op byte, oldRow, newRow expr.Row) (string
 				return "a hold on " + spec.Rel.FullName() + " no longer exists", true
 			}
 		case 'U':
-			matchOld, unkOld := visible(spec.Filter, oldRow)
+			// Protocol: Update carries 'K' (old key) or 'O' (old full) or
+			// neither, never both. 'K' only if replica-identity columns changed;
+			// 'N' is always present. A nil old row is omitted, not unknown.
 			matchNew, unkNew := visible(spec.Filter, newRow)
-			if unkOld || (matchOld && (unkNew || !matchNew)) {
+			cut := unkNew || !matchNew
+			if oldRow != nil {
+				matchOld, _ := visible(spec.Filter, oldRow)
+				cut = matchOld && cut
+			}
+			if cut {
 				return "a hold on " + spec.Rel.FullName() + " no longer matches", true
 			}
 		}

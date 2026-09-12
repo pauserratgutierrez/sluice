@@ -81,6 +81,18 @@ func main() {
 		"Bob's subscribe to alpha is denied (or not ok)",
 		truncate(string(bobReady.Data), 240))
 
+	fmt.Println("\n-- hold UPDATE that stays in the filter does not cut --")
+	mustExec(ctx, fmt.Sprintf(
+		`update iss_project_members set id = default where project_id = 'alpha' and user_id = '%s'`, aliceID))
+	mustExec(ctx, `insert into iss_documents (project_id, title, body) values ('alpha', 'after-hold-update', 'x')`)
+	got = stream.collect(4 * time.Second)
+	check(!containsShapeNotAuthorized(got),
+		"an UPDATE of the hold that does not leave the filter does not emit shape_not_authorized",
+		fmt.Sprintf("got events %s", truncate(eventNames(got), 240)))
+	check(containsTitle(got, "docs", "after-hold-update"),
+		"the shape stays live after a hold UPDATE that does not leave the filter",
+		fmt.Sprintf("got %v", changeTitles(got, "docs")))
+
 	fmt.Println("\n-- hold DELETE cuts the shape, not the stream --")
 	mustExec(ctx, fmt.Sprintf(
 		`delete from iss_project_members where project_id = 'alpha' and user_id = '%s'`, aliceID))
@@ -491,6 +503,23 @@ func containsTitle(events []sseEvent, sub, title string) bool {
 		}
 	}
 	return false
+}
+
+func containsShapeNotAuthorized(events []sseEvent) bool {
+	for _, e := range events {
+		if e.Name == "error" && strings.Contains(string(e.Data), "shape_not_authorized") {
+			return true
+		}
+	}
+	return false
+}
+
+func eventNames(events []sseEvent) string {
+	names := make([]string, 0, len(events))
+	for _, e := range events {
+		names = append(names, e.Name)
+	}
+	return strings.Join(names, ",")
 }
 
 func check(ok bool, what, detail string) {

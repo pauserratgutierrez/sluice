@@ -100,6 +100,80 @@ func TestOnChangeKeepsUpdateStayingInHold(t *testing.T) {
 	}
 }
 
+// DEFAULT replica identity omits the old tuple when the key is unchanged
+// (pgoutput Update with only 'N'). That must not look like "unknown" and cut.
+func TestOnChangeUpdateOmitsOldTuple(t *testing.T) {
+	rel := membersRel()
+	rel.ReplicaIdentity = 'd'
+	rel.ReplicaIdentityColumns = []string{"id"}
+	rel.Columns = append([]catalog.Column{{Name: "id", TypeName: "uuid"}}, rel.Columns...)
+	rel.IndexedColumns = map[string]bool{"id": true, "project_id": true}
+	id := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	spec := holdSpec(t, rel, "id=eq."+id)
+	matching := row{
+		"id":         expr.Text(id),
+		"project_id": expr.Text("42"),
+		"user_id":    expr.Text("u1"),
+		"updated_at": expr.Text("2026-01-01T00:00:00Z"),
+	}
+
+	t.Run("still matching", func(t *testing.T) {
+		idx := New()
+		if !idx.Add("s1", "docs", []Spec{spec}) {
+			t.Fatal("add")
+		}
+		cuts := idx.OnChange(rel.OID, 'U', nil, matching)
+		if len(cuts) != 0 {
+			t.Fatalf("omitted old with a still-matching new row must not cut: %+v", cuts)
+		}
+		if idx.Count() != 1 {
+			t.Fatal("the watch must stay indexed")
+		}
+	})
+
+	t.Run("no longer matching", func(t *testing.T) {
+		idx := New()
+		// Routing is on id (indexed + replica identity). Same id keeps the
+		// watch a candidate; a filter column that left the predicate cuts.
+		left := holdSpec(t, rel, "id=eq."+id+",project_id=eq.42")
+		if !idx.Add("s1", "docs", []Spec{left}) {
+			t.Fatal("add")
+		}
+		cuts := idx.OnChange(rel.OID, 'U', nil, row{
+			"id":         expr.Text(id),
+			"project_id": expr.Text("99"),
+			"user_id":    expr.Text("u1"),
+		})
+		if len(cuts) != 1 {
+			t.Fatalf("omitted old with a new row that left the filter must cut, got %+v", cuts)
+		}
+	})
+
+	t.Run("delete still cuts", func(t *testing.T) {
+		idx := New()
+		if !idx.Add("s1", "docs", []Spec{spec}) {
+			t.Fatal("add")
+		}
+		cuts := idx.OnChange(rel.OID, 'D', matching, nil)
+		if len(cuts) != 1 {
+			t.Fatalf("DELETE of a matching hold must still cut, got %+v", cuts)
+		}
+	})
+
+	t.Run("identity change leaving filter", func(t *testing.T) {
+		idx := New()
+		if !idx.Add("s1", "docs", []Spec{spec}) {
+			t.Fatal("add")
+		}
+		cuts := idx.OnChange(rel.OID, 'U', matching, row{
+			"id": expr.Text("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+		})
+		if len(cuts) != 1 {
+			t.Fatalf("UPDATE that changes identity and leaves the filter must cut, got %+v", cuts)
+		}
+	})
+}
+
 func TestOnChangeIgnoresInsert(t *testing.T) {
 	idx := New()
 	rel := membersRel()
