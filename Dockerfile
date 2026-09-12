@@ -20,7 +20,26 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
   CGO_ENABLED=0 GOOS=linux \
   go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/sluice ./cmd/sluice
+    -o /out/sluice ./cmd/sluice \
+  && CGO_ENABLED=0 GOOS=linux \
+  go build -trimpath -ldflags "-s -w" \
+    -o /out/issuer-stub ./cmd/issuer-stub
+
+# Harness-only. Must stay before `runner` so an untargeted build (GHCR) still
+# produces the sluice runtime image.
+FROM alpine:3.22 AS issuer-stub
+
+RUN apk add --no-cache ca-certificates tzdata \
+  && addgroup -g 65532 -S sluice \
+  && adduser -u 65532 -S -G sluice sluice
+
+COPY --from=builder /out/issuer-stub /issuer-stub
+
+USER 65532:65532
+EXPOSE 8080
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=6 \
+  CMD ["/issuer-stub", "-healthcheck"]
+ENTRYPOINT ["/issuer-stub"]
 
 FROM alpine:3.22 AS runner
 

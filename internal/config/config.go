@@ -79,6 +79,13 @@ type Config struct {
 	ReplicaIdentity string // warn | strict
 	DegradedDeletes string // withhold | deliver
 
+	// ShapeOracle is the process-wide judge of shapes: "rls" (default) or "issuer".
+	// There is no AND/OR of the two.
+	ShapeOracle   string
+	IssuerURL     string
+	IssuerBearer  string
+	IssuerTimeout time.Duration
+
 	SnapshotEnabled  bool
 	SnapshotMaxConc  int
 	SnapshotMaxRows  int
@@ -177,6 +184,10 @@ func Load() (*Config, error) {
 
 		AuthzLease:     envDur("SLUICE_AUTHZ_LEASE", 60*time.Second),
 		CatalogRefresh: envDur("SLUICE_CATALOG_REFRESH", 30*time.Second),
+		ShapeOracle:    strings.ToLower(env("SLUICE_SHAPE_ORACLE", "rls")),
+		IssuerURL:      env("SLUICE_ISSUER_URL", ""),
+		IssuerBearer:   env("SLUICE_ISSUER_BEARER", ""),
+		IssuerTimeout:  envDur("SLUICE_ISSUER_TIMEOUT", 2*time.Second),
 		TierC:          env("SLUICE_TIER_C", "allow"),
 		TierCMaxProbes: envInt("SLUICE_TIER_C_MAX_PROBES_PER_SECOND", 2000),
 		// Tier B reimplements PostgreSQL's evaluation semantics in Go, so the
@@ -309,8 +320,26 @@ func (c *Config) validate() error {
 		return fmt.Errorf("SLUICE_MESSAGE_PREFIX must not be empty; an empty prefix would " +
 			"expose every pg_logical_emit_message in the database as a channel")
 	}
+	switch c.ShapeOracle {
+	case "rls":
+	case "issuer":
+		if c.IssuerURL == "" {
+			return fmt.Errorf("SLUICE_ISSUER_URL is required when SLUICE_SHAPE_ORACLE=issuer")
+		}
+		if c.IssuerBearer == "" {
+			return fmt.Errorf("SLUICE_ISSUER_BEARER is required when SLUICE_SHAPE_ORACLE=issuer")
+		}
+		if c.IssuerTimeout <= 0 {
+			return fmt.Errorf("SLUICE_ISSUER_TIMEOUT must be positive")
+		}
+	default:
+		return fmt.Errorf("SLUICE_SHAPE_ORACLE must be rls or issuer, got %q", c.ShapeOracle)
+	}
 	return nil
 }
+
+// IssuerMode reports whether this process uses the HTTP issuer as the shape oracle.
+func (c *Config) IssuerMode() bool { return c.ShapeOracle == "issuer" }
 
 // Channel returns the configured policy for a channel name's namespace.
 func (c *Config) Channel(name string) (Channel, bool) {

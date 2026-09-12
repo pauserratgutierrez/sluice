@@ -16,6 +16,7 @@ package server
 import (
 	"cmp"
 	"context"
+	"crypto/hmac"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,8 +34,10 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/config"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/hold"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
+	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/reader"
 	"github.com/pauserratgutierrez/sluice/internal/registry"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
@@ -48,6 +51,8 @@ type Server struct {
 
 	cat     *catalog.Cache
 	authz   *Authorizer
+	oracle  oracle.Oracle
+	holds   *hold.Index
 	reg     *registry.Registry
 	hub     *hub.Hub
 	verify  *auth.Verifier
@@ -70,6 +75,10 @@ type Server struct {
 	// per-change check costs an integer comparison rather than string building.
 	sessionsOID atomic.Uint32
 	usersOID    atomic.Uint32
+
+	// holdExists, if set, replaces hold.Exists. Tests inject it so /token can
+	// verify holds without a database pool.
+	holdExists func(ctx context.Context, specs []hold.Spec) error
 }
 
 // Authorizer is aliased so the package reads naturally and so the concrete type
@@ -82,6 +91,7 @@ type Options struct {
 	Pool    *pgxpool.Pool
 	Catalog *catalog.Cache
 	Authz   *Authorizer
+	Oracle  oracle.Oracle
 	Hub     *hub.Hub
 	Verify  *auth.Verifier
 	Revoker *auth.Revoker
@@ -90,8 +100,9 @@ type Options struct {
 func New(ctx context.Context, o Options) *Server {
 	s := &Server{
 		cfg: o.Config, log: o.Logger, pool: o.Pool,
-		cat: o.Catalog, authz: o.Authz,
-		reg: registry.New(), hub: o.Hub,
+		cat: o.Catalog, authz: o.Authz, oracle: o.Oracle,
+		holds: hold.New(),
+		reg:   registry.New(), hub: o.Hub,
 		verify: o.Verify, revoker: o.Revoker,
 		ctx: ctx,
 		// 64 buckets spreads a heartbeat period into batches rather than waking
@@ -105,6 +116,9 @@ func New(ctx context.Context, o Options) *Server {
 		// rather than spending the first tick re-resolving against a version
 		// nothing was resolved against.
 		s.authzVer.Store(o.Catalog.AuthzVersion())
+	}
+	if s.oracle == nil && o.Authz != nil && o.Catalog != nil {
+		s.oracle = oracle.NewRLS(o.Authz, o.Catalog)
 	}
 	return s
 }
@@ -130,6 +144,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/presence", s.handlePresence)
 	mux.HandleFunc("POST "+p+"/token", s.handleToken)
 	mux.HandleFunc("POST "+p+"/admin/jwks/refresh", s.handleJWKSRefresh)
+	mux.HandleFunc("POST "+p+"/admin/shapes/drop", s.handleAdminShapesDrop)
 
 	mux.HandleFunc("GET "+p+"/healthz", s.handleHealthz)
 	mux.HandleFunc("GET "+p+"/readyz", s.handleReadyz)
@@ -187,7 +202,9 @@ type subscribeReq struct {
 type subResult struct {
 	Sub        string          `json:"sub"`
 	OK         bool            `json:"ok"`
+	Oracle     string          `json:"oracle,omitempty"`
 	Tier       string          `json:"tier,omitempty"`
+	Filter     string          `json:"filter,omitempty"`
 	Indexed    *bool           `json:"indexed,omitempty"`
 	RoutingKey string          `json:"routing_key,omitempty"`
 	Reason     string          `json:"reason,omitempty"`
@@ -225,6 +242,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	st := s.hub.Open(streamID, id)
 	metrics.Streams.Set(float64(s.hub.Count()))
 	defer func() {
+		s.holds.RemoveStream(streamID)
 		for _, sub := range s.reg.RemoveStream(streamID) {
 			s.decSubMetric(sub)
 		}
@@ -401,6 +419,7 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	removed := 0
 	for _, label := range req.Subs {
 		if sub := s.reg.Remove(st.StreamID(), label); sub != nil {
+			s.holds.Remove(st.StreamID(), label)
 			s.decSubMetric(sub)
 			removed++
 		}
@@ -504,53 +523,30 @@ func (s *Server) subscribeShape(
 		return res
 	}
 
-	// Column projection, intersected with column-level grants. Never trusted
-	// from the client.
-	columns := sp.Columns
-	if len(columns) == 0 {
-		for _, c := range rel.Columns {
-			columns = append(columns, c.Name)
-		}
-	}
-	granted, err := s.cat.HasColumnPrivilege(ctx, id.Role, rel.FullName(), columns)
-	if err != nil {
-		res.Error = &event.Error{Code: "internal", Message: "could not check column privileges"}
-		return res
-	}
-	var allowed, denied []string
-	for _, c := range columns {
-		if granted[c] {
-			allowed = append(allowed, c)
-		} else {
-			denied = append(denied, c)
-		}
-	}
-	if len(allowed) == 0 {
-		res.Error = &event.Error{Code: "column_not_granted", Message: fmt.Sprintf(
-			"role %q may not select any of the requested columns on %s", id.Role, rel.FullName())}
+	if s.oracle == nil {
+		res.Error = &event.Error{Code: "internal", Message: "shape oracle is not configured"}
 		return res
 	}
 
 	start := time.Now()
-	decision, err := s.authz.Resolve(ctx, rel, id, filter.Equalities)
+	grant, err := s.oracle.Resolve(ctx, oracle.Request{
+		Action:   oracle.ActionSubscribe,
+		Identity: id,
+		Relation: rel,
+		Filter:   filter,
+		Columns:  sp.Columns,
+		Ops:      sp.Ops,
+	})
 	if err != nil {
-		var denied *authz.ErrDenied
-		var tierC *authz.ErrTierCDisabled
-		switch {
-		case errors.As(err, &denied):
-			metrics.AuthzResolutions.WithLabelValues("-", "denied").Inc()
-			res.Error = &event.Error{Code: "shape_not_authorized", Message: denied.Reason}
-		case errors.As(err, &tierC):
-			metrics.AuthzResolutions.WithLabelValues("C", "refused").Inc()
-			res.Error = &event.Error{Code: "policy_requires_impersonation", Message: tierC.Reason}
-		default:
-			res.Error = &event.Error{Code: "internal", Message: err.Error()}
-		}
+		s.mapOracleErr(&res, err)
 		return res
 	}
-	metrics.AuthzResolveSeconds.WithLabelValues(string(decision.Tier)).Observe(time.Since(start).Seconds())
-	metrics.AuthzResolutions.WithLabelValues(string(decision.Tier), "granted").Inc()
-	if decision.Tier == authz.TierC {
+	decision := grant.Decision
+	filter = grant.Filter
+	tierLabel := s.tierLabel(decision)
+	metrics.AuthzResolveSeconds.WithLabelValues(tierLabel).Observe(time.Since(start).Seconds())
+	metrics.AuthzResolutions.WithLabelValues(tierLabel, "granted").Inc()
+	if decision != nil && decision.Tier == authz.TierC && s.oracle.Name() == oracle.NameRLS {
 		metrics.AuthzCompileFailures.WithLabelValues(rel.Schema, rel.Name, truncate(decision.Reason, 60)).Inc()
 	}
 
@@ -560,7 +556,7 @@ func (s *Server) subscribeShape(
 		Relation:    rel,
 		Ops:         ops,
 		Filter:      filter,
-		Columns:     allowed,
+		Columns:     grant.Columns,
 		Transitions: sp.Transitions,
 		Decision:    authz.NewHandle(decision),
 		RoutingKey:  filter.RoutingKey(rel),
@@ -568,12 +564,16 @@ func (s *Server) subscribeShape(
 
 	// Warnings. Every one carries a remedy that is a runnable statement, because
 	// a warning nobody can act on is noise.
-	if len(denied) > 0 {
+	if len(grant.Denied) > 0 {
+		remedy := fmt.Sprintf("GRANT SELECT (%s) ON %s TO %s;", strings.Join(grant.Denied, ", "), rel.FullName(), id.Role)
+		if s.oracle.Name() == oracle.NameIssuer {
+			remedy = fmt.Sprintf("GRANT SELECT (%s) ON %s TO the Sluice role, or ask the issuer to allow those columns;", strings.Join(grant.Denied, ", "), rel.FullName())
+		}
 		sub.Warnings = append(sub.Warnings, event.Warning{
 			Sub: spec.Sub, Code: "columns_not_granted",
-			Message: "these columns were dropped from the projection: " + strings.Join(denied, ", "),
+			Message: "these columns were dropped from the projection: " + strings.Join(grant.Denied, ", "),
 			Effect:  "events will not contain them",
-			Remedy:  fmt.Sprintf("GRANT SELECT (%s) ON %s TO %s;", strings.Join(denied, ", "), rel.FullName(), id.Role),
+			Remedy:  remedy,
 		})
 	}
 	if sub.RoutingKey == "" {
@@ -646,20 +646,33 @@ func (s *Server) subscribeShape(
 		return res
 	}
 
-	if !s.reg.Add(sub) {
-		res.Error = &event.Error{Code: "duplicate_sub",
-			Message: "this stream already has a subscription labelled " + spec.Sub}
+	if err := s.installShape(ctx, sub, grant.Holds); err != nil {
+		if errors.Is(err, errDuplicateSub) {
+			res.Error = &event.Error{Code: "duplicate_sub",
+				Message: "this stream already has a subscription labelled " + spec.Sub}
+			return res
+		}
+		res.Error = &event.Error{Code: "shape_not_authorized", Message: err.Error()}
 		return res
 	}
 	s.incSubMetric(sub)
 
 	res.OK = true
-	res.Tier = string(decision.Tier)
 	indexed := sub.Indexed()
 	res.Indexed = &indexed
 	res.RoutingKey = sub.RoutingKey
-	res.Reason = decision.Reason
+	res.Reason = grant.Reason
 	res.Warnings = sub.Warnings
+	if s.oracle.Name() == oracle.NameIssuer {
+		res.Oracle = oracle.NameIssuer
+		if filter != nil {
+			if d := filter.Describe(); d != "" && d != "(none)" {
+				res.Filter = d
+			}
+		}
+	} else if decision != nil {
+		res.Tier = string(decision.Tier)
+	}
 
 	for _, w := range sub.Warnings {
 		hub.SendWarning(st, w)
@@ -900,14 +913,21 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	revoked := 0
 	for _, sub := range s.reg.StreamSubscriptions(st.StreamID()) {
-		ok, err := s.authz.Refresh(r.Context(), sub.Decision, sub.Relation, newID, sub.Filter.Equalities)
-		if err != nil || !ok {
-			metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
-			hub.SendError(st, event.Error{Sub: sub.Label, Code: "shape_not_authorized",
-				Message: "the refreshed token no longer grants access to this shape"})
-			if removed := s.reg.Remove(st.StreamID(), sub.Label); removed != nil {
-				s.decSubMetric(removed)
+		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+			if !s.refreshIssuerShape(r.Context(), st, sub, newID) {
+				metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
+				revoked++
+				continue
 			}
+			metrics.AuthzLeaseRefreshes.WithLabelValues("held").Inc()
+			continue
+		}
+		eqs := sub.Filter.Equalities
+		held, err := s.oracle.LeaseTick(r.Context(), sub.Decision, sub.Relation, newID, eqs)
+		if err != nil || !held {
+			metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
+			s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
+				Message: "the refreshed token no longer grants access to this shape"})
 			revoked++
 			continue
 		}
@@ -987,9 +1007,6 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 	}
 
 	for _, sub := range subs {
-		if !catalogMoved && !sub.Decision.Load().Expired(now) {
-			continue
-		}
 		st := streamOf(sub)
 		if st == nil {
 			continue
@@ -997,26 +1014,67 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 		// Re-read the relation: the cached pointer may predate a refresh.
 		rel, ok := s.cat.Lookup(sub.Relation.Schema, sub.Relation.Name)
 		if !ok {
-			hub.SendError(st, event.Error{Sub: sub.Label, Code: "relation_unpublished",
+			s.dropShape(st, sub.Label, event.Error{Code: "relation_unpublished",
 				Message: sub.Relation.FullName() + " is no longer in the publication"})
-			if removed := s.reg.Remove(st.StreamID(), sub.Label); removed != nil {
-				s.decSubMetric(removed)
-			}
 			continue
 		}
 		sub.Relation = rel
 
-		held, err := s.authz.Refresh(ctx, sub.Decision, rel, st.Identity(), sub.Filter.Equalities)
+		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+			continue
+		}
+		if s.oracle == nil {
+			continue
+		}
+		if !catalogMoved && !sub.Decision.Load().Expired(now) {
+			continue
+		}
+
+		held, err := s.oracle.LeaseTick(ctx, sub.Decision, rel, st.Identity(), sub.Filter.Equalities)
 		if err != nil || !held {
 			metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
-			hub.SendError(st, event.Error{Sub: sub.Label, Code: "shape_not_authorized",
+			s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
 				Message: "access to this shape has been revoked"})
-			if removed := s.reg.Remove(st.StreamID(), sub.Label); removed != nil {
-				s.decSubMetric(removed)
-			}
 			continue
 		}
 		metrics.AuthzLeaseRefreshes.WithLabelValues("held").Inc()
+	}
+
+	for _, w := range s.holds.All() {
+		unpublished := false
+		riReason := ""
+		fresh := make([]*catalog.Relation, len(w.Holds))
+		for i, h := range w.Holds {
+			if h.Rel == nil {
+				unpublished = true
+				break
+			}
+			rel, ok := s.cat.Lookup(h.Rel.Schema, h.Rel.Name)
+			if !ok {
+				unpublished = true
+				break
+			}
+			if missing := hold.MissingReplicaIdentity(rel, h.Filter); len(missing) > 0 {
+				riReason = hold.ReplicaIdentityReason(rel, missing)
+				break
+			}
+			fresh[i] = rel
+		}
+		if !unpublished && riReason == "" {
+			s.holds.RefreshRels(w.StreamID, w.Label, fresh)
+			continue
+		}
+		st, ok := s.hub.Get(w.StreamID)
+		if !ok {
+			s.holds.Remove(w.StreamID, w.Label)
+			continue
+		}
+		if unpublished {
+			s.dropShape(st, w.Label, event.Error{Code: "relation_unpublished",
+				Message: "a hold table is no longer in the publication"})
+			continue
+		}
+		s.dropShape(st, w.Label, event.Error{Code: "shape_not_authorized", Message: riReason})
 	}
 }
 
@@ -1059,13 +1117,21 @@ func (s *Server) resolveStream(w http.ResponseWriter, r *http.Request, bodyID st
 }
 
 func (s *Server) incSubMetric(sub *registry.Subscription) {
+	tier := "-"
+	if d := sub.Decision.Load(); d != nil {
+		tier = s.tierLabel(d)
+	}
 	metrics.Subscriptions.WithLabelValues(sub.Relation.Schema, sub.Relation.Name,
-		string(sub.Decision.Load().Tier), boolLabel(sub.Indexed())).Inc()
+		tier, boolLabel(sub.Indexed())).Inc()
 }
 
 func (s *Server) decSubMetric(sub *registry.Subscription) {
+	tier := "-"
+	if d := sub.Decision.Load(); d != nil {
+		tier = s.tierLabel(d)
+	}
 	metrics.Subscriptions.WithLabelValues(sub.Relation.Schema, sub.Relation.Name,
-		string(sub.Decision.Load().Tier), boolLabel(sub.Indexed())).Dec()
+		tier, boolLabel(sub.Indexed())).Dec()
 }
 
 func missingFromReplicaIdentity(rel *catalog.Relation, needed []string) []string {
@@ -1090,6 +1156,234 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+var errDuplicateSub = errors.New("duplicate subscription label")
+
+func (s *Server) tierLabel(d *authz.Decision) string {
+	if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+		return oracle.NameIssuer
+	}
+	if d == nil {
+		return "-"
+	}
+	return string(d.EffectiveTier())
+}
+
+func (s *Server) impersonateSnapshots() bool {
+	if s.oracle == nil {
+		return true
+	}
+	return s.oracle.SnapshotImpersonate()
+}
+
+func (s *Server) mapOracleErr(res *subResult, err error) {
+	var denied *authz.ErrDenied
+	var issuerDenied *oracle.ErrDenied
+	var tierC *authz.ErrTierCDisabled
+	switch {
+	case errors.As(err, &denied):
+		metrics.AuthzResolutions.WithLabelValues("-", "denied").Inc()
+		res.Error = &event.Error{Code: "shape_not_authorized", Message: denied.Reason}
+	case errors.As(err, &issuerDenied):
+		metrics.AuthzResolutions.WithLabelValues("-", "denied").Inc()
+		res.Error = &event.Error{Code: issuerDenied.WireCode(), Message: issuerDenied.Reason}
+	case errors.As(err, &tierC):
+		metrics.AuthzResolutions.WithLabelValues("C", "refused").Inc()
+		res.Error = &event.Error{Code: "policy_requires_impersonation", Message: tierC.Reason}
+	default:
+		res.Error = &event.Error{Code: "internal", Message: err.Error()}
+	}
+}
+
+// refreshIssuerShape is the /token path for the issuer oracle: re-ask the
+// issuer, then apply the grant without a window where the shape is live and
+// unwatched.
+func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) bool {
+	grant, err := s.oracle.Refresh(ctx, oracle.Request{
+		Action:   oracle.ActionRefresh,
+		Identity: id,
+		Relation: sub.Relation,
+		Filter:   sub.Filter,
+		Columns:  sub.Columns,
+	})
+	if err != nil || grant == nil {
+		s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
+			Message: "the refreshed token no longer grants access to this shape"})
+		return false
+	}
+	return s.applyIssuerGrant(ctx, st, sub.Label, grant)
+}
+
+// applyIssuerGrant installs a refresh grant on a live shape. Holds are
+// replaced under one lock (never Remove then Add), then EXISTS, then the
+// effective filter, columns, and routing key are rebound. A shape already
+// cut during the issuer round-trip is not resurrected.
+func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label string, grant *oracle.Grant) bool {
+	if grant == nil || grant.Filter == nil || len(grant.Columns) == 0 || len(grant.Holds) == 0 {
+		s.dropShape(st, label, event.Error{Code: "shape_not_authorized",
+			Message: "the refreshed token no longer grants access to this shape"})
+		return false
+	}
+	if s.reg.Get(st.StreamID(), label) == nil {
+		s.holds.Remove(st.StreamID(), label)
+		return false
+	}
+	s.holds.Replace(st.StreamID(), label, grant.Holds)
+	if err := s.verifyHolds(ctx, grant.Holds); err != nil {
+		s.dropShape(st, label, event.Error{Code: "shape_not_authorized", Message: err.Error()})
+		return false
+	}
+	live := s.reg.Get(st.StreamID(), label)
+	if live == nil {
+		s.holds.Remove(st.StreamID(), label)
+		return false
+	}
+	oldIndexed := live.Indexed()
+	schema, table := live.Relation.Schema, live.Relation.Name
+	tier := "-"
+	if live.Decision != nil {
+		if d := live.Decision.Load(); d != nil {
+			tier = s.tierLabel(d)
+		}
+	}
+	rebound := s.reg.Rebind(st.StreamID(), label, grant.Filter, grant.Columns)
+	if rebound == nil {
+		s.holds.Remove(st.StreamID(), label)
+		return false
+	}
+	if oldIndexed != rebound.Indexed() {
+		metrics.Subscriptions.WithLabelValues(schema, table, tier, boolLabel(oldIndexed)).Dec()
+		s.incSubMetric(rebound)
+	}
+	return true
+}
+
+func (s *Server) verifyHolds(ctx context.Context, specs []hold.Spec) error {
+	if len(specs) == 0 {
+		return fmt.Errorf("issuer grant has no holds")
+	}
+	if s.holdExists != nil {
+		return s.holdExists(ctx, specs)
+	}
+	if s.pool == nil {
+		return fmt.Errorf("cannot verify holds without a database pool")
+	}
+	return hold.Exists(ctx, s.pool, specs)
+}
+
+// installShape registers hold watches and the shape atomically, then EXISTS
+// the holds. A DELETE already in the reader is applied by the watch.
+func (s *Server) installShape(ctx context.Context, sub *registry.Subscription, holds []hold.Spec) error {
+	sid := sub.Sink.StreamID()
+	if len(holds) > 0 {
+		if !s.holds.Add(sid, sub.Label, holds) {
+			return errDuplicateSub
+		}
+	}
+	if !s.reg.Add(sub) {
+		s.holds.Remove(sid, sub.Label)
+		return errDuplicateSub
+	}
+	if len(holds) == 0 {
+		return nil
+	}
+	if s.pool == nil {
+		s.reg.Remove(sid, sub.Label)
+		s.holds.Remove(sid, sub.Label)
+		return fmt.Errorf("cannot verify holds without a database pool")
+	}
+	if err := hold.Exists(ctx, s.pool, holds); err != nil {
+		s.reg.Remove(sid, sub.Label)
+		s.holds.Remove(sid, sub.Label)
+		return err
+	}
+	return nil
+}
+
+func (s *Server) dropShape(st *hub.Stream, label string, err event.Error) {
+	if st == nil {
+		return
+	}
+	if removed := s.reg.Remove(st.StreamID(), label); removed != nil {
+		s.decSubMetric(removed)
+	}
+	s.holds.Remove(st.StreamID(), label)
+	if err.Code == "" {
+		return
+	}
+	err.Sub = label
+	hub.SendError(st, err)
+}
+
+func (s *Server) authorizeAdmin(r *http.Request) bool {
+	header := r.Header.Get("Authorization")
+	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	if s.cfg != nil && s.cfg.IssuerMode() && s.cfg.IssuerBearer != "" &&
+		hmac.Equal([]byte(token), []byte(s.cfg.IssuerBearer)) {
+		return true
+	}
+	id, err := s.identify(r)
+	return err == nil && id.Role == "service_role"
+}
+
+// handleAdminShapesDrop is ops: it walks this node's subscriptions and cuts
+// matches. It is not the hot path.
+func (s *Server) handleAdminShapesDrop(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeAdmin(r) {
+		writeErr(w, http.StatusForbidden, "forbidden", "service_role or the issuer bearer is required")
+		return
+	}
+	var req struct {
+		Identity struct {
+			Sub  string `json:"sub"`
+			Role string `json:"role"`
+		} `json:"identity"`
+		Schema     string            `json:"schema"`
+		Table      string            `json:"table"`
+		Equalities map[string]string `json:"equalities"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	schema := cmp.Or(req.Schema, "public")
+	if req.Table == "" || len(req.Equalities) == 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request", "table and equalities are required")
+		return
+	}
+	dropped := 0
+	for _, sub := range s.reg.All() {
+		if sub.Relation.Schema != schema || sub.Relation.Name != req.Table {
+			continue
+		}
+		st := streamOf(sub)
+		if st == nil {
+			continue
+		}
+		id := st.Identity()
+		if req.Identity.Sub != "" && id.Sub != req.Identity.Sub {
+			continue
+		}
+		if req.Identity.Role != "" && id.Role != req.Identity.Role {
+			continue
+		}
+		match := true
+		for col, val := range req.Equalities {
+			got, ok := sub.Filter.Equalities[col]
+			if !ok || got.String() != val {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
+			Message: "this shape was dropped by an operator"})
+		dropped++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dropped": dropped})
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

@@ -227,6 +227,26 @@ func (c *Cache) All() []*Relation {
 	return out
 }
 
+// PutForTest installs relations into the cache. Tests only; not a product API.
+func (c *Cache) PutForTest(rels ...*Relation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byOID == nil {
+		c.byOID = map[uint32]*Relation{}
+	}
+	if c.byName == nil {
+		c.byName = map[string]*Relation{}
+	}
+	for _, r := range rels {
+		if r == nil {
+			continue
+		}
+		c.byOID[r.OID] = r
+		c.byName[r.FullName()] = r
+	}
+	c.loaded = time.Now()
+}
+
 const relationQuery = `
 SELECT c.oid::oid,
        n.nspname,
@@ -547,6 +567,32 @@ func (c *Cache) HasColumnPrivilege(ctx context.Context, role, relation string, c
 		role, relation, columns)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: has_column_privilege: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var col string
+		var ok bool
+		if err := rows.Scan(&col, &ok); err != nil {
+			return nil, err
+		}
+		out[col] = ok
+	}
+	return out, rows.Err()
+}
+
+// HasColumnPrivilegeCurrent is HasColumnPrivilege for the pool's current role.
+// Issuer snapshots and projections use physical SELECT, not the JWT role's ACL.
+func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, relation string, columns []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(columns))
+	if len(columns) == 0 {
+		return out, nil
+	}
+	rows, err := c.pool.Query(ctx,
+		`SELECT col, has_column_privilege($1::regclass, col, 'SELECT')
+		   FROM unnest($2::text[]) AS col`,
+		relation, columns)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: has_column_privilege (current): %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {

@@ -209,6 +209,73 @@ func TestParseOps(t *testing.T) {
 	}
 }
 
+func TestNarrowFillsAuthorizedEqualitiesAndKeepsClientTerms(t *testing.T) {
+	r := rel()
+	auth, err := Parse("owner_id=eq.abc", r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := Parse("score=gte.10", r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Narrow(auth, client, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Equalities["owner_id"].String() != "abc" {
+		t.Fatalf("authorized equality was dropped: %v", got.Equalities)
+	}
+	if len(got.Terms) != 2 {
+		t.Fatalf("terms = %d, want 2 (authorized + client)", len(got.Terms))
+	}
+}
+
+func TestNarrowAllowsOmittingAuthorizedEquality(t *testing.T) {
+	r := rel()
+	auth, _ := Parse("owner_id=eq.abc", r)
+	got, err := Narrow(auth, nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Equalities["owner_id"].String() != "abc" {
+		t.Fatalf("omitting the equality must not widen: %v", got.Equalities)
+	}
+}
+
+func TestNarrowRejectsConflictingEquality(t *testing.T) {
+	r := rel()
+	auth, _ := Parse("owner_id=eq.abc", r)
+	client, _ := Parse("owner_id=eq.xyz", r)
+	if _, err := Narrow(auth, client, r); err == nil {
+		t.Fatal("a conflicting equality must be denied, not become an empty shape")
+	}
+}
+
+func TestNarrowRejectsWholeTableGrant(t *testing.T) {
+	r := rel()
+	auth, _ := Parse("", r)
+	if _, err := Narrow(auth, nil, r); err == nil {
+		t.Fatal("an authorized filter with no equality is a whole-table grant and must be refused")
+	}
+}
+
+func TestConcrete(t *testing.T) {
+	r := rel()
+	empty, _ := Parse("", r)
+	if empty.Concrete() {
+		t.Fatal("empty filter is not concrete")
+	}
+	eq, _ := Parse("owner_id=eq.abc", r)
+	if !eq.Concrete() {
+		t.Fatal("eq filter must be concrete")
+	}
+	neg, _ := Parse("owner_id=not.eq.abc", r)
+	if neg.Concrete() {
+		t.Fatal("a negated equality must not count as concrete")
+	}
+}
+
 func TestColumnsNeededDeduplicates(t *testing.T) {
 	f, _ := Parse("score=gt.1,score=lt.9,owner_id=eq.x", rel())
 	got := f.ColumnsNeeded()

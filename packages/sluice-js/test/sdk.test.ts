@@ -206,6 +206,38 @@ test('surfaces the tier and warnings the server reported', async () => {
   client.close()
 })
 
+test('issuer ready carries oracle and filter, not a fake tier', async () => {
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async () =>
+      new Response(
+        'event: ready\ndata: ' +
+          JSON.stringify({
+            stream_id: 'n1.x',
+            subscriptions: [
+              {
+                sub: 's1',
+                ok: true,
+                oracle: 'issuer',
+                filter: 'project_id=eq.42',
+                indexed: true,
+                routing_key: 'project_id',
+              },
+            ],
+          }) +
+          '\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+  })
+
+  const sub = await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  assert.equal(sub.oracle, 'issuer')
+  assert.equal(sub.filter, 'project_id=eq.42')
+  assert.equal(sub.tier, undefined)
+  client.close()
+})
+
 test('routes change events to the right subscription and applies handlers by op', async () => {
   const change = {
     sub: 's1',

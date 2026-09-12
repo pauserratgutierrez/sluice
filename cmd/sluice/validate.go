@@ -231,27 +231,89 @@ func validate(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, log *
 	}
 
 	// ---- impersonation capability ----------------------------------------
-	for _, role := range cfg.AllowedRoles {
-		if role == "service_role" {
-			continue // BYPASSRLS; never impersonated
+	// RLS mode assumes application roles via SET LOCAL ROLE. Issuer mode does
+	// not impersonate: it reads with the pool role and refuses to start unless
+	// that role can SELECT published tables and bypass RLS (or RLS is off).
+	if cfg.IssuerMode() {
+		if err := validateIssuerPrivileges(ctx, pool, cfg); err != nil {
+			return err
 		}
-		var canSet bool
-		// MEMBER, not USAGE. USAGE asks whether the role's privileges are
-		// available WITHOUT SET ROLE, which is false by design for a NOINHERIT
-		// role -- and NOINHERIT is exactly what we want, so that the authz role
-		// can only ever act as an application role deliberately.
-		if err := pool.QueryRow(ctx,
-			`SELECT pg_has_role(current_user, $1, 'MEMBER')`, role).Scan(&canSet); err != nil {
-			log.Warn("validate: could not check role membership", "role", role, "err", err)
-			continue
-		}
-		if !canSet {
-			return fmt.Errorf("validate: the authz role cannot assume %q; "+
-				"grant it with: GRANT %s TO <authz role>", role, role)
+	} else {
+		for _, role := range cfg.AllowedRoles {
+			if role == "service_role" {
+				continue // BYPASSRLS; never impersonated
+			}
+			var canSet bool
+			// MEMBER, not USAGE. USAGE asks whether the role's privileges are
+			// available WITHOUT SET ROLE, which is false by design for a NOINHERIT
+			// role -- and NOINHERIT is exactly what we want, so that the authz role
+			// can only ever act as an application role deliberately.
+			if err := pool.QueryRow(ctx,
+				`SELECT pg_has_role(current_user, $1, 'MEMBER')`, role).Scan(&canSet); err != nil {
+				log.Warn("validate: could not check role membership", "role", role, "err", err)
+				continue
+			}
+			if !canSet {
+				return fmt.Errorf("validate: the authz role cannot assume %q; "+
+					"grant it with: GRANT %s TO <authz role>", role, role)
+			}
 		}
 	}
 
 	log.Info("startup validation passed",
-		"wal_level", walLevel, "publication", cfg.Publication, "slot", cfg.SlotName)
+		"wal_level", walLevel, "publication", cfg.Publication, "slot", cfg.SlotName,
+		"shape_oracle", cfg.ShapeOracle)
+	return nil
+}
+
+func validateIssuerPrivileges(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) error {
+	var bypass bool
+	if err := pool.QueryRow(ctx, `
+		SELECT rolbypassrls OR rolsuper
+		  FROM pg_roles WHERE rolname = current_user`).Scan(&bypass); err != nil {
+		return fmt.Errorf("validate: read BYPASSRLS for current_user: %w", err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT n.nspname, c.relname, c.relrowsecurity,
+		       has_table_privilege(c.oid, 'SELECT')
+		  FROM pg_publication p
+		  JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+		  JOIN pg_class c ON c.oid = pr.prrelid
+		  JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE p.pubname = $1`, cfg.Publication)
+	if err != nil {
+		return fmt.Errorf("validate: inspect issuer table privileges: %w", err)
+	}
+	defer rows.Close()
+
+	var rlsBlocked, noSelect []string
+	for rows.Next() {
+		var schema, name string
+		var rls, canSelect bool
+		if err := rows.Scan(&schema, &name, &rls, &canSelect); err != nil {
+			return err
+		}
+		rel := schema + "." + name
+		if !canSelect {
+			noSelect = append(noSelect, rel)
+		}
+		if rls && !bypass {
+			rlsBlocked = append(rlsBlocked, rel)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(noSelect) > 0 {
+		return fmt.Errorf("validate: issuer mode: the pool role cannot SELECT published table(s) %v; "+
+			"GRANT SELECT ON those tables to the Sluice role", noSelect)
+	}
+	if len(rlsBlocked) > 0 {
+		return fmt.Errorf("validate: issuer mode: published table(s) %v have row-level security enabled "+
+			"and the Sluice role does not bypass it. Snapshots and hold EXISTS would be judged by RLS, "+
+			"which is a second oracle. ALTER ROLE <sluice> BYPASSRLS, or DISABLE ROW LEVEL SECURITY on those tables",
+			rlsBlocked)
+	}
 	return nil
 }

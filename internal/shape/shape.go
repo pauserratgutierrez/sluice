@@ -373,6 +373,54 @@ func (f *Filter) SQL(next int) (string, []any) {
 	return strings.Join(parts, " AND "), args
 }
 
+// Concrete reports whether the filter pins at least one column to a non-negated
+// equality. The issuer oracle requires this so a grant cannot mean "the whole
+// table"; an empty *result* (zero matching rows) is a different thing and is
+// allowed.
+func (f *Filter) Concrete() bool {
+	return f != nil && len(f.Equalities) > 0
+}
+
+// Narrow combines an authorized filter with a client filter as AND.
+//
+// Every authorized equality must survive: the client may omit it (it is filled
+// in) or repeat it, but may not change its constant. Extra client terms are
+// kept. A conflicting equality is an error rather than a silently empty shape.
+func Narrow(authorized, client *Filter, rel *catalog.Relation) (*Filter, error) {
+	if authorized == nil || !authorized.Concrete() {
+		return nil, fmt.Errorf("authorized filter must contain at least one equality; a grant for the whole table is refused")
+	}
+	if rel == nil {
+		return nil, fmt.Errorf("narrow: relation is required")
+	}
+	if client != nil {
+		for col, av := range authorized.Equalities {
+			if cv, ok := client.Equalities[col]; ok && cv.String() != av.String() {
+				return nil, fmt.Errorf("filter would widen or contradict the authorized equality on %q", col)
+			}
+		}
+	}
+
+	raw := authorized.Raw
+	if raw == "" {
+		raw = authorized.Describe()
+	}
+	if client != nil {
+		extra := client.Raw
+		if extra == "" {
+			extra = client.Describe()
+		}
+		if extra != "" && extra != "(none)" {
+			if raw == "" || raw == "(none)" {
+				raw = extra
+			} else {
+				raw = raw + "," + extra
+			}
+		}
+	}
+	return Parse(raw, rel)
+}
+
 // Describe renders the filter for diagnostics.
 func (f *Filter) Describe() string {
 	if len(f.Terms) == 0 {

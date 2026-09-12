@@ -42,7 +42,7 @@ Sluice is a realtime data-streaming server for PostgreSQL. It replaces `supabase
 
 ### Goals
 
-- **Stream PostgreSQL row changes to authenticated web clients**, correctly filtered by the same row-level security and grants that govern ordinary reads.
+- **Stream PostgreSQL row changes to authenticated web clients**, correctly filtered by the **shape oracle** this process is running: either the same row-level security and grants that govern ordinary reads (`rls`), or an application HTTP issuer that returns a concrete shape and holds (`issuer`).
 - **Provide ephemeral messaging and presence** that never touch the database.
 - **Require nothing installed in the database.** No extensions, no tables, no functions, no schemas. A stock PostgreSQL 15+ with `wal_level=logical` and a publication is sufficient.
 - **Scale with the write rate, not with the subscriber count.** Authorization must not be on the per-message path.
@@ -106,12 +106,21 @@ Sluice's contribution is to make this **sound and automatic** rather than a conv
 | **Stream** | One long-lived SSE response. One per client connection. Identified by a `stream_id`. |
 | **Subscription** | A registered interest attached to a Stream. Identified by a client-chosen `sub` label, unique within the Stream. |
 | **Shape** | A replication-plane subscription target: `{schema, table, ops, filter, columns}`. Borrowed from Electric's vocabulary because it is well-understood. |
-| **Channel** | A signalling-plane subscription target: a free-form namespaced string, e.g. `room:42`. |
-| **Predicate** | The combined RLS `SELECT` policy expression for a relation: permissive policies OR'd, restrictive policies AND'ed. |
-| **Tier** | Which of three authorization strategies a subscription resolved to. See [§7](#7-the-authorization-model). |
+| **Oracle** | The process-wide judge of shapes. One of `rls` or `issuer`. Chosen at deploy time; there is no AND/OR of the two. |
+| **Issuer** | The HTTP endpoint the `issuer` oracle calls at join and on `/token`. The application owns it. Sluice does not re-send the user's access token, only verified identity. |
+| **Effective filter** | `authorized AND client`, AND-only. The client may omit or narrow; it cannot change an authorized equality or keep a whole table. |
+| **Narrowing** | Combining the issuer's authorized filter with the client's. Conflicting equalities are a deny, not a silently empty shape. |
+| **Hold** | A row that *keeps the permission alive*, named by the issuer. EXISTS at join is only of holds, never of the subscribed table. The first hold that stops matching (DELETE, or UPDATE leaving the filter) cuts **that** shape with `shape_not_authorized`. The stream stays open. |
+| **Publication** | The PostgreSQL publication Sluice reads. Hold tables and shape tables must be in it. If a relation leaves it, those shapes and hold watches are dropped (`relation_unpublished`). |
+| **Replica identity** | PostgreSQL `REPLICA IDENTITY` — which columns appear in WAL old tuples. Hold filter columns must be in it, or subscribe is denied: a DELETE cannot be cut without them. This is WAL, not a Sluice convention. |
+| **Channel** | A signalling-plane subscription target: a free-form namespaced string, e.g. `room:42`. Independent of the shape oracle. |
+| **Predicate** | The combined RLS `SELECT` policy expression for a relation: permissive policies OR'd, restrictive policies AND'ed. Used only by the `rls` oracle. |
+| **Tier** | Which of three authorization strategies an **RLS** subscription resolved to. Issuer mode has no tiers and does not send `tier` on the wire. |
 | **Routing key** | `(relation OID, column, constant)` — the index entry used to find interested subscriptions in O(1). |
 | **Reader** | The single process/goroutine holding the replication connection. |
 | **Hub** | The sharded in-process fan-out layer. |
+| **`shape_not_authorized`** | That shape is not permitted (denied at join, issuer refresh deny, hold gone, admin drop). The stream and other subscriptions continue. |
+| **`session_revoked`** | The identity backing the **stream** is gone (`auth.sessions` DELETE). The stream closes. Different axis from holds. |
 
 ---
 
@@ -146,6 +155,8 @@ GRANT anon, authenticated TO sluice_authz;
 `sluice_repl` needs **no table privileges at all** — verified: a role with `REPLICATION` and zero grants streams every column of every published table. `REPLICATION` is documented as *"a very highly privileged role"*, which is exactly why it is not the role used for anything else.
 
 `sluice_authz` mirrors PostgREST's `authenticator`: `NOINHERIT` so it can only *assume* application roles via `SET LOCAL ROLE`, never use their privileges implicitly. It needs `SELECT` on published tables **only if** initial snapshots are enabled — and then only via the assumed role, so no direct grant is required.
+
+**Issuer mode does not change that LOGIN.** The pool still uses `SLUICE_DB_AUTHZ_URL`. What changes is how it *uses* the connection: no `SET ROLE`, no claims. Snapshots and hold EXISTS run as the pool role, so that role needs `GRANT SELECT` on published tables (including hold tables) and **`BYPASSRLS` or RLS off** on them. Startup refuses to run if a published table has RLS and the role does not bypass — otherwise RLS would become a second judge. This check exists only when `SLUICE_SHAPE_ORACLE=issuer`.
 
 ### Publication
 
@@ -318,7 +329,14 @@ A client opens **one** Stream and registers **many** Subscriptions on it. Each S
 
 ## 7. The authorization model
 
-This is the core of the design. Three tiers, chosen automatically, with the tier exposed in metrics and in the subscribe response.
+Authorization is resolved **once, at subscribe time**, into a filter. It is never evaluated per message. That decision is the whole point of Sluice; which **oracle** produces the grant is a deploy-time choice.
+
+`SLUICE_SHAPE_ORACLE=rls | issuer`. One per process. No AND/OR. Channels (`public | owner | hook`) combine with either.
+
+- **`rls` (default).** GRANT + RLS, three tiers, JWT impersonation on snapshots, leases for volatile predicates. The rest of this section is that oracle.
+- **`issuer`.** One HTTP call to the application at join and one per shape on `/token`. Fail closed. The issuer returns a **concrete** shape (≥1 non-negated equality) and ≥1 **hold**. Sluice computes `effective = authorized AND client`, installs the shape and the hold watches **then** EXISTS the holds, and cuts that shape when a hold row disappears from the WAL. No lease back to the issuer. No tiers on the wire (`oracle: "issuer"`, effective `filter`, no `tier`). Snapshots are privileged (no `SET ROLE`). The hot path is still `deliver`: a granted no-op Decision plus the effective filter.
+
+Sluice does not judge the business. The issuer can be any API; a typical handler reuses the same `Authorize` as the resource GET. The client never presents a capability token. Admin `POST .../admin/shapes/drop` is ops, not the product kick path: it walks this node's subscriptions; it is not the hot path.
 
 ### 7.0 Preliminaries
 
@@ -532,13 +550,21 @@ Examples: `owner_id=eq.7f3a...`, `status=in.(open,pending),priority=gte.3`, `arc
 
 ### 8.2 Narrowing only
 
-When a Stream's shape was authorized by a server-side policy or a gatekeeper token, any client-supplied refinement is combined as:
+When the **issuer** oracle authorizes a shape, any client-supplied refinement is combined as:
 
 ```
-WHERE {authorized_shape_filter} AND ({client_filter})
+effective = authorized_filter AND client_filter
 ```
 
-A client filter can only ever narrow. This is Electric's rule and it is not negotiable.
+Rules, enforced in Sluice (the issuer can be wrong; Sluice does not trust it):
+
+- The authorized filter uses the same grammar as [§8.1](#81-filter-grammar) and must contain **at least one non-negated equality**. Otherwise deny — that would be a whole-table grant. An *empty result* (zero rows currently matching) is not an error.
+- For each authorized equality, the effective filter carries that constant. The client may omit it or add terms. A conflicting equality is a **deny**, not a silently empty shape.
+- Columns are the intersection of the request and the issuer allowlist. Empty intersection is a deny. If the issuer omits `columns`, Sluice uses every column the **pool role** can `SELECT` (physical privilege, not the JWT ACL).
+
+The `rls` oracle does not use a separate authorized filter: `Visible` applies the policy. The client still cannot widen *relative to the policy*.
+
+This is Electric's rule and it is not negotiable.
 
 ### 8.3 The routing index
 
@@ -624,6 +650,8 @@ ERROR:  cannot delete from table "docs" because it does not have a replica ident
 
 **Application deletes fail.** Sluice validates this at startup and on every `Relation` message ([§19](#19-startup-validation)).
 
+**Holds (issuer oracle).** Every column in a hold filter must be in that table's replica identity. If it is not, **subscribe is denied** with an actionable remedy — not a warning, not an optional strict flag. Without those columns in the old tuple, a DELETE cannot cut the grant. This is PostgreSQL `REPLICA IDENTITY`, not a Sluice convention.
+
 ### What Sluice does at subscribe time
 
 If a shape's filter references a column not present in the relation's replica identity, **and** `ops` includes `DELETE` or transition detection is requested, Sluice returns the subscription with a warning and the exact remedy:
@@ -682,6 +710,8 @@ All under a configurable prefix, default `/sluice/v1`.
 | `POST` | `/publish` | Broadcast to a channel. |
 | `POST` | `/presence` | `track` / `update` / `untrack`. |
 | `POST` | `/token` | Rebind the stream to a refreshed access token. |
+| `POST` | `/admin/jwks/refresh` | Reload JWKS. `service_role`. |
+| `POST` | `/admin/shapes/drop` | Ops: drop matching issuer/rls shapes by identity + relation + equalities. Walks this node's subscriptions; not the hot path. `service_role` or the issuer bearer. |
 | `GET` | `/healthz` | Liveness. Unauthenticated. |
 | `GET` | `/readyz` | Readiness: slot connected, catalog loaded. |
 | `GET` | `/metrics` | Prometheus. Optionally token-protected. |
@@ -738,10 +768,13 @@ data: {"stream_id":"n1.k7Fq3xZm","server_time":"2026-08-08T15:04:05.123Z",
        "heartbeat_ms":20000,"wal_lsn":"1A2B/3C4D18",
        "subscriptions":[
          {"sub":"docs","tier":"A","indexed":true,"routing_key":"owner_id",
-          "replica_identity":"i","warnings":[]},
-         {"sub":"room","ok":true},
-         {"sub":"order","ok":true}]}
+          "warnings":[]},
+         {"sub":"inbox","ok":true,"oracle":"issuer","filter":"project_id=eq.42",
+          "indexed":true,"routing_key":"project_id"},
+         {"sub":"room","ok":true}]}
 ```
+
+RLS subscriptions send `tier` A/B/C (`oracle` may be omitted). Issuer subscriptions send `oracle: "issuer"` and the effective `filter`, and **do not** send `tier`.
 
 **`change`** — replication plane.
 
@@ -821,7 +854,9 @@ Response is per-subscription, and a partial failure is not a request failure:
 ```json
 { "results": [
     { "sub": "tasks", "ok": true, "tier": "B", "indexed": false,
-      "warnings": [{ "code":"unindexed_shape", "message":"...", "remedy":"..." }] } ] }
+      "warnings": [{ "code":"unindexed_shape", "message":"...", "remedy":"..." }] },
+    { "sub": "inbox", "ok": true, "oracle": "issuer", "filter": "project_id=eq.42",
+      "indexed": true, "routing_key": "project_id" } ] }
 ```
 
 **`/publish`**
@@ -846,9 +881,45 @@ Response is per-subscription, and a partial failure is not a request failure:
 { "stream_id":"n1.k7Fq3xZm", "access_token":"eyJ..." }
 ```
 
-Re-verifies, re-checks session liveness, and **re-evaluates every Tier A/B decision on the stream**, because the claims may have changed. Tokens whose `sub` differs from the stream's are rejected. If a subscription is no longer authorized, an `error` event is emitted for it and it is removed — the stream survives.
+Re-verifies, rejects a `sub` change, and re-authorizes every shape on the stream. **RLS:** re-evaluates every tiered decision (claims may have changed). **Issuer:** one HTTP hop per shape (`action: "refresh"`); a deny drops that subscription, the stream survives. There is no periodic lease to the issuer.
 
-Streams whose token expires without a `/token` refresh are closed with `code: "token_expired"`, matching Supabase's behaviour.
+An expired access token without `/token` closes the **stream** with `token_expired`. A hold that disappears cuts **that shape** with `shape_not_authorized` while the token is still valid.
+
+**Issuer HTTP** (internal, `Authorization: Bearer <SLUICE_ISSUER_BEARER>`). One hop at join and one per shape on `/token`. Timeout / non-2xx / unreadable body → deny. Identity only (`role`, `sub`, `session_id`, `claims`); the user access token is not forwarded.
+
+Request:
+
+```json
+{
+  "action": "subscribe",
+  "identity": { "role": "authenticated", "sub": "...", "session_id": "...", "claims": {} },
+  "requested": {
+    "schema": "public", "table": "documents",
+    "filter": "project_id=eq.42,status=eq.open",
+    "columns": ["id", "title"],
+    "ops": ["INSERT", "UPDATE", "DELETE"]
+  }
+}
+```
+
+Response 200:
+
+```json
+{
+  "allow": true,
+  "shape": {
+    "schema": "public", "table": "documents",
+    "filter": "project_id=eq.42",
+    "columns": ["id", "title", "body"]
+  },
+  "holds": [
+    { "schema": "public", "table": "project_members",
+      "filter": "project_id=eq.42,user_id=eq.<sub>" }
+  ]
+}
+```
+
+`holds` is required and non-empty. Each hold table must be in the publication; its filter must have equalities whose columns are in that table's replica identity. `shape.schema` / `shape.table` must match the catalog (`relname`, not an alias): `Documents` ≠ `documents`, and a grant for another name is denied. PostgreSQL folds unquoted identifiers to lowercase; quoted names that differ are distinct relations.
 
 ### 10.6 Resume semantics
 
@@ -1047,7 +1118,7 @@ Held on a dedicated connection for the reader's lifetime. Only the leader opens 
 
 1. Diffs the column list. Columns that disappeared are removed from projections; subscriptions requesting them get a `warning` event.
 2. Revalidates the replica identity and emits/clears warnings.
-3. Invalidates the cached policy set for that relation and re-resolves the tier for every subscription on it. **A policy change must be able to revoke access**, so re-resolution can downgrade Tier A to a denial.
+3. In **rls** mode: invalidates the cached policy set for that relation and re-resolves the tier for every subscription on it. **A policy change must be able to revoke access**, so re-resolution can downgrade Tier A to a denial. In **issuer** mode the catalog tick does **not** call the issuer and does not re-evaluate RLS; it drops subscriptions and hold watches whose relation left the publication (`relation_unpublished`) and those whose hold replica identity no longer covers the hold filter (`shape_not_authorized`, same reason as join).
 4. Emits `event: warning` with `code: "schema_changed"` to affected subscriptions.
 
 Because DDL is not replicated, `Relation` is the only in-band signal available. A periodic catalog poll (`catalog_refresh`, default `30s`) covers policy changes that do not alter a relation's shape and therefore produce no `Relation` message.
@@ -1063,13 +1134,16 @@ The classic race: fetch initial state over HTTP, then subscribe, and lose everyt
 ```
 1. floor := reader.confirmedLSN          // reader is always at or behind the WAL head
 2. BEGIN ISOLATION LEVEL REPEATABLE READ;
-     SET LOCAL role, request.jwt.claims  // the subscriber's identity — RLS applies
-     SELECT <columns> FROM <table> WHERE <filter> ORDER BY <pk> LIMIT <page>;
+     -- rls: SET LOCAL role + claims so PostgreSQL applies RLS
+     -- issuer: no SET ROLE; SELECT as the pool role (BYPASSRLS or RLS off)
+     SELECT <columns> FROM <table> WHERE <effective filter> ORDER BY <pk> LIMIT <page>;
      ... paged ...
    COMMIT;
 3. replay the relation ring buffer from `floor`, re-filtered and re-authorized
 4. continue live
 ```
+
+Zero rows is success: `snapshot_end` with `rows: 0` is a valid empty shape. The permission lives in the hold, not in “the table already has rows”.
 
 Taking `floor` from the **reader's confirmed LSN before the snapshot transaction begins** guarantees no gaps: the reader cannot be ahead of any transaction the snapshot can see, so replaying from `floor` covers every commit the snapshot might have missed. Duplicates are possible and expected — clients upsert by primary key. This is deliberately the safe direction; using `pg_current_wal_lsn()` instead would leave a narrow window where a commit record written before the snapshot but not yet visible could be skipped.
 
@@ -1309,6 +1383,7 @@ A human-readable JSON report, `service_role` only, answering "what is wrong with
 
 ```json
 {
+  "oracle": "rls",
   "slot": { "name":"sluice", "active":true, "retained_bytes":1048576,
             "retained_pct_of_cap":0.02, "wal_status":"reserved" },
   "publication": { "name":"sluice", "tables":12, "has_row_filters":false },
@@ -1342,7 +1417,7 @@ A human-readable JSON report, `service_role` only, answering "what is wrong with
 }
 ```
 
-Every warning has a `remedy` that is a runnable statement or a concrete instruction.
+Every warning has a `remedy` that is a runnable statement or a concrete instruction. In issuer mode the report sets `"oracle":"issuer"` (URL, hold count) and does not treat RLS policies as the judge.
 
 ### Logging
 
@@ -1368,7 +1443,8 @@ Checked at startup and re-checked on every `Relation` message:
 | `idle_replication_slot_timeout` is `0`, or comfortably larger than any expected outage | **warn** — non-zero means a long outage destroys the slot and the change stream |
 | published tables have primary keys | **warn** per table |
 | tables with `REPLICA IDENTITY FULL` have TOAST-able columns | **warn** with measured amplification |
-| `sluice_authz` can `SET ROLE` to each configured application role | **fatal** if impersonation is enabled |
+| `sluice_authz` can `SET ROLE` to each configured application role | **fatal** if `SLUICE_SHAPE_ORACLE=rls` |
+| published tables: pool role has `SELECT`, and `BYPASSRLS` or RLS off | **fatal** if `SLUICE_SHAPE_ORACLE=issuer` |
 | JWKS is fetchable and contains at least one key of the pinned algorithm | **fatal** |
 | JWKS does not contain a symmetric `oct` key | **warn** — `supabase-headless`'s own smoke test asserts this |
 | `pg_logical_emit_message` is executable by the app role | **warn** if DB broadcast is enabled |
@@ -1400,8 +1476,8 @@ A `relreplident = 'i'` row with `adequate = false` means somebody dropped the in
 
 ### Trust boundaries
 
-- **PostgreSQL is the authority on what a user may read.** Sluice never invents a rule. Everything it enforces is derived from `pg_policy`, `pg_class.relrowsecurity`, and `has_column_privilege`.
-- **The JWT is the only client identity.** Verified with a pinned algorithm against a JWKS. Streams are bound to `sub` and `session_id` at open time and cannot change identity via `/token`.
+- **The shape oracle is the authority on what a user may read.** In `rls` mode that is PostgreSQL: `pg_policy`, `relrowsecurity`, `has_column_privilege`. In `issuer` mode that is the application endpoint; Sluice only enforces concreteness, narrowing, publication, replica identity on holds, and physical `SELECT` for the pool role. RLS is not a second judge on that path.
+- **The JWT is the only client identity.** Verified with a pinned algorithm against a JWKS. Streams are bound to `sub` and `session_id` at open time and cannot change identity via `/token`. The issuer sees that identity, not the access token.
 - **`sluice_repl` sees everything.** Confirmed: a `REPLICATION` role with zero grants reads every column of every published table. This is inherent to logical decoding. Consequences: its credential is as sensitive as a superuser's, it is used for nothing else, and Sluice never logs decoded row data.
 
 ### Specific measures
@@ -1523,7 +1599,11 @@ SLUICE_ANON_ROLE=anon
 SLUICE_ALLOWED_ROLES=anon,authenticated,service_role
 
 # ── authorization ─────────────────────────────────────────────────────────
-SLUICE_AUTHZ_LEASE=60s                # for volatile predicates only
+SLUICE_SHAPE_ORACLE=rls              # rls | issuer
+SLUICE_ISSUER_URL=                   # required when oracle=issuer
+SLUICE_ISSUER_BEARER=                # required when oracle=issuer; not the user JWT
+SLUICE_ISSUER_TIMEOUT=2s
+SLUICE_AUTHZ_LEASE=60s                # for volatile RLS predicates only
 SLUICE_CATALOG_REFRESH=30s
 SLUICE_TIER_C=allow                   # allow | deny
 SLUICE_TIER_C_MAX_PROBES_PER_SECOND=2000
@@ -1580,6 +1660,8 @@ sluice/
 ├── cmd/sluice/                     server wiring, startup validation, graceful shutdown
 ├── cmd/keygen/                     harness secrets and ES256 API keys
 ├── cmd/smoke/                      end-to-end harness validation (~36 assertions)
+├── cmd/smoke-issuer/               issuer overlay smoke (does not replace the 36)
+├── cmd/issuer-stub/                harness HTTP issuer for cmd/smoke-issuer
 ├── cmd/audit/                      production-readiness battery (RLS spectrum, WAL edges, diagnostics)
 ├── cmd/load/                       realtime stress probe against the harness
 ├── internal/
@@ -1587,8 +1669,10 @@ sluice/
 │   ├── auth/                       JWT/JWKS verification, alg pinning, revocation
 │   ├── catalog/                    policies, grants, columns, RI, indexes (cached)
 │   ├── authz/                      three-tier authorizer, probes, leases, Tier B verify
+│   ├── oracle/                     shape oracle: rls wrapper, issuer HTTP client
+│   ├── hold/                       issuer hold index, EXISTS, WAL cut
 │   ├── expr/                       convert (pgparser AST) / analyze / fold / evaluate
-│   ├── shape/                      filter grammar, routing-key selection
+│   ├── shape/                      filter grammar, narrowing, routing-key selection
 │   ├── registry/                   constant-indexed subscription index
 │   ├── pgoutput/                   logical replication decoder (owns the 'u' marker)
 │   ├── reader/                     single replication connection, LSN feedback, leader lock
@@ -1689,7 +1773,11 @@ Test coverage grew from the swap: **106 new subtests** across grammar breadth (e
 
 The cost is binary size: the goyacc tables take the `sluice` binary to ~25 MB. For a server that is not a consideration.
 
-PostgREST is in the harness deliberately: it is the **authorization oracle**. The correctness invariant Sluice must satisfy is *"a client receives a change for row R if and only if that client could `SELECT` row R through PostgREST"*, and having both in the harness makes that invariant directly testable.
+PostgREST is in the harness deliberately: it is the **authorization oracle** for **RLS** mode. The correctness invariant Sluice must satisfy in that mode is *"a client receives a change for row R if and only if that client could `SELECT` row R through PostgREST"*, and having both in the harness makes that invariant directly testable.
+
+### v0.4 — issuer shape oracle
+
+A second, process-wide oracle: `SLUICE_SHAPE_ORACLE=issuer`. Same tube (SSE, WAL, registry, snapshot, resume, channels). The application authorizes at join over HTTP, Sluice narrows AND-only, and a hold row on the same slot is the kick. RLS LOGIN, tiers, and the harness default are unchanged. The harness issuer smoke (`cmd/smoke-issuer`) is an overlay on the same compose up — a second process, publication, and stub — and does not replace the 36 RLS assertions.
 
 ### Next — hardening (not done)
 

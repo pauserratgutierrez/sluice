@@ -22,7 +22,9 @@
  *   .on('*', ({ op, record }) => console.log(op, record?.title))
  *   .subscribe()
  *
- * if (docs.tier === 'C') {
+ * if (docs.oracle === 'issuer') {
+ *   console.log('effective filter', docs.filter)
+ * } else if (docs.tier === 'C') {
  *   console.warn('this subscription authorizes per change', docs.warnings)
  * }
  * ```
@@ -49,6 +51,7 @@ export type {
   GenericTable,
   Json,
   Operation,
+  Oracle,
   PresenceMember,
   PresencePayload,
   ReadyPayload,

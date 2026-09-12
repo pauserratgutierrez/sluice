@@ -27,6 +27,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/config"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
+	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/reader"
 	"github.com/pauserratgutierrez/sluice/internal/server"
 )
@@ -166,9 +167,15 @@ func run() error {
 			"postgres_said", pgSaid)
 	}
 
+	orc, err := oracle.New(cfg, az, cat)
+	if err != nil {
+		return fmt.Errorf("shape oracle: %w", err)
+	}
+	log.Info("shape oracle", "oracle", orc.Name())
+
 	srv := server.New(ctx, server.Options{
 		Config: cfg, Logger: log, Pool: pool,
-		Catalog: cat, Authz: az, Hub: h,
+		Catalog: cat, Authz: az, Oracle: orc, Hub: h,
 		Verify: verifier, Revoker: revoker,
 	})
 

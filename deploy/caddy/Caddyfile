@@ -80,6 +80,20 @@
 		}
 	}
 
+	# Issuer overlay. Same as /sluice/v1: do not strip the prefix; the process
+	# listens on SLUICE_PATH_PREFIX=/sluice-issuer/v1.
+	handle /sluice-issuer/v1/* {
+		reverse_proxy sluice-issuer:4000 {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
 	handle {
 		header Content-Type "application/json"
 		respond `{"error":"not_found"}` 404

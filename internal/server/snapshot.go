@@ -79,10 +79,13 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	s.replayFrom(sub, floor)
 }
 
-// readSnapshot performs the impersonated, RLS-enforced read.
+// readSnapshot performs the initial consistent read.
+//
+// RLS mode impersonates the caller so PostgreSQL applies the same policies as
+// any query. Issuer mode selects as the pool role (BYPASSRLS or RLS off) using
+// the effective filter; zero rows is success.
 func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) ([]map[string]any, error) {
 	rel := sub.Relation
-	id := streamOf(sub).Identity()
 
 	// The impersonation runs as its own statement with its own parameters, so the
 	// filter can number from $1 without colliding.
@@ -125,10 +128,13 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx,
-		`SELECT set_config('role', $1, true), set_config('request.jwt.claims', $2, true)`,
-		id.Role, id.ClaimsRaw); err != nil {
-		return nil, err
+	if s.impersonateSnapshots() {
+		id := streamOf(sub).Identity()
+		if _, err := tx.Exec(ctx,
+			`SELECT set_config('role', $1, true), set_config('request.jwt.claims', $2, true)`,
+			id.Role, id.ClaimsRaw); err != nil {
+			return nil, err
+		}
 	}
 
 	qrows, err := tx.Query(ctx, sql, args...)

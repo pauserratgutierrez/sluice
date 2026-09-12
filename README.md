@@ -26,6 +26,8 @@ Measured on PostgreSQL 18.4, that model costs **~9–13 µs per subscriber per c
 
 Sluice resolves authorization **once, at subscribe time**, into something that costs nothing per change. That single decision is the whole point; everything else follows from it.
 
+Which **oracle** produces the grant is chosen per process: `SLUICE_SHAPE_ORACLE=rls` (default — the same policies as a `SELECT`) or `issuer` (an HTTP call to your app at join, a concrete filter, and a hold row on the WAL as the kick). One tube either way. The harness stays on `rls`.
+
 ## What it does differently
 
 | | `supabase/realtime` | Sluice |
@@ -34,22 +36,36 @@ Sluice resolves authorization **once, at subscribe time**, into something that c
 | Change source | `pg_logical_slot_get_changes` polled every 100 ms, on a **temporary** slot | `START_REPLICATION` streaming protocol, permanent slot, LSN feedback and real backpressure |
 | Output plugin | `wal2json` | `pgoutput` (in-core) |
 | Unchanged TOASTed column | dropped from the JSON with **no marker** | explicit `unchanged: ["body"]` |
-| Authorization | one impersonated probe per subscriber per change | resolved once, in three tiers |
+| Authorization | one impersonated probe per subscriber per change | resolved once: RLS in three tiers, or an issuer grant + hold |
 | `DELETE` under RLS | `old_record` truncated to primary keys | full old row, correctly authorized |
 | Database broadcast | day-partitioned `realtime.messages` + a second replication connection + a janitor | `pg_logical_emit_message`, atomic with your transaction, zero tables |
 | Session revocation | none; a signed-out user streams until the JWT expires | pushed on the same slot, milliseconds |
 | Transport | WebSocket, so the token travels in the URL | SSE over POST, `Authorization: Bearer` |
 | Expensive configuration | silent | reported at `/diagnostics` with a runnable remedy |
 
-## The three authorization tiers
+## The two shape oracles
 
-Chosen automatically at subscribe time, reported back to the client, and visible in metrics.
+`SLUICE_SHAPE_ORACLE=rls | issuer`. One per process. Channels still combine with either.
+
+### RLS (default)
+
+Chosen automatically at subscribe time, reported back as `tier` A/B/C, and visible in metrics.
 
 **Tier A — constant reduction.** If the RLS predicate reads only columns the shape's filter pins to equality constants, then its truth value is the same for every row in the shape. Evaluate it once; never again. A policy of `owner_id = auth.uid()` with a shape filtered on `owner_id` lands here — the canonical Supabase case, and the reason the numbers above are 40× apart.
 
 **Tier B — compiled predicate.** Row-dependent but pure over the row, so it is compiled to an in-process evaluator and run against the tuple the WAL already delivered. Zero database round trips, full RLS semantics — **including `DELETE`**, which Supabase documents as impossible precisely because it probes a live table instead of the old tuple.
 
 **Tier C — impersonated probe.** Subqueries, joins, volatile functions. Correct, but ~13 µs per subscriber per change. Treated as a defect to surface, not a normal mode: rate-budgeted, counted in `sluice_authz_tier_c_probes_total`, and reported at `/diagnostics` with the offending policy and a concrete rewrite. Set `SLUICE_TIER_C=deny` to refuse such subscriptions outright.
+
+### Issuer
+
+Your API is the judge. Sluice POSTs verified identity plus the requested shape to `SLUICE_ISSUER_URL` **once at join** and **once per shape on `/token`** (`Authorization: Bearer <SLUICE_ISSUER_BEARER>`). Fail closed. No TTL cache, no lease back to the issuer, no user access token forwarded.
+
+The issuer returns a concrete filter (≥1 equality), an optional column allowlist, and ≥1 **hold** — a row that already exists for the permission, typically the membership row your kick already deletes. `shape.schema` / `shape.table` must be the catalog names (`relname`, not an alias). `Documents` ≠ `documents`; a grant for another name is denied. PostgreSQL folds unquoted identifiers to lowercase; quoted names that differ are distinct relations. Sluice ANDs that filter with the client's (narrowing only), installs the hold watches on the same slot **then** EXISTS the holds. Zero matching rows on the *subscribed* table is fine. When a hold is deleted (or updated out of its filter), that shape gets `shape_not_authorized`; the stream and other subscriptions continue. An expired JWT still closes the stream (`token_expired`). `session_revoked` is the other identity axis and is unchanged.
+
+Snapshots run as the pool role (no `SET ROLE`). Startup refuses if a published table has RLS and that role does not bypass it. Ops can `POST /admin/shapes/drop` with `service_role` or the issuer bearer — it walks this node's subscriptions; it is not the hot path.
+
+The client `from` / `eq` / `subscribe` tube does not change. The ready event has `oracle: "issuer"` and the effective `filter`, and does **not** send `tier`.
 
 ## How to write policies
 
@@ -110,6 +126,8 @@ docker compose -f deploy/compose.yml --env-file .env up -d --build
 docker compose -f deploy/compose.yml --env-file .env ps
 ```
 
+The same `up` starts `sluice-issuer` and `issuer-stub`. The `sluice` process stays on `rls`.
+
 ## Run the published image
 
 The runtime image is only the `sluice` binary (plus CA certs). It does not include Compose, Postgres, GoTrue, or the harness.
@@ -164,6 +182,17 @@ articles               A     yes      owner_id      warn:replica_identity_insuff
   …
 
 == 36 checks, 0 failures ==
+```
+
+The issuer overlay is a second Sluice on the same compose network (`sluice-issuer` + `issuer-stub`). The harness process stays on `rls`. `cmd/smoke-issuer` does not replace the 36 assertions; run it after `cmd/smoke`, not in parallel.
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
+  golang:1.26-alpine go build -o .bin/smoke-issuer ./cmd/smoke-issuer
+
+docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
+  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" \
+  alpine:3.22 /b/smoke-issuer
 ```
 
 Smoke's fan-out is a correctness check (200 streams × 25 changes by default). `cmd/load` is a separate soak on the same compose network, not a replay of the numbers in [Measured behaviour](#measured-behaviour). Default `LOAD_SCENARIO=all` is a laptop ladder: Tier A and no-RLS at 1500 streams × 80 changes, B capped at 800×60, C at 150×40, then multi-user, then extreme A at 4000×100. Not a CI check.
@@ -247,6 +276,8 @@ id: 1A2B/3C4D18:3
 data: {"sub":"docs","op":"UPDATE","record":{…},"old":{…},"unchanged":["body"]}
 ```
 
+Issuer mode sends `oracle:"issuer"` and the effective `filter` instead of `tier`.
+
 `EventSource` is deliberately not used: it cannot set headers, cannot POST, and cannot change its subscription set without reconnecting. Those three limitations are the only reason realtime tokens ever travelled in URLs.
 
 ## Broadcast from the database, atomically
@@ -272,6 +303,7 @@ curl -H "Authorization: Bearer $SERVICE_ROLE_KEY" localhost:4000/sluice/v1/diagn
 
 ```json
 {
+  "oracle": "rls",
   "slot": { "active": true, "retained_bytes": 1280, "wal_status": "reserved" },
   "replication_options": { "proto_version": 4, "streaming": "off", "binary": false },
   "warnings": [
@@ -284,7 +316,7 @@ curl -H "Authorization: Bearer $SERVICE_ROLE_KEY" localhost:4000/sluice/v1/diagn
 }
 ```
 
-Every warning carries a remedy that is a runnable statement. The metric to alert on is `sluice_authz_tier_c_probes_total`.
+Every warning carries a remedy that is a runnable statement. In issuer mode `/diagnostics` reports `oracle=issuer` (holds, URL) and does not treat RLS policies as the judge. The metric to alert on in RLS mode is `sluice_authz_tier_c_probes_total`.
 
 ## Measured behaviour
 
@@ -304,7 +336,7 @@ End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
 
 Sluice is a working prototype with good test coverage, not production software. In rough order of importance:
 
-1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each tier. Your policies are the variable that matters; `/diagnostics` will tell you which ones fall to Tier C.
+1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each RLS tier. Your policies (or your issuer) are the variable that matters; `/diagnostics` will tell you which RLS policies fall to Tier C.
 2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
 3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
 4. **An open-source license** (SDK is still `UNLICENSED`).
@@ -319,15 +351,19 @@ Published artifacts are already cut from `v*.*.*` tags: the runtime image on GHC
 cmd/sluice          the server
 cmd/keygen          harness secrets and ES256 API keys
 cmd/smoke           end-to-end validation (~36 assertions)
+cmd/smoke-issuer    issuer-oracle overlay (separate binary; does not replace the 36)
+cmd/issuer-stub     harness HTTP issuer used by cmd/smoke-issuer
 cmd/audit           production-readiness battery
 cmd/load            realtime stress probe
 internal/expr       the expression engine: parse, analyze, fold, reduce, evaluate
-internal/authz      the three-tier authorization model
+internal/authz      the three-tier authorization model (RLS oracle)
+internal/oracle     shape oracle: rls wrapper and issuer HTTP client
+internal/hold       issuer hold index, EXISTS, WAL cut
 internal/auth       JWT/JWKS verification and session revocation
 internal/pgoutput   the logical replication decoder (owns the 'u' marker)
 internal/reader     the single replication connection and LSN feedback
 internal/catalog    cached policies, grants, replica identity, index coverage
-internal/shape      filter grammar and routing-key selection
+internal/shape      filter grammar, narrowing, and routing-key selection
 internal/registry   the constant-indexed subscription index
 internal/hub        streams, fan-out, ring buffers, presence
 internal/server     HTTP surface, SSE, dispatch, snapshots, hooks, diagnostics

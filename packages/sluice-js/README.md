@@ -36,9 +36,11 @@ const docs = await sluice
 
 The `Database` generic is the **same generated types file** a PostgREST client uses. The SDK is hand-written because it has a public API and semver matters; the types it consumes are generated, because a schema has no API to break.
 
-## Check the tier
+## Check the oracle
 
-The single most useful thing this client tells you:
+The tube (`from` / `eq` / `subscribe`) is the same on every server. What comes back on the ready event depends on which **shape oracle** that process runs.
+
+**RLS** (`SLUICE_SHAPE_ORACLE=rls`, the default): `tier` is `A`, `B` or `C`. `oracle` may be omitted.
 
 ```ts
 if (docs.tier === 'C') {
@@ -54,6 +56,14 @@ if (docs.tier === 'C') {
 | `C` | **one impersonated query per change, per subscriber** |
 
 Tier C is correct but does not scale. If you see it, the server's `/diagnostics` endpoint names the offending policy and suggests a rewrite. Usually the fix is to add an `.eq()` on the column the policy compares, or to denormalise a joined column onto the table.
+
+**Issuer** (`SLUICE_SHAPE_ORACLE=issuer`): there are no tiers. The ready event has `oracle: "issuer"` and the effective `filter` after narrowing. Do not assume `tier: "A"`.
+
+```ts
+if (docs.oracle === 'issuer') {
+  console.log('effective filter', docs.filter)
+}
+```
 
 `indexed: false` is the other one to watch: it means your shape has no equality filter on an indexed column, so the server scans it for every change to that table.
 
@@ -143,7 +153,7 @@ supabase.auth.onAuthStateChange((_e, session) => {
 })
 ```
 
-Every authorization decision is re-resolved server-side on refresh, so a subscription that is no longer permitted is dropped with an error instead of quietly continuing. If the token expires without a refresh, the stream closes with `token_expired`. If the user signs out, the server sees the `auth.sessions` delete on its replication stream and closes the stream within milliseconds.
+Every authorization decision is re-resolved server-side on refresh, so a subscription that is no longer permitted is dropped with an error instead of quietly continuing. If the token expires without a refresh, the stream closes with `token_expired`. If a **hold** row is deleted, that shape is cut with `shape_not_authorized` and the stream stays open. If the user signs out, the server sees the `auth.sessions` delete on its replication stream and closes the stream within milliseconds (`session_revoked`).
 
 **`pauseWhenHidden`** closes the stream on `document.hidden` and reopens with a resume when the tab returns. This is the standard mitigation for the conflict between proxies wanting frequent keepalives and mobile radios wanting silence.
 
@@ -161,12 +171,13 @@ import { SluiceError } from '@pauserratgutierrez/sluice-js'
 
 | Code | Meaning |
 | --- | --- |
-| `shape_not_authorized` | the policy denies this shape for this caller |
+| `shape_not_authorized` | this shape is not permitted (RLS policy, issuer deny, or a hold that disappeared) |
 | `relation_not_published` | add the table to the publication |
 | `invalid_filter` | the filter references an unknown column or a bad value |
 | `replica_identity_insufficient` | DELETE cannot be filtered; the remedy is a runnable `ALTER TABLE` |
 | `resume_too_old` | the buffer aged out; resnapshot |
-| `token_expired` / `session_revoked` | reauthenticate |
+| `token_expired` | reauthenticate; the stream is closed |
+| `session_revoked` | the session row was deleted; the stream is closed |
 | `stream_lagging` | the client could not keep up and was disconnected |
 
 ## API

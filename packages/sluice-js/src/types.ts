@@ -52,8 +52,11 @@ export type ColumnOf<
 
 export type Operation = 'INSERT' | 'UPDATE' | 'DELETE' | 'TRUNCATE'
 
-/** Which authorization strategy the server resolved a subscription to. */
+/** Which authorization strategy the server resolved a subscription to (RLS oracle). */
 export type Tier = 'A' | 'B' | 'C'
+
+/** Which shape oracle the server is running. Issuer mode has no tiers. */
+export type Oracle = 'rls' | 'issuer'
 
 export interface ShapeSpec {
   schema?: string
@@ -93,7 +96,12 @@ export interface SluiceErrorPayload {
 export interface SubscriptionResult {
   sub: string
   ok: boolean
+  /** Present in issuer mode. Omitted or `"rls"` when the process uses GRANT+RLS. */
+  oracle?: Oracle
+  /** Authorization tier. Only the RLS oracle sends this; issuer mode omits it. */
   tier?: Tier
+  /** Effective AND-only filter after issuer narrowing. */
+  filter?: string
   indexed?: boolean
   routing_key?: string
   reason?: string

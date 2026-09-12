@@ -216,6 +216,29 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	newRow := tupleRow{rel: rel, t: m.New}
 	oldRow := tupleRow{rel: rel, t: m.Old}
 
+	if s.holds != nil {
+		var oldR, newR expr.Row
+		if m.Old != nil {
+			oldR = oldRow
+		}
+		if m.New != nil {
+			newR = newRow
+		}
+		for _, cut := range s.holds.OnChange(rel.OID, m.Type, oldR, newR) {
+			if st, ok := s.hub.Get(cut.StreamID); ok {
+				s.dropShape(st, cut.Label, event.Error{
+					Code:    "shape_not_authorized",
+					Message: cut.Reason,
+				})
+			} else {
+				s.holds.Remove(cut.StreamID, cut.Label)
+				if removed := s.reg.Remove(cut.StreamID, cut.Label); removed != nil {
+					s.decSubMetric(removed)
+				}
+			}
+		}
+	}
+
 	// Route on both tuples. Routing only on the new one would miss a row that
 	// left a shape, which is supabase/walrus#64 -- still open upstream.
 	candidates := s.reg.Candidates(rel.OID, func(col string) (expr.Value, bool) {

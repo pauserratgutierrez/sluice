@@ -8,7 +8,9 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
+	"github.com/pauserratgutierrez/sluice/internal/hold"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
+	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/reader"
 )
 
@@ -34,22 +36,38 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	out := map[string]any{}
 
+	if s.oracle != nil {
+		out["oracle"] = s.oracle.Name()
+	} else {
+		out["oracle"] = oracle.NameRLS
+	}
+	if s.cfg != nil && s.cfg.IssuerMode() {
+		out["issuer"] = map[string]any{
+			"url":     s.cfg.IssuerURL,
+			"timeout": s.cfg.IssuerTimeout.String(),
+			"holds":   s.holds.Count(),
+		}
+	}
+
 	if s.reader != nil {
 		out["slot"] = s.slotInfo(r)
 	}
 
 	stats := s.reg.Stats()
-	out["subscriptions"] = map[string]any{
+	subs := map[string]any{
 		"total":     stats.Subscriptions,
 		"streams":   stats.Streams,
 		"relations": stats.Relations,
 		"unindexed": stats.Unindexed,
-		"by_tier": map[string]int{
+	}
+	if s.oracle == nil || s.oracle.Name() == oracle.NameRLS {
+		subs["by_tier"] = map[string]int{
 			"A": stats.ByTier[authz.TierA],
 			"B": stats.ByTier[authz.TierB],
 			"C": stats.ByTier[authz.TierC],
-		},
+		}
 	}
+	out["subscriptions"] = subs
 
 	diags := s.diagnostics()
 	out["warnings"] = diags
@@ -144,6 +162,10 @@ func (s *Server) diagnostics() []Diagnostic {
 					" (<filter columns>, <pk>); ALTER TABLE " + rel.FullName() +
 					" REPLICA IDENTITY USING INDEX " + rel.Name + "_ri;",
 			})
+		}
+
+		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+			continue
 		}
 
 		// Report uncompilable policies even when nobody is subscribed yet, so the
@@ -251,7 +273,7 @@ func (s *Server) diagnostics() []Diagnostic {
 			})
 		}
 	}
-	if n := stats.ByTier[authz.TierC]; n > 0 {
+	if n := stats.ByTier[authz.TierC]; n > 0 && (s.oracle == nil || s.oracle.Name() == oracle.NameRLS) {
 		out = append(out, Diagnostic{
 			Code: "tier_c_subscriptions", Severity: "high",
 			Reason: fmt.Sprintf("%d subscription(s) are authorizing per change", n),
@@ -259,6 +281,26 @@ func (s *Server) diagnostics() []Diagnostic {
 			Remedy: "see the tier_c_policy findings above; or set SLUICE_TIER_C=deny to refuse " +
 				"such subscriptions outright",
 		})
+	}
+
+	if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+		for _, w := range s.holds.All() {
+			for _, h := range w.Holds {
+				if h.Rel == nil || h.Filter == nil {
+					continue
+				}
+				if missing := hold.MissingReplicaIdentity(h.Rel, h.Filter); len(missing) > 0 {
+					out = append(out, Diagnostic{
+						Code: "hold_replica_identity", Severity: "high",
+						Relation: h.Rel.FullName(),
+						Reason: fmt.Sprintf("hold filter column(s) %s are not in the replica identity",
+							strings.Join(missing, ", ")),
+						Impact: "a DELETE of this hold cannot be cut from the WAL; this is PostgreSQL REPLICA IDENTITY",
+						Remedy: "CREATE UNIQUE INDEX on the hold filter columns and ALTER TABLE ... REPLICA IDENTITY USING INDEX",
+					})
+				}
+			}
+		}
 	}
 	return out
 }

@@ -8,6 +8,7 @@ import {
   type ShapeSpec,
   type SubscriptionResult,
   type SubscriptionWarning,
+  type Oracle,
   type Tier,
 } from './types.js'
 
@@ -28,9 +29,10 @@ const nextLabel = () => `s${(++counter).toString(36)}`
  * subscriber count and throughput that degrades linearly with it. Register two
  * subscriptions instead.
  *
- * Prefer at least one `.eq()` on an indexed column. That is also what lets the
- * server reduce the RLS policy to a constant and stop authorizing per change;
- * the `tier` on the returned subscription tells you whether it managed to.
+ * Prefer at least one `.eq()` on an indexed column. Under the RLS oracle that
+ * is also what lets the server reduce the policy to a constant; the `tier` on
+ * the returned subscription tells you whether it managed to. Under the issuer
+ * oracle there is no tier — look at `oracle` and the effective `filter`.
  *
  * `Row` narrows as you call `.select()`, so handlers see exactly the columns you
  * asked for.
@@ -222,7 +224,9 @@ export class ShapeBuilder<
     return {
       sub: this.label,
       ok: final.ok,
+      oracle: final.oracle,
       tier: final.tier,
+      filter: final.filter,
       indexed: final.indexed,
       routingKey: final.routing_key,
       reason: final.reason,
@@ -237,15 +241,20 @@ export class ShapeBuilder<
 export interface ShapeSubscription {
   sub: string
   ok: boolean
+  /** `"issuer"` when the server uses the HTTP shape issuer; otherwise omitted or `"rls"`. */
+  oracle?: Oracle
   /**
-   * Which authorization strategy the server resolved to.
+   * Which authorization strategy the RLS oracle resolved to.
    *
-   * `A` costs nothing per change. `B` is evaluated in process, also free of
-   * database work. `C` runs one impersonated query per change PER SUBSCRIBER and
-   * is the thing to design away -- `reason` and `warnings` say why, and the
-   * server's `/diagnostics` endpoint suggests a rewrite.
+   * Only present when the server runs `SLUICE_SHAPE_ORACLE=rls`. Do not assume
+   * `"A"` in issuer mode. `A` costs nothing per change. `B` is evaluated in
+   * process, also free of database work. `C` runs one impersonated query per
+   * change PER SUBSCRIBER — `reason` and `warnings` say why, and `/diagnostics`
+   * suggests a rewrite.
    */
   tier?: Tier
+  /** Effective filter after issuer narrowing, when the server sent one. */
+  filter?: string
   /** False means the shape is scanned for every change to the table. */
   indexed?: boolean
   routingKey?: string

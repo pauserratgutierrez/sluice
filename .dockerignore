@@ -31,6 +31,7 @@ packages/
 # Dev / CI helpers — not linked into cmd/sluice
 cmd/keygen/
 cmd/smoke/
+cmd/smoke-issuer/
 cmd/audit/
 cmd/load/
 

@@ -115,7 +115,14 @@ func (r *Registry) Add(s *Subscription) bool {
 		return false
 	}
 	subs[s.Label] = s
+	r.indexRelLocked(s)
+	return true
+}
 
+func (r *Registry) indexRelLocked(s *Subscription) {
+	if s.Relation == nil {
+		return
+	}
 	ri := r.rels[s.Relation.OID]
 	if ri == nil {
 		ri = newRelIndex()
@@ -126,7 +133,7 @@ func (r *Registry) Add(s *Subscription) bool {
 	if s.RoutingKey == "" {
 		ri.unindexed = append(ri.unindexed, s)
 		r.unindexedCount++
-		return true
+		return
 	}
 	key := s.Filter.Equalities[s.RoutingKey].String()
 	byConst := ri.byColumn[s.RoutingKey]
@@ -135,7 +142,6 @@ func (r *Registry) Add(s *Subscription) bool {
 		ri.byColumn[s.RoutingKey] = byConst
 	}
 	byConst[key] = append(byConst[key], s)
-	return true
 }
 
 // Remove drops one subscription.
@@ -158,10 +164,17 @@ func (r *Registry) removeLocked(streamID, label string) *Subscription {
 	if len(subs) == 0 {
 		delete(r.byStream, streamID)
 	}
+	r.unindexRelLocked(s)
+	return s
+}
 
+func (r *Registry) unindexRelLocked(s *Subscription) {
+	if s.Relation == nil {
+		return
+	}
 	ri := r.rels[s.Relation.OID]
 	if ri == nil {
-		return s
+		return
 	}
 	delete(ri.all, s)
 
@@ -183,6 +196,31 @@ func (r *Registry) removeLocked(streamID, label string) *Subscription {
 	if len(ri.all) == 0 {
 		delete(r.rels, s.Relation.OID)
 	}
+}
+
+// Get returns the live subscription for a stream label, or nil.
+func (r *Registry) Get(streamID, label string) *Subscription {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.byStream[streamID][label]
+}
+
+// Rebind applies a new effective filter, projection, and routing key to a live
+// subscription under one lock. Remove+Add would leave an interval where
+// Candidates misses the shape (under-delivery) or, if a caller also swapped
+// holds across two lock acquisitions, a DELETE could miss the watch.
+func (r *Registry) Rebind(streamID, label string, filter *shape.Filter, columns []string) *Subscription {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.byStream[streamID][label]
+	if s == nil || filter == nil {
+		return nil
+	}
+	r.unindexRelLocked(s)
+	s.Filter = filter
+	s.Columns = append([]string(nil), columns...)
+	s.RoutingKey = filter.RoutingKey(s.Relation)
+	r.indexRelLocked(s)
 	return s
 }
 

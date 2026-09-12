@@ -56,3 +56,4 @@ If you ever create a different package name: publish once from a machine with `n
 
 - CI on every push (vet, `-race`, harness smoke) — release workflows only run on tags
 - Choosing an open-source license (SDK is still `UNLICENSED`)
+- The issuer overlay smoke (`cmd/smoke-issuer`) does not replace the 36 RLS assertions

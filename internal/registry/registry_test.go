@@ -142,6 +142,46 @@ func TestDuplicateLabelRejected(t *testing.T) {
 	}
 }
 
+func TestGetAndRebindUpdatesRoutingIndex(t *testing.T) {
+	r := New()
+	sink := &fakeSink{id: "s"}
+	if !r.Add(sub(t, sink, "docs", "owner_id=eq.x")) {
+		t.Fatal("add")
+	}
+	got := r.Get("s", "docs")
+	if got == nil || got.Label != "docs" {
+		t.Fatal("Get must return the live subscription")
+	}
+	if r.Get("s", "nope") != nil {
+		t.Fatal("Get of an unknown label must be nil")
+	}
+
+	rel := testRel()
+	narrow, err := shape.Parse("owner_id=eq.y", rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound := r.Rebind("s", "docs", narrow, []string{"id", "owner_id"})
+	if rebound == nil {
+		t.Fatal("Rebind of a live shape must succeed")
+	}
+	if rebound.Filter.Equalities["owner_id"].String() != "y" {
+		t.Fatalf("filter = %s, want owner_id=eq.y", rebound.Filter.Describe())
+	}
+	if len(rebound.Columns) != 2 || rebound.Columns[0] != "id" {
+		t.Fatalf("columns = %v", rebound.Columns)
+	}
+	if len(r.Candidates(16400, lookup(map[string]string{"owner_id": "x"}))) != 0 {
+		t.Fatal("old routing constant must not find the rebound shape")
+	}
+	if got := r.Candidates(16400, lookup(map[string]string{"owner_id": "y"})); len(got) != 1 {
+		t.Fatalf("new routing constant must find the shape, got %d", len(got))
+	}
+	if r.Rebind("s", "missing", narrow, []string{"id"}) != nil {
+		t.Fatal("Rebind of a missing shape must be nil")
+	}
+}
+
 func TestRemoveCleansUpIndex(t *testing.T) {
 	r := New()
 	s := &fakeSink{id: "s"}

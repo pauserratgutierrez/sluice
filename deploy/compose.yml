@@ -76,7 +76,8 @@ services:
       PGDATABASE: ${POSTGRES_DB:-postgres}
     volumes:
       - ./db/fixtures.sql:/fixtures.sql:ro
-    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql"]
+      - ./db/issuer_fixtures.sql:/issuer_fixtures.sql:ro
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql", "-f", "/issuer_fixtures.sql"]
     networks: [private_net]
 
   auth:
@@ -148,6 +149,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      target: runner
     image: sluice:dev
     container_name: sluice
     restart: always
@@ -200,6 +202,87 @@ services:
       start_period: 10s
     networks: [private_net]
 
+  issuer-stub:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: issuer-stub
+    image: sluice-issuer-stub:dev
+    container_name: sluice-issuer-stub
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      ISSUER_STUB_LISTEN: 0.0.0.0:8080
+      ISSUER_STUB_BEARER: ${SLUICE_ISSUER_BEARER:-harness-issuer-secret}
+      ISSUER_STUB_DB_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+    healthcheck:
+      test: ["CMD", "/issuer-stub", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [private_net]
+
+  sluice-issuer:
+    image: sluice:dev
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runner
+    container_name: sluice-issuer
+    restart: always
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db: { condition: service_healthy }
+      auth: { condition: service_healthy }
+      fixtures: { condition: service_completed_successfully }
+      issuer-stub: { condition: service_healthy }
+    environment:
+      SLUICE_LISTEN_ADDR: 0.0.0.0:4000
+      SLUICE_PATH_PREFIX: /sluice-issuer/v1
+      SLUICE_LOG_LEVEL: ${SLUICE_LOG_LEVEL:-info}
+      SLUICE_LOG_FORMAT: ${SLUICE_LOG_FORMAT:-text}
+
+      SLUICE_DB_REPL_URL: postgres://sluice_repl:${SLUICE_REPL_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}?replication=database
+      SLUICE_DB_AUTHZ_URL: postgres://sluice_authz:${SLUICE_AUTHZ_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+
+      SLUICE_SLOT_NAME: sluice_issuer
+      SLUICE_PUBLICATION: sluice_issuer
+      SLUICE_PROTO_VERSION: "4"
+      SLUICE_STREAMING: "off"
+      SLUICE_BINARY: "false"
+      SLUICE_MESSAGES: "true"
+      SLUICE_MESSAGE_PREFIX: "sluice:"
+
+      SLUICE_JWKS_URL: http://auth:9999/.well-known/jwks.json
+      SLUICE_JWT_ALG: ES256
+      SLUICE_JWT_AUDIENCE: authenticated
+
+      SLUICE_SHAPE_ORACLE: issuer
+      SLUICE_ISSUER_URL: http://issuer-stub:8080/shapes
+      SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-harness-issuer-secret}
+
+      SLUICE_TIER_C: allow
+      SLUICE_REPLICA_IDENTITY: warn
+      SLUICE_CATALOG_REFRESH: ${SLUICE_CATALOG_REFRESH:-5s}
+      SLUICE_SNAPSHOT_ENABLED: "true"
+
+      SLUICE_CHANNELS: "room:public,notify:owner"
+      SLUICE_HEARTBEAT: 20s
+      # Default false. Do not copy the RLS process's true: auth.sessions / auth.users
+      # are not in publication sluice_issuer, so a true here would not revoke.
+    healthcheck:
+      test: ["CMD", "/sluice", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks: [private_net]
+
   gateway:
     image: caddy:2.11.4-alpine
     container_name: sluice-gateway
@@ -210,6 +293,7 @@ services:
       auth: { condition: service_healthy }
       rest: { condition: service_healthy }
       sluice: { condition: service_healthy }
+      sluice-issuer: { condition: service_healthy }
     environment:
       CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-*}
       CADDY_LOG_LEVEL: ${CADDY_LOG_LEVEL:-INFO}
