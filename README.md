@@ -208,6 +208,8 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
 
 Knobs: `LOAD_SCENARIO` (`all` | `A` | `B` | `C` | `none` | `multi`), `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`. Same harness URLs as smoke (`SMOKE_AUTH_URL`, `SMOKE_SLUICE_URL`, `SMOKE_DB_URL`).
 
+Capacity hunts against the **published** image (not this tree) live in [`apps/loadtest`](apps/loadtest/README.md): Compose profiles `rls-a`, `rls-b`, `rls-c`, and `issuer`, pulling `ghcr.io/pauserratgutierrez/sluice:0.1.4`.
+
 `cmd/audit` is the production-readiness battery (RLS spectrum, WAL edges, `/diagnostics`). Same two-step build/run as smoke, targeting `./cmd/audit`.
 
 ## Using it from a client
@@ -323,14 +325,16 @@ Every warning carries a remedy that is a runnable statement. In issuer mode `/di
 The design claim is that dispatch cost is flat in subscriber count. Measured on the harness, delivering the same 20 changes:
 
 | Subscribers | Events delivered | Wall time | Events/s |
-| --- | --- | --- | --- |
+| --- | ---: | ---: | ---: |
 | 100 | 2,000 | 349 ms | 5,727 |
 | 400 | 8,000 | 359 ms | 22,297 |
 | 1,000 | 20,000 | 359 ms | 55,722 |
 
-Wall time is constant; only the event count scales. That table is a small fan-out, not something `cmd/load` reproduces; use `cmd/load` when you want a laptop soak at much larger stream counts. For comparison, `supabase/realtime`'s published figure for the RLS path is 5 database changes per second at 4,000 subscribers, because it authorizes every change against every subscriber.
+Wall time is constant; only the event count scales. That table is a small fan-out through the local harness.
 
-End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
+Independent numbers against the published image live in [`apps/loadtest`](apps/loadtest/README.md). On that laptop Docker run, 20 changes still took ~410 ms out to 1,600 subscribers (78k events/s). 28,000 streams opened and delivered every event; past ~3,000 the wall clock grows because the process is flushing SSE, not because authorization got more expensive. End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
+
+For comparison, `supabase/realtime`'s published figure for the RLS path is 5 database changes per second at 4,000 subscribers, because it authorizes every change against every subscriber.
 
 ## What's left before production
 
@@ -354,7 +358,7 @@ cmd/smoke           end-to-end validation (~36 assertions)
 cmd/smoke-issuer    issuer-oracle overlay (separate binary; does not replace the 36)
 cmd/issuer-stub     harness HTTP issuer used by cmd/smoke-issuer
 cmd/audit           production-readiness battery
-cmd/load            realtime stress probe
+cmd/load            realtime stress probe against the local harness
 internal/expr       the expression engine: parse, analyze, fold, reduce, evaluate
 internal/authz      the three-tier authorization model (RLS oracle)
 internal/oracle     shape oracle: rls wrapper and issuer HTTP client
@@ -372,6 +376,7 @@ internal/metrics    Prometheus collectors
 internal/config     env parsing and defaults
 internal/event      shared event types
 deploy/             compose harness: db bootstrap, fixtures, Caddy; sluice.env.example lists every runtime SLUICE_* knob
+apps/loadtest       independent Docker load-test against ghcr.io/.../sluice:0.1.4 (changes, broadcast, presence, mixed, hold kick)
 packages/sluice-js  the typed TypeScript client
 design_doc.md       full design: protocol, authz tiers, config, failure modes
 MAINTENANCE.md      how to cut image and SDK releases

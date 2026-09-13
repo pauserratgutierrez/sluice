@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 .bin/
+apps/loadtest/results/*.json
+apps/loadtest/results/*.md
+apps/loadtest/results/*.txt
 
 node_modules/
 dist/

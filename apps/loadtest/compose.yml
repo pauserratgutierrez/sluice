@@ -1,0 +1,322 @@
+# Independent load-test app against the published Sluice image.
+#
+# Does not import the Sluice module. Speaks the public HTTP protocol only.
+# One profile per experiment:
+#
+#   docker compose --profile rls-a     up --build --abort-on-container-exit --exit-code-from runner-rls-a
+#   docker compose --profile rls-b     up --build --abort-on-container-exit --exit-code-from runner-rls-b
+#   docker compose --profile rls-c     up --build --abort-on-container-exit --exit-code-from runner-rls-c
+#   docker compose --profile issuer    up --build --abort-on-container-exit --exit-code-from runner-issuer
+#   docker compose --profile broadcast up --build --abort-on-container-exit --exit-code-from runner-broadcast
+#   docker compose --profile presence  up --build --abort-on-container-exit --exit-code-from runner-presence
+#   docker compose --profile mixed     up --build --abort-on-container-exit --exit-code-from runner-mixed
+#   docker compose --profile kick      up --build --abort-on-container-exit --exit-code-from runner-kick
+
+name: sluice-loadtest
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+x-loadtest: &loadtest
+  image: sluice-loadtest:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  logging: *default-logging
+  init: true
+
+x-runner-env: &runner-env
+  LOAD_PRIVATE_JWK: /keys/private.jwk
+  LOAD_RESULTS: /results
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
+  SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.1.4}
+  LOAD_DB_URL: postgres://postgres:${POSTGRES_PASSWORD:-loadtest-pg}@db:5432/postgres
+  ISSUER_URL: http://issuer:8080
+  LOAD_AXIS: ${LOAD_AXIS:-all}
+  LOAD_HUNT: ${LOAD_HUNT:-}
+  LOAD_MAX_STREAMS: ${LOAD_MAX_STREAMS:-0}
+  LOAD_START: ${LOAD_START:-100}
+  LOAD_CHANGES: ${LOAD_CHANGES:-20}
+  LOAD_LADDER: ${LOAD_LADDER:-}
+  LOAD_WAVE: ${LOAD_WAVE:-256}
+  LOAD_GRANULARITY: ${LOAD_GRANULARITY:-50}
+  LOAD_OPEN_MIN: ${LOAD_OPEN_MIN:-0.95}
+  LOAD_DELIVERY_MIN: ${LOAD_DELIVERY_MIN:-0.90}
+  LOAD_CHANNEL: ${LOAD_CHANNEL:-room:load}
+
+x-runner: &runner
+  <<: *loadtest
+  command: ["run"]
+  restart: "no"
+  user: "0:0"
+  mem_limit: 6g
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  sysctls:
+    net.ipv4.ip_local_port_range: "1024 65535"
+    net.core.somaxconn: 65535
+  volumes:
+    - keys_data:/keys:ro
+    - ./results:/results
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *runner-env
+
+x-runner-rls: &runner-rls
+  <<: *runner
+  depends_on:
+    db: { condition: service_healthy }
+    jwks: { condition: service_healthy }
+    sluice-rls: { condition: service_healthy }
+  networks: [loadtest]
+
+x-runner-issuer: &runner-issuer
+  <<: *runner
+  depends_on:
+    db: { condition: service_healthy }
+    jwks: { condition: service_healthy }
+    issuer: { condition: service_healthy }
+    sluice-issuer: { condition: service_healthy }
+  networks: [loadtest]
+
+x-sluice: &sluice
+  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.1.4}
+  pull_policy: always
+  restart: unless-stopped
+  logging: *default-logging
+  init: true
+  mem_limit: 6g
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  sysctls:
+    net.core.somaxconn: 65535
+  security_opt: ["no-new-privileges:true"]
+  env_file:
+    - path: .env
+      required: false
+  environment: &sluice-env
+    SLUICE_LISTEN_ADDR: 0.0.0.0:4000
+    SLUICE_PATH_PREFIX: /sluice/v1
+    SLUICE_LOG_LEVEL: ${SLUICE_LOG_LEVEL:-info}
+    SLUICE_LOG_FORMAT: json
+    SLUICE_DB_REPL_URL: postgres://sluice_repl:${SLUICE_REPL_PASSWORD:-loadtest-repl}@db:5432/postgres?replication=database
+    SLUICE_DB_AUTHZ_URL: postgres://sluice_authz:${SLUICE_AUTHZ_PASSWORD:-loadtest-authz}@db:5432/postgres
+    SLUICE_PROTO_VERSION: "4"
+    SLUICE_STREAMING: "off"
+    SLUICE_BINARY: "false"
+    SLUICE_MESSAGES: "true"
+    SLUICE_MESSAGE_PREFIX: "sluice:"
+    SLUICE_JWKS_URL: http://jwks:8080/.well-known/jwks.json
+    SLUICE_JWT_ALG: ES256
+    SLUICE_JWT_AUDIENCE: authenticated
+    SLUICE_TIER_C: allow
+    SLUICE_TIER_C_MAX_PROBES_PER_SECOND: "100000"
+    SLUICE_TIER_B_VERIFY: "0"
+    SLUICE_SNAPSHOT_ENABLED: "false"
+    SLUICE_REVOCATION_ENABLED: "false"
+    SLUICE_CATALOG_REFRESH: 60s
+    SLUICE_HEARTBEAT: 30s
+    SLUICE_MAX_STREAMS: "50000"
+    SLUICE_DB_POOL_MAX_CONNS: "32"
+    SLUICE_METRICS_ENABLED: "true"
+    SLUICE_DIAGNOSTICS_ENABLED: "true"
+    SLUICE_ISSUER_TIMEOUT: 5s
+    SLUICE_CHANNELS: "room:public"
+    SLUICE_PUBLISH_RATE: "1000"
+    SLUICE_PRESENCE_MAX_KEYS: "50000"
+
+services:
+  db:
+    image: postgres:18.4-trixie
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick]
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2500m
+    shm_size: 1gb
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=8
+      -c max_wal_senders=8
+      -c max_slot_wal_keep_size=2GB
+      -c wal_sender_timeout=60s
+      -c logical_decoding_work_mem=64MB
+      -c shared_buffers=512MB
+      -c max_wal_size=2GB
+      -c synchronous_commit=off
+      -c max_connections=100
+      -c password_encryption=scram-sha-256
+      -c log_min_messages=warning
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"
+      PGDATA: /var/lib/postgresql/data
+      SLUICE_REPL_PASSWORD: ${SLUICE_REPL_PASSWORD:-loadtest-repl}
+      SLUICE_AUTHZ_PASSWORD: ${SLUICE_AUTHZ_PASSWORD:-loadtest-authz}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./sql/00-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - ./sql/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [loadtest]
+
+  jwks:
+    <<: *loadtest
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick]
+    command: ["jwks"]
+    restart: unless-stopped
+    user: "0:0"
+    mem_limit: 128m
+    environment:
+      KEYS_DIR: /keys
+      JWKS_LISTEN: 0.0.0.0:8080
+    volumes:
+      - keys_data:/keys
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [loadtest]
+
+  issuer:
+    <<: *loadtest
+    profiles: [issuer, kick]
+    command: ["issuer"]
+    restart: unless-stopped
+    user: "65532:65532"
+    mem_limit: 512m
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ISSUER_LISTEN: 0.0.0.0:8080
+      SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [loadtest]
+
+  sluice-rls:
+    <<: *sluice
+    profiles: [rls-a, rls-b, rls-c, broadcast, presence, mixed]
+    depends_on:
+      db: { condition: service_healthy }
+      jwks: { condition: service_healthy }
+    environment:
+      <<: *sluice-env
+      SLUICE_SHAPE_ORACLE: rls
+      SLUICE_SLOT_NAME: load_rls
+      SLUICE_PUBLICATION: sluice_rls
+    networks: [loadtest]
+
+  sluice-issuer:
+    <<: *sluice
+    profiles: [issuer, kick]
+    depends_on:
+      db: { condition: service_healthy }
+      jwks: { condition: service_healthy }
+      issuer: { condition: service_healthy }
+    environment:
+      <<: *sluice-env
+      SLUICE_SHAPE_ORACLE: issuer
+      SLUICE_SLOT_NAME: load_issuer
+      SLUICE_PUBLICATION: sluice_issuer
+      SLUICE_ISSUER_URL: http://issuer:8080/shapes
+      SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+    networks: [loadtest]
+
+  runner-rls-a:
+    <<: *runner-rls
+    profiles: [rls-a]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: rls-a
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-rls-b:
+    <<: *runner-rls
+    profiles: [rls-b]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: rls-b
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-rls-c:
+    <<: *runner-rls
+    profiles: [rls-c]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: rls-c
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-issuer:
+    <<: *runner-issuer
+    profiles: [issuer]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: issuer
+      SLUICE_URL: http://sluice-issuer:4000/sluice/v1
+
+  runner-broadcast:
+    <<: *runner-rls
+    profiles: [broadcast]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: broadcast
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-presence:
+    <<: *runner-rls
+    profiles: [presence]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: presence
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-mixed:
+    <<: *runner-rls
+    profiles: [mixed]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: mixed
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-kick:
+    <<: *runner-issuer
+    profiles: [kick]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: kick
+      SLUICE_URL: http://sluice-issuer:4000/sluice/v1
+
+volumes:
+  db_data:
+  keys_data:
+
+networks:
+  loadtest:
+    driver: bridge

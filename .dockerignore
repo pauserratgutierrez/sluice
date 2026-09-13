@@ -25,6 +25,9 @@ design_doc.md
 # Compose harness and sibling services (not part of the sluice binary)
 deploy/
 
+# Independent load-test app (own module, own image)
+apps/
+
 # TypeScript client SDK
 packages/
 
