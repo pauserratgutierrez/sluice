@@ -33,11 +33,22 @@ type Stream struct {
 
 	created time.Time
 
-	// channels this stream subscribes to on the signalling plane:
-	// channel name -> subscription label
+	// channels this stream subscribes to on the signalling plane
 	mu       sync.RWMutex
-	channels map[string]string
+	channels map[string]channelJoin
 	buckets  map[string]*bucket
+}
+
+type channelJoin struct {
+	label string
+	// recheckAt is when the join's authorization expires and must be asked
+	// again. Zero means it never expires (public and owner namespaces).
+	recheckAt time.Time
+}
+
+// DueChannel is a join whose authorization has expired.
+type DueChannel struct {
+	Channel, Label string
 }
 
 func (s *Stream) StreamID() string { return s.id }
@@ -98,9 +109,9 @@ func (s *Stream) CloseCode() string {
 }
 
 // TrackChannel records a signalling-plane subscription.
-func (s *Stream) TrackChannel(channel, label string) {
+func (s *Stream) TrackChannel(channel, label string, recheckAt time.Time) {
 	s.mu.Lock()
-	s.channels[channel] = label
+	s.channels[channel] = channelJoin{label: label, recheckAt: recheckAt}
 	s.mu.Unlock()
 }
 
@@ -114,8 +125,32 @@ func (s *Stream) UntrackChannel(channel string) {
 func (s *Stream) ChannelLabel(channel string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	l, ok := s.channels[channel]
-	return l, ok
+	j, ok := s.channels[channel]
+	return j.label, ok
+}
+
+// DueChannels lists the joins whose authorization expired at or before now.
+func (s *Stream) DueChannels(now time.Time) []DueChannel {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []DueChannel
+	for ch, j := range s.channels {
+		if !j.recheckAt.IsZero() && !j.recheckAt.After(now) {
+			out = append(out, DueChannel{Channel: ch, Label: j.label})
+		}
+	}
+	return out
+}
+
+// SetChannelRecheck moves a join's expiry, if the channel is still joined
+// under the same label. A join replaced in the meantime keeps its own.
+func (s *Stream) SetChannelRecheck(channel, label string, at time.Time) {
+	s.mu.Lock()
+	if j, ok := s.channels[channel]; ok && j.label == label {
+		j.recheckAt = at
+		s.channels[channel] = j
+	}
+	s.mu.Unlock()
 }
 
 func (s *Stream) Channels() []string {
@@ -163,7 +198,7 @@ func (h *Hub) Open(id string, identity authz.Identity) *Stream {
 		queue:    make(chan event.Event, h.queueSize),
 		done:     make(chan struct{}),
 		created:  time.Now(),
-		channels: map[string]string{},
+		channels: map[string]channelJoin{},
 	}
 	s.identity.Store(&identity)
 	h.mu.Lock()
@@ -225,8 +260,9 @@ func (h *Hub) Streams() []*Stream {
 
 // JoinChannel adds a stream to a channel's fan-out set. It returns false when
 // the stream has already been closed, so a join racing a disconnect cannot
-// leave a closed stream in the set.
-func (h *Hub) JoinChannel(channel string, s *Stream, label string) bool {
+// leave a closed stream in the set. recheckAt is when the join's authorization
+// expires; zero means never.
+func (h *Hub) JoinChannel(channel string, s *Stream, label string, recheckAt time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.streams[s.id] != s {
@@ -238,13 +274,34 @@ func (h *Hub) JoinChannel(channel string, s *Stream, label string) bool {
 		h.byChannel[channel] = set
 	}
 	set[s.id] = s
-	s.TrackChannel(channel, label)
+	s.TrackChannel(channel, label, recheckAt)
 	return true
 }
 
 // LeaveChannel removes a stream from a channel.
 func (h *Hub) LeaveChannel(channel string, s *Stream) {
 	h.mu.Lock()
+	h.leaveLocked(channel, s)
+	h.mu.Unlock()
+	h.presence.Untrack(channel, s.id)
+}
+
+// LeaveChannelLabel removes a stream from a channel only if it is still joined
+// under label, and reports whether it was. A revocation decided about one join
+// must not remove a newer join of the same channel.
+func (h *Hub) LeaveChannelLabel(channel string, s *Stream, label string) bool {
+	h.mu.Lock()
+	if l, ok := s.ChannelLabel(channel); !ok || l != label {
+		h.mu.Unlock()
+		return false
+	}
+	h.leaveLocked(channel, s)
+	h.mu.Unlock()
+	h.presence.Untrack(channel, s.id)
+	return true
+}
+
+func (h *Hub) leaveLocked(channel string, s *Stream) {
 	if set := h.byChannel[channel]; set != nil {
 		delete(set, s.id)
 		if len(set) == 0 {
@@ -252,8 +309,6 @@ func (h *Hub) LeaveChannel(channel string, s *Stream) {
 		}
 	}
 	s.UntrackChannel(channel)
-	h.mu.Unlock()
-	h.presence.Untrack(channel, s.id)
 }
 
 // ChannelMembers returns the streams subscribed to a channel.

@@ -87,7 +87,7 @@ func TestJoinAfterCloseIsRefused(t *testing.T) {
 	h := newHub(4)
 	s := h.Open("s", authz.Identity{})
 	h.Close("s", "client_closed")
-	if h.JoinChannel("room:1", s, "r") {
+	if h.JoinChannel("room:1", s, "r", time.Time{}) {
 		t.Fatal("joining a channel on a closed stream must fail")
 	}
 	if len(h.ChannelMembers("room:1")) != 0 {
@@ -113,8 +113,8 @@ func TestChannelFanoutAndSelf(t *testing.T) {
 	h := newHub(8)
 	a := h.Open("a", authz.Identity{Sub: "ua"})
 	b := h.Open("b", authz.Identity{Sub: "ub"})
-	h.JoinChannel("room:1", a, "sub-a")
-	h.JoinChannel("room:1", b, "sub-b")
+	h.JoinChannel("room:1", a, "sub-a", time.Time{})
+	h.JoinChannel("room:1", b, "sub-b", time.Time{})
 
 	n := h.PublishBroadcast("room:1", "ping", "ua", "client", "", json.RawMessage(`{}`), false, "a")
 	if n != 1 {
@@ -138,6 +138,32 @@ func TestChannelFanoutAndSelf(t *testing.T) {
 	}
 }
 
+// A join's expiry is tracked per label, and removing one join by label leaves a
+// newer join of the same channel alone.
+func TestChannelRecheckIsPerJoin(t *testing.T) {
+	h := newHub(8)
+	s := h.Open("a", authz.Identity{Sub: "ua"})
+	t0 := time.Now()
+	h.JoinChannel("chat:1", s, "old", t0)
+	if due := s.DueChannels(t0); len(due) != 1 || due[0].Label != "old" {
+		t.Fatalf("due = %+v, want the old join", due)
+	}
+	h.JoinChannel("chat:1", s, "new", t0.Add(time.Minute))
+	s.SetChannelRecheck("chat:1", "old", t0)
+	if due := s.DueChannels(t0); len(due) != 0 {
+		t.Fatalf("a stale label moved the newer join's expiry: due = %+v", due)
+	}
+	if h.LeaveChannelLabel("chat:1", s, "old") {
+		t.Fatal("a stale label removed the newer join")
+	}
+	if !h.LeaveChannelLabel("chat:1", s, "new") {
+		t.Fatal("the current join was not removed")
+	}
+	if _, ok := s.ChannelLabel("chat:1"); ok {
+		t.Fatal("still joined")
+	}
+}
+
 // A disconnect is the only leave signal Sluice needs, so closing a stream must
 // clean up channel membership and presence with no client cooperation.
 func TestCloseRemovesChannelAndPresence(t *testing.T) {
@@ -146,7 +172,7 @@ func TestCloseRemovesChannelAndPresence(t *testing.T) {
 	defer h.Presence().Stop()
 
 	s := h.Open("s", authz.Identity{Sub: "u1"})
-	h.JoinChannel("room:1", s, "r")
+	h.JoinChannel("room:1", s, "r", time.Time{})
 	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"n":1}`), 0)
 
 	if h.Presence().Count("room:1") != 1 {
@@ -171,7 +197,7 @@ func TestPresenceStateAndDiff(t *testing.T) {
 	defer h.Presence().Stop()
 
 	s := h.Open("s", authz.Identity{Sub: "u1"})
-	h.JoinChannel("room:1", s, "r")
+	h.JoinChannel("room:1", s, "r", time.Time{})
 
 	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"name":"a"}`), 0)
 	state := h.Presence().State("room:1")
@@ -327,7 +353,7 @@ func TestConcurrentStreamsAndBroadcast(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		s := h.Open(fmt.Sprintf("s%d", i), authz.Identity{Sub: fmt.Sprintf("u%d", i)})
-		h.JoinChannel("room:1", s, "r")
+		h.JoinChannel("room:1", s, "r", time.Time{})
 		wg.Add(1)
 		go func(s *Stream) {
 			defer wg.Done()

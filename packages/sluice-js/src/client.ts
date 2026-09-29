@@ -443,7 +443,6 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const err = new SluiceError(e)
         if (e.sub) {
           const reg = this.registrations.get(e.sub)
-          reg?.onEvent('error', err)
           // The position is gone from the server's buffer; resending it on the
           // next reconnect would only fail again.
           if (e.code === 'resume_too_old' && reg?.spec.shape) {
@@ -451,7 +450,13 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
           }
           // A subscription-scoped error that is not retryable ends that
           // subscription; the stream and every other subscription carry on.
-          if (!e.retryable) this.registrations.delete(e.sub)
+          // It is forgotten before the handler runs, so the handler may
+          // subscribe again under the same name.
+          if (!e.retryable) {
+            this.registrations.delete(e.sub)
+            this.readyResults.delete(e.sub)
+          }
+          reg?.onEvent('error', err)
         } else {
           // A stream-scoped error is followed by the server closing the
           // stream. The loop reconnects, and the server refuses the reconnect
@@ -465,9 +470,10 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
 
   private handleResult(result: SubscriptionResult): void {
     for (const w of result.warnings ?? []) this.options.onWarning?.(w)
-    this.registrations.get(result.sub)?.onResult(result)
+    const reg = this.registrations.get(result.sub)
     // A refused subscription is not resent on every reconnect.
     if (!result.ok) this.registrations.delete(result.sub)
+    reg?.onResult(result)
   }
 }
 

@@ -112,7 +112,7 @@ Tier C evaluates the policy under the caller's role and claims against the WAL t
 
 **Undecidable changes are withheld.** When the filter or the policy needs a value the WAL did not carry — an unchanged TOASTed column, or a column outside a narrow replica identity on `DELETE` — the change is not delivered and `sluice_authz_unknown_total` counts it. With `SLUICE_DEGRADED_DELETES=deliver`, such a `DELETE` is delivered with `"degraded": "delete_authz_unavailable"`.
 
-**Revocation.** Every `SLUICE_CATALOG_REFRESH` tick reloads the catalog. When anything a decision reads changed — policies, RLS flags, roles with `BYPASSRLS`, role memberships — every RLS subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`. Time-dependent predicates (`now()`) and Tier C decisions are also re-resolved when their `SLUICE_AUTHZ_LEASE` has expired, checked on the same tick; `POST /token` re-resolves every subscription of the stream. So a policy change reaches open streams within one tick, not instantly. `REVOKE SELECT (column)` does not reach open streams: column grants are checked only at subscribe time.
+**Revocation.** Every `SLUICE_CATALOG_REFRESH` tick reloads the catalog. When anything a decision reads changed — policies, RLS flags, roles with `BYPASSRLS`, role memberships — every RLS subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`. Time-dependent predicates (`now()`) and Tier C decisions are also re-resolved when their `SLUICE_AUTHZ_LEASE` has expired, checked on the same tick; `POST /token` re-resolves every subscription of the stream. So a policy change reaches open streams within one tick, not instantly. Hook channel joins are re-checked the same way when their verdict expires (see [Channels](#channels-broadcast-and-presence)). `REVOKE SELECT (column)` does not reach open streams: column grants are checked only at subscribe time.
 
 **Columns.** The projection is the requested columns (all columns when none are requested) plus the table's key columns (primary key, or the replica identity index), intersected with the caller's `SELECT` privileges. Denied columns are reported with `columns_not_granted`; nothing outside the projection is ever emitted.
 
@@ -307,7 +307,8 @@ A subscription result has `sub`, `ok`, and then either an `error` (`{code, messa
 | `invalid_filter`, `invalid_columns`, `invalid_ops`, `invalid_subscription` | subscribe | malformed request |
 | `duplicate_sub`, `too_many_subscriptions`, `too_many_shapes`, `too_many_unindexed_shapes` | subscribe | limits |
 | `replica_identity_insufficient` | subscribe | `SLUICE_REPLICA_IDENTITY=strict` |
-| `unknown_namespace`, `channel_not_authorized` | subscribe | channel refused |
+| `unknown_namespace` | subscribe | channel refused |
+| `channel_not_authorized` | subscribe, later | channel refused, or a hook channel's join revoked on re-check or `/token` |
 | `resume_too_old` | subscribe, after a snapshot | the position is no longer buffered; `action: "resnapshot"` |
 | `invalid_resume`, `snapshot_failed`, `internal` | subscribe | as named |
 | `stream_lagging` | stream | the client did not keep up; `action: "resnapshot"` |
@@ -325,7 +326,7 @@ Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insuf
 | `/presence` `{ "stream_id", "channel", "action": "track" \| "update" \| "untrack", "meta" }` | `{ "ok": true }`; `403 presence_key_not_allowed`, `403 channel_not_subscribed`, `429 rate_limited`, `429 presence_too_many_keys` |
 | `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch` |
 
-`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape); channels are not re-checked.
+`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape), and every hook channel is asked about again; `revoked_subscriptions` counts both.
 
 ### Resume
 
@@ -341,13 +342,15 @@ A channel is `namespace:name`; the namespace is everything before the first `:`.
 | `owner` | a token whose `sub` the channel name ends with, after a `:` (`notify:<sub>`) |
 | `hook` | whoever your endpoint allows |
 
-**Hook.** Sluice POSTs `{ "action": "subscribe", "channel", "namespace", "role", "sub", "session_id", "claims" }` to the namespace's URL, with `Authorization: Bearer <SLUICE_CHANNEL_HOOK_BEARER>` when that variable is set, and caches the verdict per URL, channel, role, sub and session. Redirects are not followed.
+**Hook.** Sluice POSTs `{ "action": "subscribe", "channel", "namespace", "role", "sub", "session_id", "claims" }` to the namespace's URL, with `Authorization: Bearer <SLUICE_CHANNEL_HOOK_BEARER>` when that variable is set. Redirects are not followed. The verdict is cached per URL, channel, role, sub and session, so while it is valid it also answers new joins by the same session, on any of its streams.
 
-| Response | Verdict | Cached for |
+| Response | Verdict | Valid for |
 | --- | --- | --- |
-| `2xx` `{ "allow": true \| false, "reason"?, "ttl"? }` | as returned | `ttl` seconds, else `SLUICE_CHANNEL_HOOK_TTL` |
+| `2xx` `{ "allow": true \| false, "reason"?, "ttl"? }` | as returned | `ttl` seconds, else `SLUICE_CHANNEL_HOOK_TTL`; `ttl: 0` is not cached |
 | `403` | deny | `SLUICE_CHANNEL_HOOK_TTL` |
-| `401` (Sluice's credential rejected), other status, unreadable body, timeout (`SLUICE_CHANNEL_HOOK_TIMEOUT`) | deny | 2 s |
+| `401` (Sluice's credential rejected), other status, unreadable body, timeout (`SLUICE_CHANNEL_HOOK_TIMEOUT`) | none: joins are refused | 2 s |
+
+A join is a lease on its verdict. Validity is shortened at random by up to a fifth, so joins made together do not all expire together. On the first `SLUICE_CATALOG_REFRESH` tick after it expires, Sluice asks again, once per verdict however many of the session's streams joined. An allow extends the join; a denial removes it with a `channel_not_authorized` error for that subscription, and the stream receives nothing more from the channel. A re-check that gets no verdict keeps the join and asks again on the next tick, so an endpoint outage does not eject everyone. A revocation therefore reaches an open stream within the verdict's validity plus one tick. `POST /token` asks again at once for every hook channel of the stream, ignoring cached verdicts. The cost is one endpoint call per joined verdict (channel and session) per `max(ttl, tick)`; with `ttl: 0`, one per tick.
 
 **Broadcast from clients.** `POST /publish` delivers `payload` to every stream that joined the channel (the sender too with `self: true`) and returns how many streams it was queued on. At most `SLUICE_PUBLISH_RATE` per second per stream, `SLUICE_MAX_PAYLOAD_BYTES` per payload.
 
@@ -435,6 +438,7 @@ Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers.
 | `sluice_authz_compile_failures_total` | `schema`, `table`, `reason` |
 | `sluice_authz_unknown_total` | `schema`, `table`, `op` |
 | `sluice_authz_lease_refreshes_total` | `result` = held, revoked |
+| `sluice_channel_hook_rechecks_total` (per joined channel) | `result` = held, revoked, unavailable |
 | `sluice_streams` (gauge) | |
 | `sluice_stream_dropped_events_total` | `kind` |
 | `sluice_stream_closed_total` | `reason` |

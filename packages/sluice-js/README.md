@@ -121,6 +121,8 @@ const delivered = await room.send('cursor', { x, y })
 
 The channel's namespace (`room`) must be configured on the server. `send` is a request with a response: an oversized payload or a channel you have not joined **throws**. `on('*', …)` receives every event. Presence is keyed by your token's `sub` (a token without one cannot track), and your entry is withdrawn automatically when the connection closes. Registering `onPresence`, `onJoin` or `onLeave` before `subscribe()` requests the full roster on join; `channel.presence` holds the current roster.
 
+The server can end a join later: a `hook` namespace re-checks it when its verdict expires, and on `setAuth`. The channel's `onError` then receives `channel_not_authorized`, no more events arrive, `send` throws, and `channel.presence` is emptied. The same happens if a reconnect resends the join and it is refused. Call `subscribe()` again to rejoin; it is safe from inside `onError`.
+
 Database-originated broadcasts arrive on the same handlers with `meta.origin === 'database'` and, for transactional messages, `meta.commit_lsn`:
 
 ```sql
@@ -179,7 +181,8 @@ Subscription errors go to that subscription's `onError`; stream errors go to the
 | `shape_not_authorized` | not permitted: RLS policy, issuer deny, revoked on refresh, hold removed, or dropped by an operator |
 | `relation_not_published` / `relation_unpublished` | the table is not (or no longer) in the publication |
 | `invalid_filter`, `invalid_columns` | unknown column or bad value |
-| `unknown_namespace`, `channel_not_authorized` | the channel was refused |
+| `unknown_namespace` | the channel's namespace is not configured |
+| `channel_not_authorized` | the channel was refused, or its join was revoked later |
 | `resume_too_old` | the resume position is gone; resnapshot |
 | `snapshot_failed` | the initial snapshot failed (retryable) |
 | `stream_lagging` | the client did not keep up; the stream reconnects with a resume |

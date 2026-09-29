@@ -82,13 +82,25 @@ export class Channel<M = Json> {
     return this.presenceState
   }
 
-  /** Joins the channel. */
+  /**
+   * Joins the channel.
+   *
+   * The server may later remove the join, for example when a hook no longer
+   * allows it (`channel_not_authorized`). `onError` then receives the error,
+   * `send` rejects, and `subscribe()` may be called again to rejoin.
+   */
   async subscribe(): Promise<ChannelSubscription> {
     let resolved: SubscriptionResult | undefined
+    let settled = false
     const result = await this.client.register({
       spec: { sub: this.label, channel: this.name, presence: this.wantPresence },
       onResult: (r) => {
-        resolved = r
+        if (!settled) {
+          resolved = r
+        } else if (!r.ok) {
+          // Refused when a reconnect resent the join.
+          this.ended(new SluiceError(r.error ?? { code: 'channel_not_authorized', message: 'the channel join was refused' }))
+        }
       },
       onEvent: (kind, payload) => {
         if (kind === 'broadcast') {
@@ -98,10 +110,15 @@ export class Channel<M = Json> {
         } else if (kind === 'presence') {
           this.applyPresence(payload as PresencePayload<M>)
         } else if (kind === 'error') {
-          this.errorHandler?.(payload as SluiceError)
+          const e = payload as SluiceError
+          // A subscription error that is not retryable means the server
+          // removed the join; the client has already forgotten it.
+          if (!e.retryable) this.ended(e)
+          else this.errorHandler?.(e)
         }
       },
     })
+    settled = true
 
     const final = resolved ?? result
     this.subscribed = final.ok
@@ -134,6 +151,13 @@ export class Channel<M = Json> {
   /** Withdraws presence. Also happens automatically when the stream closes. */
   async untrack(): Promise<void> {
     await this.client.presence(this.name, 'untrack')
+  }
+
+  /** The server removed the join: nothing more arrives until subscribe() again. */
+  private ended(e: SluiceError): void {
+    this.subscribed = false
+    this.presenceState = {}
+    this.errorHandler?.(e)
   }
 
   private applyPresence(p: PresencePayload<M>): void {

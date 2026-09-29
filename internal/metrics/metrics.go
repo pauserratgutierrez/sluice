@@ -123,6 +123,11 @@ var (
 		Help: "Lease re-evaluations of volatile predicates, by outcome.",
 	}, []string{"result"})
 
+	HookRechecks = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_channel_hook_rechecks_total",
+		Help: "Re-checks of joined hook channels whose verdict expired, per joined channel, by outcome (held, revoked, unavailable).",
+	}, []string{"result"})
+
 	// ---- streams ---------------------------------------------------------
 	Streams = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_streams",

@@ -37,7 +37,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 
 - Model the table-owner bypass using the role memberships the catalog already loads.
 - Detect column-grant revocation (it costs a query per subscription per tick rather than a hash comparison).
-- Re-check hook channels on `/token`.
+- Batch hook re-checks: one endpoint call for several channels whose verdicts expire on the same tick (needs a multi-channel hook request).
 - Per-namespace hook secrets, or signed hook requests (HMAC over the body with a timestamp) instead of a static bearer.
 - Cap the `ttl` a hook may return.
 - Move Tier C probes off the replication path, so one slow policy does not delay every subscriber.

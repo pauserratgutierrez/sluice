@@ -64,6 +64,9 @@ type Server struct {
 	wheel   *timer.Wheel
 	snapSem chan struct{}
 	hooks   *hookCache
+	// hookRecheck is held while a round of hook re-checks runs, so a slow
+	// endpoint cannot stack rounds up across ticks.
+	hookRecheck atomic.Bool
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
@@ -768,6 +771,8 @@ func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpe
 			"channel %q has no configured namespace; add it to SLUICE_CHANNELS", spec.Channel)}
 		return res
 	}
+	// A hook verdict is a lease: the join is asked about again when it expires.
+	var recheckAt time.Time
 	switch ch.Mode {
 	case config.ChannelPublic:
 	case config.ChannelOwner:
@@ -779,14 +784,15 @@ func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpe
 			return res
 		}
 	case config.ChannelHook:
-		allow, reason := s.hooks.Authorize(s.ctx, ch, id, spec.Channel)
-		if !allow {
-			res.Error = &event.Error{Code: "channel_not_authorized", Message: reason}
+		v := s.hooks.Authorize(s.ctx, ch, id, spec.Channel, false)
+		if !v.allowed() {
+			res.Error = &event.Error{Code: "channel_not_authorized", Message: v.reason}
 			return res
 		}
+		recheckAt = v.expires
 	}
 
-	if !s.hub.JoinChannel(spec.Channel, st, spec.Sub) {
+	if !s.hub.JoinChannel(spec.Channel, st, spec.Sub, recheckAt) {
 		res.Error = &event.Error{Code: "stream_closed", Message: "the stream closed during the subscribe"}
 		return res
 	}
@@ -965,6 +971,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 		metrics.AuthzLeaseRefreshes.WithLabelValues("held").Inc()
 	}
+	revoked += s.recheckStreamHooks(r.Context(), st, newID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revoked_subscriptions": revoked})
 }
 
@@ -1032,6 +1039,9 @@ func (s *Server) scheduleCatalogRefresh() {
 // stream for as long as it stayed open. Comparing the catalog's authorization
 // version closes it; re-resolving is pure CPU, since Resolve reads the cached
 // catalog and makes no database round trip.
+//
+// Hook channel joins are leases too, expiring with their verdict; they are
+// re-checked in the background (see recheckHookChannels).
 func (s *Server) RefreshLeases(ctx context.Context) {
 	now := time.Now()
 	subs := s.reg.All()
@@ -1110,6 +1120,8 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 		}
 		s.dropShape(st, w.Label, event.Error{Code: "shape_not_authorized", Message: riReason})
 	}
+
+	s.startHookRechecks(ctx, now)
 }
 
 // ---------------------------------------------------------------------------

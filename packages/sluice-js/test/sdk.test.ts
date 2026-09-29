@@ -452,6 +452,110 @@ test('a refused subscription is not resent on reconnect', async () => {
   client.close()
 })
 
+/** An SSE body that stays open, with events pushed by the test. */
+function pushStream() {
+  const encoder = new TextEncoder()
+  let ctrl!: ReadableStreamDefaultController<Uint8Array>
+  const body = new ReadableStream<Uint8Array>({ start: (c) => void (ctrl = c) })
+  return { body, push: (s: string) => ctrl.enqueue(encoder.encode(s)) }
+}
+
+test('a channel the server removes reports the error, refuses send, and can be rejoined', async () => {
+  const calls: string[] = []
+  const live = pushStream()
+  let label = ''
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (input, init) => {
+      const path = String(input).replace('https://example.test/sluice/v1', '')
+      const body = JSON.parse(String(init?.body))
+      calls.push(path)
+      if (path === '/stream') {
+        label = body.subscriptions[0].sub
+        live.push('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: [{ sub: label, ok: true }] }) + '\n\n')
+        return sse(live.body)
+      }
+      if (path === '/subscribe') return new Response(JSON.stringify({ results: [{ sub: body.subscriptions[0].sub, ok: true }] }))
+      if (path === '/publish') return new Response(JSON.stringify({ delivered: 1 }))
+      return new Response(JSON.stringify({ removed: 0 }))
+    },
+  })
+
+  const channel = client.channel('chat:1')
+  const errors: string[] = []
+  let rejoined: Promise<{ ok: boolean }> | undefined
+  channel.onError((e) => {
+    errors.push(e.code)
+    // Rejoining from the handler itself must work: the removed join is
+    // already forgotten.
+    rejoined = channel.subscribe()
+  })
+  assert.equal((await channel.subscribe()).ok, true)
+  assert.equal(await channel.send('typing', {}), 1)
+
+  live.push('event: error\ndata: ' + JSON.stringify({ sub: label, code: 'channel_not_authorized', message: 'blocked' }) + '\n\n')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(errors, ['channel_not_authorized'])
+  assert.ok(rejoined, 'onError did not run')
+  assert.equal((await rejoined).ok, true)
+  assert.equal(await channel.send('typing', {}), 1)
+  assert.deepEqual(calls, ['/stream', '/publish', '/subscribe', '/publish'])
+  client.close()
+})
+
+test('a removed channel refuses send until it is joined again', async () => {
+  const live = pushStream()
+  let label = ''
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (_input, init) => {
+      label = JSON.parse(String(init?.body)).subscriptions?.[0]?.sub ?? label
+      live.push('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: [{ sub: label, ok: true }] }) + '\n\n')
+      return sse(live.body)
+    },
+  })
+  const channel = client.channel('chat:1')
+  const errors: string[] = []
+  channel.onError((e) => errors.push(e.code))
+  await channel.subscribe()
+  live.push('event: error\ndata: ' + JSON.stringify({ sub: label, code: 'channel_not_authorized', message: 'blocked' }) + '\n\n')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(errors, ['channel_not_authorized'])
+  await assert.rejects(() => channel.send('typing', {}), /subscribe/)
+  client.close()
+})
+
+test('a channel refused when a reconnect resends it reports the error', async () => {
+  let streams = 0
+  let label = ''
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (_input, init) => {
+      label = JSON.parse(String(init?.body)).subscriptions[0].sub
+      streams++
+      const result = streams === 1
+        ? { sub: label, ok: true }
+        : { sub: label, ok: false, error: { code: 'channel_not_authorized', message: 'blocked' } }
+      const ready = 'event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: [result] }) + '\n\n'
+      // The first stream ends, so the client reconnects and resends the join.
+      return sse(streams === 1 ? ready : openStream(ready))
+    },
+  })
+  const channel = client.channel('chat:1')
+  const errors: string[] = []
+  channel.onError((e) => errors.push(e.code))
+  assert.equal((await channel.subscribe()).ok, true)
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(streams, 2)
+  assert.deepEqual(errors, ['channel_not_authorized'])
+  await assert.rejects(() => channel.send('typing', {}), /subscribe/)
+  client.close()
+})
+
 // The server closes a stream whose token expired; the reconnect with the same
 // token is refused, so the client stops. A refreshed token brings it back.
 test('setAuth reconnects a stream that stopped on an expired token', async () => {

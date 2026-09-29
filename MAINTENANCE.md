@@ -55,3 +55,5 @@ If you ever create a different package name: publish once from a machine with `n
 ## Before tagging
 
 The release workflows run `go vet`, `go test -race` and the SDK's `npm test`, but not the harness suites. Run them by hand first (see [Development and testing](README.md#development-and-testing)): `cmd/smoke`, `cmd/smoke-issuer`, `cmd/audit` and `packages/sluice-js/test/live.mjs`.
+
+Add the version's entry to [CHANGELOG.md](CHANGELOG.md), with anything that changes behavior for clients or hook endpoints called out.
