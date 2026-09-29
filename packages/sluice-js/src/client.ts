@@ -45,13 +45,22 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   private registrations = new Map<string, Registration>()
   /** Last commit LSN seen per relation, so a reconnect resumes instead of gapping. */
   private resumeFrom = new Map<string, string>()
+  /** Results the current stream's ready event carried, by label. */
+  private readyResults = new Map<string, SubscriptionResult>()
 
   private streamId: string | null = null
   private abort: AbortController | null = null
   private status: ConnectionStatus = 'closed'
   private attempt = 0
   private closed = false
-  private connectPromise: Promise<void> | null = null
+  /** True while the stream loop runs; there is never more than one. */
+  private running = false
+  /** Set while the document is hidden: the loop stops and does not reconnect. */
+  private paused = false
+  /** Callers waiting for the next ready event, or for the loop to stop. */
+  private waiters: Array<() => void> = []
+  /** Token passed to setAuth, used instead of options.accessToken from then on. */
+  private tokenOverride: string | null = null
   private visibilityHandler: (() => void) | null = null
 
   constructor(url: string, options: ClientOptions) {
@@ -64,8 +73,13 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       // between proxies wanting frequent keepalives and mobile radios wanting
       // silence. It also stops background tabs holding server resources.
       this.visibilityHandler = () => {
-        if (document.visibilityState === 'hidden') this.disconnect()
-        else if (!this.closed && this.registrations.size) void this.connect()
+        if (document.visibilityState === 'hidden') {
+          this.paused = true
+          this.disconnect()
+        } else {
+          this.paused = false
+          if (!this.closed && this.registrations.size) void this.connect()
+        }
       }
       document.addEventListener('visibilitychange', this.visibilityHandler)
     }
@@ -118,16 +132,26 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
 
     if (!this.streamId) {
       await this.connect()
-      // The stream request carried this subscription, so its result already
-      // arrived in the ready event.
-      return this.lastResults.get(reg.spec.sub) ?? { sub: reg.spec.sub, ok: true }
+      // If the stream request carried this subscription, its result arrived in
+      // the ready event. If the request had already been sent when it was
+      // registered, it is subscribed below like any later one.
+      const carried = this.readyResults.get(reg.spec.sub)
+      if (carried) return carried
+      if (!this.streamId) {
+        this.registrations.delete(reg.spec.sub)
+        throw new SluiceError({ sub: reg.spec.sub, code: 'not_connected', message: 'the stream could not be opened', retryable: true })
+      }
     }
 
     const body = await this.post('/subscribe', {
       stream_id: this.streamId,
       subscriptions: [reg.spec],
     })
-    const result = (body.results as SubscriptionResult[])?.[0] ?? { sub: reg.spec.sub, ok: true }
+    const result = (body.results as SubscriptionResult[] | undefined)?.[0] ?? {
+      sub: reg.spec.sub,
+      ok: false,
+      error: { code: 'bad_response', message: 'the server returned no result for this subscription' },
+    }
     this.handleResult(result)
     return result
   }
@@ -135,6 +159,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   /** @internal */
   async unregister(sub: string): Promise<void> {
     this.registrations.delete(sub)
+    this.readyResults.delete(sub)
     if (!this.streamId) return
     try {
       await this.post('/unsubscribe', { stream_id: this.streamId, subs: [sub] })
@@ -169,22 +194,28 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   }
 
   /**
-   * Rebinds the stream to a refreshed access token.
+   * Uses a refreshed access token from now on, instead of `options.accessToken`.
    *
-   * Call this when your auth library refreshes. Every authorization decision on
-   * the stream is re-resolved server-side, because the claims may have changed:
-   * a subscription that is no longer permitted is dropped with an error rather
-   * than silently continuing.
+   * Call this when your auth library refreshes. On an open stream every
+   * authorization decision is re-resolved server-side, because the claims may
+   * have changed: a subscription that is no longer permitted is dropped with an
+   * error rather than silently continuing. If the stream is down -- for example
+   * after it closed with `token_expired` -- it reconnects with this token.
    */
   async setAuth(token: string): Promise<void> {
-    if (!this.streamId) return
-    await this.post('/token', { stream_id: this.streamId, access_token: token })
+    this.tokenOverride = token
+    if (this.streamId) {
+      await this.post('/token', { stream_id: this.streamId, access_token: token })
+    } else if (!this.closed && !this.paused && this.registrations.size > 0) {
+      await this.connect()
+    }
   }
 
   /** Closes the stream and forgets every subscription. */
   close(): void {
     this.closed = true
     this.registrations.clear()
+    this.readyResults.clear()
     this.resumeFrom.clear()
     if (this.visibilityHandler && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.visibilityHandler)
@@ -196,8 +227,6 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   // -------------------------------------------------------------------------
   // Transport
   // -------------------------------------------------------------------------
-
-  private lastResults = new Map<string, SubscriptionResult>()
 
   private disconnect(): void {
     this.abort?.abort()
@@ -219,7 +248,8 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   }
 
   private async token(): Promise<string> {
-    const t = typeof this.options.accessToken === 'function' ? await this.options.accessToken() : this.options.accessToken
+    const source = this.options.accessToken
+    const t = this.tokenOverride ?? (typeof source === 'function' ? await source() : source)
     if (!t) throw new SluiceError({ code: 'no_token', message: 'no access token available', retryable: true })
     return t
   }
@@ -242,7 +272,13 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       body: JSON.stringify(body),
     })
     const text = await res.text()
-    const parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {}
+    let parsed: Record<string, unknown> = {}
+    try {
+      if (text) parsed = JSON.parse(text) as Record<string, unknown>
+    } catch {
+      // A proxy error page, not a Sluice response; reported by status below.
+      if (res.ok) throw new SluiceError({ code: 'bad_response', message: 'the server did not return JSON', retryable: true })
+    }
     if (!res.ok) {
       throw new SluiceError({
         code: (parsed.error as string) ?? `http_${res.status}`,
@@ -253,95 +289,92 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
     return parsed
   }
 
-  /** Opens the stream, retrying with backoff until closed. */
+  /**
+   * Resolves on the next ready event, or when the stream loop stops. Starts the
+   * loop if it is not running; there is never more than one.
+   */
   private connect(): Promise<void> {
-    if (this.connectPromise) return this.connectPromise
-    this.connectPromise = this.connectLoop().finally(() => {
-      this.connectPromise = null
-    })
-    return this.connectPromise
-  }
-
-  private async connectLoop(): Promise<void> {
-    let resolve!: () => void
-    const opened = new Promise<void>((r) => {
-      resolve = r
-    })
-    void this.runStream(resolve)
-    return opened
-  }
-
-  private async runStream(opened: () => void): Promise<void> {
-    let settled = false
-    const settle = () => {
-      if (!settled) {
-        settled = true
-        opened()
-      }
+    const next = new Promise<void>((resolve) => this.waiters.push(resolve))
+    if (!this.running) {
+      this.running = true
+      void this.runStream()
     }
+    return next
+  }
 
-    while (!this.closed && this.registrations.size > 0) {
-      this.setStatus(this.attempt === 0 ? 'connecting' : 'reconnecting')
-      const abort = new AbortController()
-      this.abort = abort
+  private wake(): void {
+    const waiters = this.waiters
+    this.waiters = []
+    for (const resolve of waiters) resolve()
+  }
 
-      try {
-        const resume: Record<string, string> = {}
-        for (const [rel, lsn] of this.resumeFrom) resume[rel] = lsn
+  /** Opens the stream and keeps it open, reconnecting with backoff. */
+  private async runStream(): Promise<void> {
+    try {
+      while (!this.closed && !this.paused && this.registrations.size > 0) {
+        this.setStatus(this.attempt === 0 ? 'connecting' : 'reconnecting')
+        const abort = new AbortController()
+        this.abort = abort
 
-        const res = await this.fetchImpl(this.url + '/stream', {
-          method: 'POST',
-          headers: { ...(await this.headers()), Accept: 'text/event-stream' },
-          body: JSON.stringify({
-            subscriptions: [...this.registrations.values()].map((r) => r.spec),
-            resume,
-          }),
-          signal: abort.signal,
-        })
+        try {
+          const resume: Record<string, string> = {}
+          for (const [rel, lsn] of this.resumeFrom) resume[rel] = lsn
 
-        if (!res.ok || !res.body) {
-          const text = await res.text().catch(() => '')
-          throw new SluiceError({
-            code: `http_${res.status}`,
-            message: text || res.statusText,
-            // 401 means the token is wrong, not that the server is busy.
-            retryable: res.status !== 401 && res.status !== 403,
+          const res = await this.fetchImpl(this.url + '/stream', {
+            method: 'POST',
+            headers: { ...(await this.headers()), Accept: 'text/event-stream' },
+            body: JSON.stringify({
+              subscriptions: [...this.registrations.values()].map((r) => r.spec),
+              resume,
+            }),
+            signal: abort.signal,
           })
+
+          if (!res.ok || !res.body) {
+            const text = await res.text().catch(() => '')
+            throw new SluiceError({
+              code: `http_${res.status}`,
+              message: text || res.statusText,
+              // 401 means the token is wrong, not that the server is busy.
+              retryable: res.status !== 401 && res.status !== 403,
+            })
+          }
+
+          this.attempt = 0
+          for await (const ev of parseSSE(res.body, abort.signal)) {
+            this.dispatch(ev.event, ev.data)
+          }
+          // A clean end of stream is still a disconnect: reconnect. A fresh
+          // token is fetched, so a stream closed for token_expired recovers
+          // when accessToken returns a new one.
+        } catch (err) {
+          if (abort.signal.aborted || this.closed) break
+          const e = err instanceof SluiceError ? err : new SluiceError({
+            code: 'connection_failed',
+            message: err instanceof Error ? err.message : String(err),
+            retryable: true,
+          })
+          this.options.onError?.(e)
+          if (!e.retryable) break
+        } finally {
+          this.streamId = null
         }
 
-        this.attempt = 0
-        for await (const ev of parseSSE(res.body, abort.signal)) {
-          this.dispatch(ev.event, ev.data)
-          if (ev.event === 'ready') settle()
-        }
-        // A clean end of stream is still a disconnect: reconnect.
-      } catch (err) {
-        if (abort.signal.aborted || this.closed) break
-        const e = err instanceof SluiceError ? err : new SluiceError({
-          code: 'connection_failed',
-          message: err instanceof Error ? err.message : String(err),
-          retryable: true,
-        })
-        this.options.onError?.(e)
-        if (!e.retryable) {
-          settle()
-          break
-        }
+        if (this.closed || this.paused || this.registrations.size === 0) break
+
+        const schedule = this.options.backoff ?? DEFAULT_BACKOFF
+        const wait = schedule[Math.min(this.attempt, schedule.length - 1)] ?? 1000
+        this.attempt++
+        // Full jitter: a server restart must not bring every client back at the
+        // same instant.
+        await sleep(Math.random() * wait)
       }
-
-      if (this.closed || this.registrations.size === 0) break
-
-      const schedule = this.options.backoff ?? DEFAULT_BACKOFF
-      const wait = schedule[Math.min(this.attempt, schedule.length - 1)] ?? 1000
-      this.attempt++
-      // Full jitter: a server restart must not bring every client back at the
-      // same instant.
-      await sleep(Math.random() * wait)
+    } finally {
+      this.running = false
+      this.streamId = null
+      this.setStatus(this.closed ? 'closed' : 'reconnecting')
+      this.wake()
     }
-
-    settle()
-    this.streamId = null
-    this.setStatus(this.closed ? 'closed' : 'reconnecting')
   }
 
   private dispatch(kind: string, raw: string): void {
@@ -358,7 +391,12 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const ready = payload as ReadyPayload
         this.streamId = ready.stream_id
         this.setStatus('open')
-        for (const result of ready.subscriptions ?? []) this.handleResult(result)
+        this.readyResults.clear()
+        for (const result of ready.subscriptions ?? []) {
+          this.readyResults.set(result.sub, result)
+          this.handleResult(result)
+        }
+        this.wake()
         return
       }
       case 'change': {
@@ -393,16 +431,21 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const e = payload as SluiceErrorPayload
         const err = new SluiceError(e)
         if (e.sub) {
-          this.registrations.get(e.sub)?.onEvent('error', err)
-          // A subscription-scoped error is terminal for that subscription; the
-          // stream and every other subscription carry on.
+          const reg = this.registrations.get(e.sub)
+          reg?.onEvent('error', err)
+          // The position is gone from the server's buffer; resending it on the
+          // next reconnect would only fail again.
+          if (e.code === 'resume_too_old' && reg?.spec.shape) {
+            this.resumeFrom.delete(`${reg.spec.shape.schema ?? 'public'}.${reg.spec.shape.table}`)
+          }
+          // A subscription-scoped error that is not retryable ends that
+          // subscription; the stream and every other subscription carry on.
           if (!e.retryable) this.registrations.delete(e.sub)
         } else {
+          // A stream-scoped error is followed by the server closing the
+          // stream. The loop reconnects, and the server refuses the reconnect
+          // (401) if the identity is no longer valid.
           this.options.onError?.(err)
-          // A stream-scoped error means the server is about to close us.
-          if (e.code === 'session_revoked' || e.code === 'token_expired') {
-            this.disconnect()
-          }
         }
         return
       }
@@ -410,9 +453,10 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   }
 
   private handleResult(result: SubscriptionResult): void {
-    this.lastResults.set(result.sub, result)
     for (const w of result.warnings ?? []) this.options.onWarning?.(w)
     this.registrations.get(result.sub)?.onResult(result)
+    // A refused subscription is not resent on every reconnect.
+    if (!result.ok) this.registrations.delete(result.sub)
   }
 }
 

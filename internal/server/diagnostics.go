@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -50,7 +51,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.reader != nil {
-		out["slot"] = s.slotInfo(r)
+		out["slot"] = s.slotInfo(r.Context())
 	}
 
 	stats := s.reg.Stats()
@@ -71,12 +72,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	diags := s.diagnostics()
 	out["warnings"] = diags
-
-	// Reset then set, so a resolved warning stops being reported.
-	metrics.ConfigWarnings.Reset()
-	for _, d := range diags {
-		metrics.ConfigWarnings.WithLabelValues(d.Code).Set(1)
-	}
+	setWarningMetrics(diags)
 
 	out["publication"] = map[string]any{
 		"name":   s.cfg.Publication,
@@ -84,15 +80,33 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 	out["replication_options"] = map[string]any{
 		"proto_version": s.cfg.ProtoVersion,
-		"streaming":     s.cfg.Streaming,
-		"binary":        s.cfg.Binary,
 		"messages":      s.cfg.Messages,
 	}
 
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) slotInfo(r *http.Request) map[string]any {
+// RefreshHealth runs on every catalog tick. It keeps the slot and warning
+// metrics current without anyone calling /diagnostics, and bounds the memory
+// the resume buffer holds for tables that went quiet.
+func (s *Server) RefreshHealth(ctx context.Context) {
+	if s.reader != nil && s.pool != nil {
+		s.slotInfo(ctx)
+	}
+	setWarningMetrics(s.diagnostics())
+	s.hub.Rings().Sweep()
+}
+
+// setWarningMetrics resets then sets sluice_config_warnings, so a resolved
+// warning stops being reported.
+func setWarningMetrics(diags []Diagnostic) {
+	metrics.ConfigWarnings.Reset()
+	for _, d := range diags {
+		metrics.ConfigWarnings.WithLabelValues(d.Code).Set(1)
+	}
+}
+
+func (s *Server) slotInfo(ctx context.Context) map[string]any {
 	info := map[string]any{
 		"name":          s.cfg.SlotName,
 		"confirmed_lsn": reader.FormatLSN(s.reader.ConfirmedLSN()),
@@ -104,7 +118,7 @@ func (s *Server) slotInfo(r *http.Request) map[string]any {
 		retained int64
 		invalid  *string
 	)
-	err := s.pool.QueryRow(r.Context(), `
+	err := s.pool.QueryRow(ctx, `
 		SELECT active,
 		       coalesce(wal_status, 'unknown'),
 		       coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint,
@@ -123,19 +137,10 @@ func (s *Server) slotInfo(r *http.Request) map[string]any {
 	return info
 }
 
-// diagnostics builds the warning list from the catalog and the live registry.
+// diagnostics builds the warning list from startup validation, the catalog and
+// the live registry.
 func (s *Server) diagnostics() []Diagnostic {
-	var out []Diagnostic
-
-	if s.cfg.Streaming != "off" {
-		out = append(out, Diagnostic{
-			Code: "streaming_enabled", Severity: "low",
-			Reason: "streaming is set to " + s.cfg.Streaming,
-			Impact: "uncommitted transactions must be buffered in the Go heap until Stream Commit, " +
-				"instead of being buffered by PostgreSQL where the spill is disk-backed and observable",
-			Remedy: "set SLUICE_STREAMING=off unless a measured workload requires otherwise",
-		})
-	}
+	out := append([]Diagnostic(nil), s.startupWarnings...)
 
 	// Per-relation findings from the catalog.
 	for _, rel := range s.cat.All() {
@@ -156,8 +161,8 @@ func (s *Server) diagnostics() []Diagnostic {
 				Code: "replica_identity_full_with_toast", Severity: "medium",
 				Relation: rel.FullName(),
 				Reason:   "REPLICA IDENTITY FULL combined with a TOAST-able column",
-				Impact: "toast_flatten_tuple inlines the whole out-of-line value into every old tuple; " +
-					"measured 15x more WAL and 3200x larger DELETE messages",
+				Impact: "every UPDATE and DELETE carries the whole out-of-line value in the old tuple, " +
+					"even when that column did not change, inflating WAL and the replication stream",
 				Remedy: "CREATE UNIQUE INDEX " + rel.Name + "_ri ON " + rel.FullName() +
 					" (<filter columns>, <pk>); ALTER TABLE " + rel.FullName() +
 					" REPLICA IDENTITY USING INDEX " + rel.Name + "_ri;",
@@ -215,7 +220,7 @@ func (s *Server) diagnostics() []Diagnostic {
 					Relation: rel.FullName(), Policy: p.Name,
 					Reason: "calls " + strings.Join(calls, ", ") + " directly rather than as a scalar subquery",
 					Impact: "PostgreSQL re-invokes the function for every row it scans instead of once " +
-						"per query as an InitPlan; measured at 179 ms versus 9 ms over 100,000 rows",
+						"per query as an InitPlan, in snapshots, Tier C probes and the application's own queries",
 					Remedy: fmt.Sprintf(
 						"rewrite the policy wrapping each call, e.g. `(select %s)`, then "+
 							"ALTER POLICY %s ON %s USING (...);",
@@ -233,8 +238,8 @@ func (s *Server) diagnostics() []Diagnostic {
 					Code: "unindexed_policy_column", Severity: "low",
 					Relation: rel.FullName(), Policy: p.Name,
 					Reason: fmt.Sprintf("the policy reads %q, which is not the leading column of any index", col),
-					Impact: "snapshots and Tier C probes scan the table instead of seeking; " +
-						"measured at 171 ms versus under 0.1 ms over 100,000 rows",
+					Impact: "snapshots, Tier C probes and the application's own queries scan the table " +
+						"instead of seeking",
 					Remedy: fmt.Sprintf("CREATE INDEX ON %s (%s);", rel.FullName(), catalog.QuoteIdent(col)),
 				})
 			}
@@ -246,8 +251,8 @@ func (s *Server) diagnostics() []Diagnostic {
 				Code: "tier_c_policy", Severity: "high",
 				Relation: rel.FullName(), Policy: p.Name,
 				Reason: info.Unsupported,
-				Impact: "measured at roughly 13 microseconds per subscriber per change, which caps " +
-					"throughput near 100 changes/sec at 1,000 subscribers",
+				Impact: "every change to this table runs one impersonated query per Tier C subscriber, " +
+					"on the replication path, so throughput falls as subscribers grow",
 				Remedy: remedyForTierC(rel, info),
 			})
 		}

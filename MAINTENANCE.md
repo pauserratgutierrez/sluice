@@ -52,8 +52,6 @@ After that, each new `v*.*.*` tag publishes via OIDC.
 
 If you ever create a different package name: publish once from a machine with `npm login` (browser/2FA), then attach Trusted Publisher as above. Do not rely on CI tokens for the first create.
 
-## Not covered here yet
+## Before tagging
 
-- CI on every push (vet, `-race`, harness smoke) — release workflows only run on tags
-- Choosing an open-source license (SDK is still `UNLICENSED`)
-- The issuer overlay smoke (`cmd/smoke-issuer`) does not replace the 36 RLS assertions
+The release workflows run `go vet`, `go test -race` and the SDK's `npm test`, but not the harness suites. Run them by hand first (see [Development and testing](README.md#development-and-testing)): `cmd/smoke`, `cmd/smoke-issuer`, `cmd/audit` and `packages/sluice-js/test/live.mjs`.

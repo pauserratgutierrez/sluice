@@ -284,20 +284,41 @@ func TestDecodeBeginCommit(t *testing.T) {
 
 func TestDecodeStreamingSetsInStream(t *testing.T) {
 	d := NewDecoder()
-	if d.InStream() {
+	if d.inStream {
 		t.Fatal("should not start in a stream")
 	}
 	if _, err := d.Decode((&builder{}).u8(MsgStreamStart).u32(99).u8(1).bytes()); err != nil {
 		t.Fatal(err)
 	}
-	if !d.InStream() {
+	if !d.inStream {
 		t.Fatal("StreamStart must set inStream")
 	}
 	if _, err := d.Decode([]byte{MsgStreamStop}); err != nil {
 		t.Fatal(err)
 	}
-	if d.InStream() {
+	if d.inStream {
 		t.Fatal("StreamStop must clear inStream")
+	}
+}
+
+// The replication connection reuses its receive buffer, and the resume ring
+// keeps tuples after the next message arrives. A decoded tuple must therefore
+// not alias the input.
+func TestDecodedTupleOwnsItsBytes(t *testing.T) {
+	d := decoderWithRelation(t)
+	msg := append([]byte{MsgInsert}, u32b(16400)...)
+	msg = append(msg, 'N')
+	msg = append(msg, tuple(text("1"), text("abc"), text("hello"))...)
+
+	m, err := d.Decode(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range msg {
+		msg[i] = 'z'
+	}
+	if got := string(m.New.Columns[2].Data); got != "hello" {
+		t.Fatalf("tuple data changed with the input buffer: %q", got)
 	}
 }
 

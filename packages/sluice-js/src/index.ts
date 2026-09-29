@@ -8,7 +8,7 @@
  * @example
  * ```ts
  * import { createClient } from '@pauserratgutierrez/sluice-js'
- * import type { Database } from '@gatherpeers/database-types'
+ * import type { Database } from './database.types' // generated PostgREST types
  *
  * const sluice = createClient<Database>('https://api.example.com/sluice/v1', {
  *   accessToken: () => supabase.auth.getSession().then(s => s.data.session?.access_token),

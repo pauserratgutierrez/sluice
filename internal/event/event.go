@@ -49,11 +49,13 @@ type Change struct {
 	// subscriber whenever an unrelated counter is updated.
 	Unchanged []string `json:"unchanged,omitempty"`
 	// Transition is "enter" or "leave" when an UPDATE moved the row into or out
-	// of the shape. Without this a client's view goes stale on a row that no
-	// longer matches its filter -- supabase/walrus#64, still open.
+	// of the shape (only for subscriptions that asked for transitions). Without
+	// it a client's view goes stale on a row that no longer matches its filter.
 	Transition string `json:"transition,omitempty"`
-	// Degraded names a correctness caveat that applies to this event, e.g.
-	// "delete_authz_unavailable" or "payload_too_large". Never silent.
+	// Degraded names a caveat that applies to this event:
+	// "delete_authz_unavailable" (a DELETE delivered without an authorization
+	// decision, only with SLUICE_DEGRADED_DELETES=deliver) or
+	// "change_too_large" (record and old trimmed to the key columns).
 	Degraded string `json:"degraded,omitempty"`
 	Snapshot bool   `json:"snapshot,omitempty"`
 }
@@ -106,9 +108,11 @@ type Warning struct {
 	Remedy  string `json:"remedy,omitempty"`
 }
 
-// SnapshotEnd terminates an initial snapshot.
+// SnapshotEnd terminates an initial snapshot. Truncated means more rows matched
+// than SLUICE_SNAPSHOT_MAX_ROWS and only that many were sent.
 type SnapshotEnd struct {
-	Sub      string `json:"sub"`
-	Rows     int    `json:"rows"`
-	FloorLSN string `json:"floor_lsn"`
+	Sub       string `json:"sub"`
+	Rows      int    `json:"rows"`
+	FloorLSN  string `json:"floor_lsn"`
+	Truncated bool   `json:"truncated,omitempty"`
 }

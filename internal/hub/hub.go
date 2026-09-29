@@ -1,10 +1,12 @@
 // Package hub owns live streams and the in-process fan-out.
 //
-// Backpressure policy is per plane and explicit, because the right answer
-// differs. A silently truncated change stream is worse than a closed one, so a
-// lagging change consumer is disconnected and told to resnapshot. Broadcast is
-// documented as best-effort, so it drops oldest. Presence is coalescible, so a
-// newer diff supersedes an older one.
+// Each stream has one bounded queue, and the policy when it is full depends on
+// the kind of event. A silently truncated change stream is worse than a closed
+// one, so a change (or snapshot_end) that does not fit closes the stream as
+// stream_lagging and the client resumes or resnapshots. Every other kind --
+// broadcast, presence, warnings -- is best-effort and the new event is dropped.
+// Nothing already queued is ever displaced, because that would reorder the
+// stream.
 package hub
 
 import (
@@ -15,6 +17,7 @@ import (
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/metrics"
 )
 
 // Stream is one live SSE connection.
@@ -28,7 +31,6 @@ type Stream struct {
 	closeOnce sync.Once
 	closeCode atomic.Pointer[string]
 
-	dropped atomic.Int64
 	created time.Time
 
 	// channels this stream subscribes to on the signalling plane:
@@ -65,40 +67,11 @@ func (s *Stream) Send(ev event.Event) bool {
 	default:
 	}
 
-	// Queue full. Apply the per-plane policy.
-	switch ev.Kind {
-	case event.KindChange:
-		s.dropped.Add(1)
+	metrics.StreamDropped.WithLabelValues(string(ev.Kind)).Inc()
+	if ev.Kind == event.KindChange || ev.Kind == event.KindSnapshotEnd {
 		s.CloseWith("stream_lagging")
-		return false
-	case event.KindPresence:
-		// Coalesce: discard one older presence event to make room. A newer
-		// snapshot or diff carries strictly more recent truth.
-		select {
-		case old := <-s.queue:
-			if old.Kind != event.KindPresence {
-				// Do not sacrifice a change or an error to make room for
-				// presence; put it back and drop the presence event instead.
-				select {
-				case s.queue <- old:
-				default:
-				}
-				s.dropped.Add(1)
-				return false
-			}
-		default:
-		}
-		select {
-		case s.queue <- ev:
-			return true
-		default:
-			s.dropped.Add(1)
-			return false
-		}
-	default:
-		s.dropped.Add(1)
-		return false
 	}
+	return false
 }
 
 // Events is the channel the SSE writer reads.
@@ -123,8 +96,6 @@ func (s *Stream) CloseCode() string {
 	}
 	return ""
 }
-
-func (s *Stream) Dropped() int64 { return s.dropped.Load() }
 
 // TrackChannel records a signalling-plane subscription.
 func (s *Stream) TrackChannel(channel, label string) {
@@ -161,12 +132,11 @@ func (s *Stream) Channels() []string {
 type Hub struct {
 	queueSize int
 
-	mu      sync.RWMutex
-	streams map[string]*Stream
-	// channel -> set of streams, sharded only by map access for now; a
-	// single-node hub at 100k streams does not need more, and the seam for a
-	// sharded implementation is this type's method set.
-	byChannel map[string]map[string]*Stream
+	// mu guards streams and byChannel. When a Stream's own lock is also needed,
+	// it is taken after this one.
+	mu        sync.RWMutex
+	streams   map[string]*Stream
+	byChannel map[string]map[string]*Stream // channel -> stream id -> stream
 
 	presence *Presence
 	rings    *Rings
@@ -208,6 +178,7 @@ func (h *Hub) Close(id, code string) {
 	s := h.streams[id]
 	delete(h.streams, id)
 	if s != nil {
+		s.mu.RLock()
 		for ch := range s.channels {
 			if set := h.byChannel[ch]; set != nil {
 				delete(set, id)
@@ -216,13 +187,14 @@ func (h *Hub) Close(id, code string) {
 				}
 			}
 		}
+		s.mu.RUnlock()
 	}
 	h.mu.Unlock()
 	if s == nil {
 		return
 	}
 	// Presence leave is driven by the transport close, with no client message
-	// required. Borrowed from MCP's "closing the stream is the cancellation" rule.
+	// required.
 	h.presence.RemoveStream(id)
 	s.CloseWith(code)
 }
@@ -251,17 +223,23 @@ func (h *Hub) Streams() []*Stream {
 	return out
 }
 
-// JoinChannel adds a stream to a channel's fan-out set.
-func (h *Hub) JoinChannel(channel string, s *Stream, label string) {
+// JoinChannel adds a stream to a channel's fan-out set. It returns false when
+// the stream has already been closed, so a join racing a disconnect cannot
+// leave a closed stream in the set.
+func (h *Hub) JoinChannel(channel string, s *Stream, label string) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.streams[s.id] != s {
+		return false
+	}
 	set := h.byChannel[channel]
 	if set == nil {
 		set = map[string]*Stream{}
 		h.byChannel[channel] = set
 	}
 	set[s.id] = s
-	h.mu.Unlock()
 	s.TrackChannel(channel, label)
+	return true
 }
 
 // LeaveChannel removes a stream from a channel.
@@ -273,8 +251,8 @@ func (h *Hub) LeaveChannel(channel string, s *Stream) {
 			delete(h.byChannel, channel)
 		}
 	}
-	h.mu.Unlock()
 	s.UntrackChannel(channel)
+	h.mu.Unlock()
 	h.presence.Untrack(channel, s.id)
 }
 
@@ -290,12 +268,8 @@ func (h *Hub) ChannelMembers(channel string) []*Stream {
 	return out
 }
 
-// PublishBroadcast fans a message out to a channel.
-//
-// Unlike Supabase, there is no mode in which this silently vanishes: the caller
-// is an HTTP request that receives a synchronous 403 or 413 when the channel or
-// payload is rejected, and the delivered count is returned so the caller knows
-// what happened.
+// PublishBroadcast fans a message out to a channel and returns how many streams
+// it was queued on. A stream whose queue is full does not count.
 func (h *Hub) PublishBroadcast(channel, evName, from, origin, commitLSN string, payload json.RawMessage, includeSelf bool, selfID string) int {
 	members := h.ChannelMembers(channel)
 	now := time.Now().UTC().Format(time.RFC3339Nano)

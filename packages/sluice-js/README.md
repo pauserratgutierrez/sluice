@@ -1,16 +1,16 @@
 # @pauserratgutierrez/sluice-js
 
-Typed realtime client for [Sluice](../../README.md). PostgreSQL row changes, ephemeral broadcast and presence over **one** SSE connection, with the access token in an `Authorization` header rather than a query parameter.
+Typed realtime client for [Sluice](../../README.md): PostgreSQL row changes, broadcast and presence over **one** SSE connection, with the access token in an `Authorization` header rather than a query parameter.
 
-Zero runtime dependencies. ESM. Works in browsers, Node ≥ 20, Deno and workers.
+Zero runtime dependencies. ESM. Needs `fetch` with streaming response bodies (browsers, Node ≥ 20, Deno, workers).
 
-For the raw HTTP/SSE contract (any language, no client library), see [Wire protocol](../../README.md#wire-protocol-any-language) in the main README.
+For the raw HTTP/SSE contract, see [Wire protocol](../../README.md#wire-protocol) in the main README.
 
 ```bash
 npm install @pauserratgutierrez/sluice-js
 ```
 
-Install from [npm](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js). Versions are published on the same `v*.*.*` tags as the server image (see [`MAINTENANCE.md`](../../MAINTENANCE.md)). In git, `package.json` stays at `0.0.0`; CI sets the published version from the tag.
+Versions are published on the same `v*.*.*` tags as the server image (see [`MAINTENANCE.md`](../../MAINTENANCE.md)). In git, `package.json` stays at `0.0.0`; CI sets the published version from the tag.
 
 ## Quick start
 
@@ -34,13 +34,13 @@ const docs = await sluice
   .subscribe()
 ```
 
-The `Database` generic is the **same generated types file** a PostgREST client uses. The SDK is hand-written because it has a public API and semver matters; the types it consumes are generated, because a schema has no API to break.
+The `Database` generic is the **same generated types file** a PostgREST client uses.
 
 ## Check the oracle
 
-The tube (`from` / `eq` / `subscribe`) is the same on every server. What comes back on the ready event depends on which **shape oracle** that process runs.
+What comes back from `subscribe()` depends on which shape oracle the server runs.
 
-**RLS** (`SLUICE_SHAPE_ORACLE=rls`, the default): `tier` is `A`, `B` or `C`. `oracle` may be omitted.
+**RLS** (`SLUICE_SHAPE_ORACLE=rls`, the default): `tier` is `A`, `B` or `C`.
 
 ```ts
 if (docs.tier === 'C') {
@@ -55,17 +55,17 @@ if (docs.tier === 'C') {
 | `B` | an in-process evaluation, no database work |
 | `C` | **one impersonated query per change, per subscriber** |
 
-Tier C is correct but does not scale. If you see it, the server's `/diagnostics` endpoint names the offending policy and suggests a rewrite. Usually the fix is to add an `.eq()` on the column the policy compares, or to denormalise a joined column onto the table.
+Tier C is correct but does not scale; the server's `/diagnostics` names the policy and suggests a rewrite. Usually the fix is an `.eq()` on the column the policy compares, or denormalising a joined column onto the table.
 
-**Issuer** (`SLUICE_SHAPE_ORACLE=issuer`): there are no tiers. The ready event has `oracle: "issuer"` and the effective `filter` after narrowing. Do not assume `tier: "A"`.
+**Issuer** (`SLUICE_SHAPE_ORACLE=issuer`): there are no tiers. `oracle` is `'issuer'` and `filter` is the effective filter after narrowing.
 
 ```ts
-if (docs.oracle === 'issuer') {
-  console.log('effective filter', docs.filter)
-}
+if (docs.oracle === 'issuer') console.log('effective filter', docs.filter)
 ```
 
-`indexed: false` is the other one to watch: it means your shape has no equality filter on an indexed column, so the server scans it for every change to that table.
+`indexed: false` means the shape has no equality filter on an indexed column, so the server scans it for every change to that table.
+
+A subscription the server refuses resolves with `ok: false` and `error`, calls `onError`, and is not resent on reconnect.
 
 ## Changes
 
@@ -77,7 +77,7 @@ sluice.from('documents')
   .on('UPDATE', c => {
     // `unchanged` lists columns the WAL did not carry because they hold an
     // unchanged TOASTed value. They are NOT null and NOT deleted -- keep your
-    // existing value for them. This is the distinction wal2json throws away.
+    // existing value for them.
     const prev = cache.get(c.record.id)
     cache.set(c.record.id, { ...prev, ...c.record })
   })
@@ -85,9 +85,13 @@ sluice.from('documents')
   .subscribe()
 ```
 
-**`withTransitions()`** is worth understanding. Without it, a row that stops matching your filter simply stops producing events, and your local copy keeps a row that no longer belongs there. With it, you get a synthetic `INSERT` when a row enters the shape (`transition: 'enter'`) and a synthetic `DELETE` when it leaves (`transition: 'leave'`).
+**`select()`** restricts the projection and narrows the row type. The server adds the table's key columns (primary key, or the replica identity index) when you may read them, so rows can always be identified.
 
-**`withInitialSnapshot()`** closes the race between fetching initial state over HTTP and subscribing. The server takes its replay floor *before* opening the snapshot transaction, so nothing slips through the gap. Rows arrive as `INSERT` with `snapshot: true`, terminated by `onSnapshotEnd`. Duplicates between the snapshot and the live stream are possible and intended — upsert by primary key.
+**`withTransitions()`**: an UPDATE that moves a row out of the shape arrives as a `DELETE` with `transition: 'leave'`, and one that moves it in as an `INSERT` with `transition: 'enter'`. Both need the table's replica identity to carry the filter columns; the server warns (`replica_identity_insufficient`) when it does not. Without transitions, a row that stops matching simply stops producing events.
+
+**`withInitialSnapshot()`** makes the server read the current rows itself and then continue live, with no gap between the two. Rows arrive as `INSERT` with `snapshot: true`, followed by `onSnapshotEnd({ rows, truncated })` (`truncated` when more rows matched than the server's cap). Duplicates around the boundary are possible and intended — upsert by primary key. Snapshot rows use PostgreSQL's JSON encoding (ISO 8601 timestamps, JSON arrays) while live changes use its text output, so parse timestamps with a parser that accepts both.
+
+`ops('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')` restricts operations; the default is the first three.
 
 ### Filters
 
@@ -98,7 +102,7 @@ AND-only, PostgREST spelling. `*` is the wildcard for `like`/`ilike`.
 .like('title', 'draft*').is('deleted_at', null)
 ```
 
-There is no `or()`, and that is deliberate: `OR` destroys the constant indexing that makes dispatch O(1) in subscriber count. Register two subscriptions.
+Also `neq`, `gt`, `lt`, `lte`, `ilike`, `notIn`, `notLike`. There is no `or()`: `OR` would stop the server routing a change with a map lookup. Register two subscriptions.
 
 ## Broadcast and presence
 
@@ -115,14 +119,14 @@ await room.track({ name: 'Pau' })
 const delivered = await room.send('cursor', { x, y })
 ```
 
-`send` is a request with a response: an oversized payload or an unauthorized channel **throws**, rather than being silently dropped. `track` is withdrawn automatically when the connection closes — there is no leave message to send.
+The channel's namespace (`room`) must be configured on the server. `send` is a request with a response: an oversized payload or a channel you have not joined **throws**. `on('*', …)` receives every event. Presence is keyed by your token's `sub` (a token without one cannot track), and your entry is withdrawn automatically when the connection closes. Registering `onPresence`, `onJoin` or `onLeave` before `subscribe()` requests the full roster on join; `channel.presence` holds the current roster.
 
-Database-originated broadcasts arrive on the same handler with `meta.origin === 'database'` and a `commit_lsn`:
+Database-originated broadcasts arrive on the same handlers with `meta.origin === 'database'` and, for transactional messages, `meta.commit_lsn`:
 
 ```sql
 BEGIN;
   UPDATE orders SET status = 'paid' WHERE id = 1;
-  SELECT pg_logical_emit_message(true, 'sluice:orders:1', '{"event":"paid"}');
+  SELECT pg_logical_emit_message(true, 'sluice:orders:1', '{"event":"paid","payload":{"id":1}}');
 COMMIT;
 ```
 
@@ -130,7 +134,7 @@ Roll the transaction back and the message never existed.
 
 ## Connection lifecycle
 
-One client holds **one** stream and multiplexes every subscription over it. Over HTTP/2 that stream and the control POSTs share a single connection.
+One client holds **one** stream and multiplexes every subscription over it.
 
 ```ts
 const sluice = createClient<Database>(url, {
@@ -143,9 +147,9 @@ const sluice = createClient<Database>(url, {
 })
 ```
 
-**Reconnection is automatic and gapless within the server's retention window.** The client tracks the last commit LSN per table and resumes from it, so a dropped connection does not silently lose changes. If the requested position has aged out of the server's buffer you get `resume_too_old` with `action: 'resnapshot'`.
+**Reconnection is automatic.** The client remembers the last commit LSN it saw per table and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). If the server no longer has that position (it restarted, or you were away too long), the shape gets `resume_too_old` with `action: 'resnapshot'` and the client forgets the stale position: discard what you hold for that shape and subscribe again, for example with `withInitialSnapshot()`.
 
-**Refresh the token when your auth library does:**
+**Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
 
 ```ts
 supabase.auth.onAuthStateChange((_e, session) => {
@@ -153,9 +157,9 @@ supabase.auth.onAuthStateChange((_e, session) => {
 })
 ```
 
-Every authorization decision is re-resolved server-side on refresh, so a subscription that is no longer permitted is dropped with an error instead of quietly continuing. If the token expires without a refresh, the stream closes with `token_expired`. If a **hold** row is deleted, that shape is cut with `shape_not_authorized` and the stream stays open. If the user signs out, the server sees the `auth.sessions` delete on its replication stream and closes the stream within milliseconds (`session_revoked`).
+If a **hold** row is deleted (issuer mode), that shape is cut with `shape_not_authorized` and the stream stays open. If the user signs out and the server has session revocation enabled, the stream closes with `session_revoked` and reconnecting with that token is refused.
 
-**`pauseWhenHidden`** closes the stream on `document.hidden` and reopens with a resume when the tab returns. This is the standard mitigation for the conflict between proxies wanting frequent keepalives and mobile radios wanting silence.
+**`pauseWhenHidden`** closes the stream while `document.hidden` and reopens it, with a resume, when the tab returns.
 
 ## Errors
 
@@ -165,20 +169,25 @@ import { SluiceError } from '@pauserratgutierrez/sluice-js'
 .onError(e => {
   if (e.code === 'shape_not_authorized') showPermissionDenied()
   else if (e.action === 'resnapshot') void refetchEverything()
-  else if (e.retryable) { /* the client is already retrying */ }
 })
 ```
 
+Subscription errors go to that subscription's `onError`; stream errors go to the client's `onError`.
+
 | Code | Meaning |
 | --- | --- |
-| `shape_not_authorized` | this shape is not permitted (RLS policy, issuer deny, or a hold that disappeared) |
-| `relation_not_published` | add the table to the publication |
-| `invalid_filter` | the filter references an unknown column or a bad value |
-| `replica_identity_insufficient` | DELETE cannot be filtered; the remedy is a runnable `ALTER TABLE` |
-| `resume_too_old` | the buffer aged out; resnapshot |
-| `token_expired` | reauthenticate; the stream is closed |
-| `session_revoked` | the session row was deleted; the stream is closed |
-| `stream_lagging` | the client could not keep up and was disconnected |
+| `shape_not_authorized` | not permitted: RLS policy, issuer deny, revoked on refresh, hold removed, or dropped by an operator |
+| `relation_not_published` / `relation_unpublished` | the table is not (or no longer) in the publication |
+| `invalid_filter`, `invalid_columns` | unknown column or bad value |
+| `unknown_namespace`, `channel_not_authorized` | the channel was refused |
+| `resume_too_old` | the resume position is gone; resnapshot |
+| `snapshot_failed` | the initial snapshot failed (retryable) |
+| `stream_lagging` | the client did not keep up; the stream reconnects with a resume |
+| `token_expired` | the token expired; the stream closed |
+| `session_revoked`, `user_banned` | the identity was revoked; the stream closed |
+| `http_401`, `http_403` | the stream request was refused; the client stops retrying |
+
+The full list is in the main README's [event reference](../../README.md#events).
 
 ## API
 
@@ -188,12 +197,11 @@ import { SluiceError } from '@pauserratgutierrez/sluice-js'
 | `.from(table)` | typed shape builder on `public` |
 | `.schema(s).from(table)` | typed shape builder on another schema |
 | `.channel<M>(name)` | signalling channel |
-| `.setAuth(token)` | rebind to a refreshed token |
+| `.setAuth(token)` | use a refreshed token |
 | `.close()` | close the stream and forget everything |
 | `.connectionStatus` | `connecting` \| `open` \| `reconnecting` \| `closed` |
 
-`parseSSE(body, signal)` is exported too, if you need the framing for a custom
-transport.
+`parseSSE(body, signal)` is exported too, if you need the framing for a custom transport.
 
 ## Development
 
@@ -202,7 +210,7 @@ npm install
 npm run build        # tsc → dist (ESM + .d.ts + source maps)
 npm test             # builds, then runs the unit and type-level tests
 npm run typecheck:test
-node test/live.mjs   # drives the built SDK against a running harness via Caddy
+node test/live.mjs   # drives the built SDK against a running harness through the gateway
 ```
 
-The unit tests import from `dist/`, so what is verified is what ships. The type-level test uses `@ts-expect-error` to assert that a wrong table name, a wrong column, or a wrong value type **fails to compile** — that is the whole point of the typing, so it is tested rather than assumed.
+The unit tests import from `dist/`, so what is verified is what ships. The type-level test uses `@ts-expect-error` to assert that a wrong table name, a wrong column, or a wrong value type **fails to compile**.

@@ -1,23 +1,21 @@
 // Package reader owns the single replication connection and dispatches changes.
 //
-// Configuration choices worth understanding before changing anything here:
+// The options it sends to pgoutput are fixed except for two:
 //
-//	proto_version = 4   declares capability. Verified empirically: the negotiated
-//	                    version ALONE changes nothing on the wire -- 1, 4 and
-//	                    4+parallel produced byte-identical output. The OPTIONS
-//	                    determine the message set.
-//	streaming = off     everything received is therefore already committed and
-//	                    durable, so this loop forwards immediately and holds no
-//	                    transaction buffer. With streaming=on it would have to
-//	                    buffer uncommitted transactions in the Go heap.
-//	binary = false      measured LARGER than text (112 vs 88 bytes) and would
-//	                    require per-type binary decoders. Sluice emits JSON.
-//	messages = true     delivers pg_logical_emit_message, which gives
-//	                    transactional broadcast with no outbox table.
+//	proto_version   SLUICE_PROTO_VERSION (default 4). With streaming off it only
+//	                declares capability; the options decide the message set.
+//	messages        SLUICE_MESSAGES (default true): delivers
+//	                pg_logical_emit_message, which gives transactional broadcast
+//	                with no outbox table.
+//
+// Streaming and binary are never requested. With streaming off, everything the
+// reader receives is already committed, so it forwards immediately and holds no
+// transaction buffer. With text format, one decoding path covers every type.
 package reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -30,12 +28,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pauserratgutierrez/sluice/internal/config"
+	"github.com/pauserratgutierrez/sluice/internal/metrics"
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 )
 
 // Handler consumes decoded messages. The reader owns ordering and never calls a
 // handler concurrently, so implementations need no locking of their own.
 type Handler interface {
+	// OnStart is called each time replication starts, with the LSN it starts
+	// from: every transaction that commits after it will be delivered.
+	OnStart(lsn uint64)
 	OnBegin(lsn uint64, commitTime time.Time, xid uint32)
 	OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN uint64, commitTime time.Time) error
 	OnMessage(m *pgoutput.Message, commitLSN uint64) error
@@ -54,16 +56,19 @@ type Reader struct {
 
 	// confirmed is the LSN Sluice has taken responsibility for. It advances only
 	// after a change has been queued to every interested stream or deliberately
-	// withheld. That is the backpressure mechanism: a stalled Sluice retains WAL
-	// on disk rather than losing data.
+	// withheld, or -- between transactions -- to the end of WAL the server says
+	// it has already decoded. That is the backpressure mechanism: a stalled
+	// Sluice retains WAL on disk rather than losing data.
 	//
 	// Atomic because the reader goroutine writes them while /diagnostics,
 	// /readyz and every snapshot read them.
 	confirmed atomic.Uint64
 	received  atomic.Uint64
+	streaming atomic.Bool
 
-	// currentCommit carries the enclosing transaction's LSN and timestamp down to
-	// per-row handlers.
+	// inTxn is true between Begin and Commit; currentCommit carries the
+	// enclosing transaction's LSN and timestamp down to per-row handlers.
+	inTxn             bool
 	currentCommit     uint64
 	currentCommitTime time.Time
 }
@@ -78,6 +83,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, h Handler) *R
 // replay floor, which is what closes the subscribe race without gaps.
 func (r *Reader) ConfirmedLSN() uint64 { return r.confirmed.Load() }
 func (r *Reader) ReceivedLSN() uint64  { return r.received.Load() }
+
+// Streaming reports whether the replication stream is currently running.
+func (r *Reader) Streaming() bool { return r.streaming.Load() }
 
 // seedConfirmed adopts the slot's persisted position as the starting point.
 //
@@ -126,6 +134,12 @@ func (r *Reader) EnsureSlot(ctx context.Context) (created bool, err error) {
 
 	if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.cfg.SlotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false}); err != nil {
+		// Two processes starting together can both see no slot; the loser's
+		// create fails with duplicate_object, which is the outcome it wanted.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42710" {
+			return false, nil
+		}
 		return false, fmt.Errorf("reader: create slot %q: %w", r.cfg.SlotName, err)
 	}
 	return true, nil
@@ -143,28 +157,36 @@ func (r *Reader) connect(ctx context.Context) (*pgconn.PgConn, error) {
 func (r *Reader) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
-		if err := r.stream(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// An invalidated slot is fatal by design. Silently resuming from a
-			// new position would be silent data loss, so the operator must act.
-			if isSlotInvalidated(err) {
-				return fmt.Errorf("reader: replication slot %q has been invalidated; "+
-					"the change stream has a gap and clients must resnapshot: %w", r.cfg.SlotName, err)
-			}
-			r.log.Error("replication stream failed, reconnecting", "err", err, "backoff", backoff)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
+		started := time.Now()
+		err := r.stream(ctx)
+		r.streaming.Store(false)
+		if err == nil {
+			return nil
 		}
-		return nil
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// An invalidated slot is fatal by design. Silently resuming from a
+		// new position would be silent data loss, so the operator must act.
+		if isSlotInvalidated(err) {
+			return fmt.Errorf("reader: replication slot %q has been invalidated; "+
+				"the change stream has a gap and clients must resnapshot: %w", r.cfg.SlotName, err)
+		}
+		// A stream that ran for a while failed on its own, not because the
+		// last attempt did; start the backoff over.
+		if time.Since(started) > time.Minute {
+			backoff = time.Second
+		}
+		metrics.ReaderReconnects.Inc()
+		r.log.Error("replication stream failed, reconnecting", "err", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
 	}
 }
 
@@ -195,13 +217,6 @@ func (r *Reader) stream(ctx context.Context) error {
 	if r.cfg.Messages {
 		args = append(args, "messages 'true'")
 	}
-	if r.cfg.Binary {
-		args = append(args, "binary 'true'")
-	}
-	if r.cfg.Streaming != "off" {
-		args = append(args, fmt.Sprintf("streaming '%s'", r.cfg.Streaming))
-	}
-	args = append(args, "origin 'any'")
 
 	// Starting at 0/0 makes the server begin at the slot's confirmed_flush_lsn,
 	// which is exactly what a resuming consumer wants.
@@ -209,11 +224,14 @@ func (r *Reader) stream(ctx context.Context) error {
 		pglogrepl.StartReplicationOptions{PluginArgs: args}); err != nil {
 		return fmt.Errorf("reader: START_REPLICATION: %w", err)
 	}
+	r.inTxn = false
+	r.streaming.Store(true)
+	r.h.OnStart(r.confirmed.Load())
 
 	r.log.Info("replication started",
 		"slot", r.cfg.SlotName, "publication", r.cfg.Publication,
-		"proto_version", r.cfg.ProtoVersion, "streaming", r.cfg.Streaming,
-		"binary", r.cfg.Binary, "system_id", sys.SystemID, "timeline", sys.Timeline)
+		"proto_version", r.cfg.ProtoVersion, "from_lsn", FormatLSN(r.confirmed.Load()),
+		"system_id", sys.SystemID, "timeline", sys.Timeline)
 
 	nextStatus := time.Now().Add(r.cfg.StatusEvery)
 
@@ -253,6 +271,14 @@ func (r *Reader) stream(ctx context.Context) error {
 				}
 				if uint64(ka.ServerWALEnd) > r.received.Load() {
 					r.received.Store(uint64(ka.ServerWALEnd))
+				}
+				// Between transactions, everything up to the server's WAL end
+				// has been decoded and anything relevant already delivered.
+				// Without this, a publication whose tables are quiet never
+				// advances the slot while the rest of the database writes WAL,
+				// and the slot retains it until it is invalidated.
+				if !r.inTxn && uint64(ka.ServerWALEnd) > r.confirmed.Load() {
+					r.confirmed.Store(uint64(ka.ServerWALEnd))
 				}
 				if ka.ReplyRequested {
 					if err := r.sendStatus(ctx, conn); err != nil {
@@ -304,6 +330,7 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 
 	switch m.Type {
 	case pgoutput.MsgBegin:
+		r.inTxn = true
 		r.currentCommit = m.FinalLSN
 		r.currentCommitTime = m.CommitTime
 		r.h.OnBegin(m.FinalLSN, m.CommitTime, m.XID)
@@ -316,6 +343,7 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 		if m.EndLSN > r.confirmed.Load() {
 			r.confirmed.Store(m.EndLSN)
 		}
+		r.inTxn = false
 		r.currentCommit, r.currentCommitTime = 0, time.Time{}
 
 	case pgoutput.MsgRelation, pgoutput.MsgType:
@@ -339,10 +367,9 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 			return err
 		}
 
-	case pgoutput.MsgStreamStart, pgoutput.MsgStreamStop,
-		pgoutput.MsgStreamCommit, pgoutput.MsgStreamAbort:
-		// Only reachable with streaming enabled, which is not the default.
-		r.log.Debug("stream control message", "type", string(rune(m.Type)), "xid", m.StreamXID)
+	case pgoutput.MsgOrigin:
+		// Only sent for changes that arrived through replication from another
+		// node; nothing to do.
 
 	default:
 		r.log.Warn("unhandled pgoutput message", "type", string(rune(m.Type)))

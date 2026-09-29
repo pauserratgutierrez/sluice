@@ -174,6 +174,8 @@ export interface SnapshotEndPayload {
   sub: string
   rows: number
   floor_lsn: string
+  /** More rows matched than the server's SLUICE_SNAPSHOT_MAX_ROWS; only that many were sent. */
+  truncated?: boolean
 }
 
 export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed'

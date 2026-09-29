@@ -60,13 +60,10 @@ CREATE ROLE sluice_repl WITH LOGIN REPLICATION PASSWORD :'sluice_repl_password';
 CREATE ROLE sluice_authz WITH LOGIN NOINHERIT PASSWORD :'sluice_authz_password';
 GRANT anon, authenticated TO sluice_authz;
 
--- Reading pg_policy / pg_class / pg_attribute / pg_index needs no grant.
--- Reading pg_publication_tables needs no grant.
--- has_column_privilege() needs no grant.
+-- Nothing else is granted. Reading pg_policy, pg_class, pg_attribute,
+-- pg_index, pg_publication_tables and pg_replication_slots, calling
+-- has_column_privilege(), and taking the reader's advisory lock need no grant.
 -- Snapshots run through SET LOCAL ROLE, so no direct table grant is required.
-
--- Allows Sluice to hold the single-reader advisory lock and to observe slots.
-GRANT pg_monitor TO sluice_authz;
 
 -- ---------------------------------------------------------------------------
 -- THE PUBLICATION.

@@ -77,7 +77,10 @@ services:
     volumes:
       - ./db/fixtures.sql:/fixtures.sql:ro
       - ./db/issuer_fixtures.sql:/issuer_fixtures.sql:ro
-    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql", "-f", "/issuer_fixtures.sql"]
+      - ./db/audit_fixtures.sql:/audit_fixtures.sql:ro
+    # audit_fixtures.sql must come after fixtures.sql, which drops
+    # public.memberships CASCADE and with it the audit's Tier C policies.
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql", "-f", "/issuer_fixtures.sql", "-f", "/audit_fixtures.sql"]
     networks: [private_net]
 
   auth:
@@ -171,8 +174,6 @@ services:
       SLUICE_SLOT_NAME: sluice
       SLUICE_PUBLICATION: sluice
       SLUICE_PROTO_VERSION: "4"
-      SLUICE_STREAMING: "off"
-      SLUICE_BINARY: "false"
       SLUICE_MESSAGES: "true"
       SLUICE_MESSAGE_PREFIX: "sluice:"
 
@@ -253,8 +254,6 @@ services:
       SLUICE_SLOT_NAME: sluice_issuer
       SLUICE_PUBLICATION: sluice_issuer
       SLUICE_PROTO_VERSION: "4"
-      SLUICE_STREAMING: "off"
-      SLUICE_BINARY: "false"
       SLUICE_MESSAGES: "true"
       SLUICE_MESSAGE_PREFIX: "sluice:"
 

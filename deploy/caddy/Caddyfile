@@ -11,9 +11,8 @@
 #    `mirror_x_api_key` chain that a Supabase Realtime gateway needs simply
 #    does not exist here.
 #
-# 2. The Sluice route disables response buffering. Caddy gained content-type
-#    aware auto-flushing for text/event-stream in 2026-07-24, but
-#    `flush_interval -1` is explicit and works on every version.
+# 2. The Sluice route disables response buffering explicitly with
+#    `flush_interval -1`, so every event is flushed as it is written.
 
 {
 	admin off
@@ -68,8 +67,8 @@
 			# events sit in a buffer until it fills.
 			flush_interval -1
 
-			# Keep streams alive across a config reload instead of dropping
-			# every client at once and inviting a reconnect stampede.
+			# No read or write timeout towards Sluice: a stream is expected to
+			# stay open for hours.
 			transport http {
 				read_timeout 0
 				write_timeout 0

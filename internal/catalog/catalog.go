@@ -2,9 +2,9 @@
 // authorize: RLS policies, column-level grants, replica identity, and index
 // coverage.
 //
-// This is the only reason Sluice touches the catalog at all. Everything here is
-// cached and refreshed on a timer plus on Relation messages, so it is off the
-// per-change path.
+// Relation metadata is cached and refreshed on SLUICE_CATALOG_REFRESH and after
+// a schema change arrives on the replication stream; column privileges are
+// checked with a query at subscribe time. None of it is on the per-change path.
 package catalog
 
 import (
@@ -49,7 +49,12 @@ type Relation struct {
 	// longer exists, or 'd' with no primary key. In that state the APPLICATION's
 	// UPDATE and DELETE statements fail, so it is a fatal condition, not a
 	// Sluice-only problem.
-	ReplicaIdentityOK  bool
+	ReplicaIdentityOK bool
+	// KeyColumns identify a row: the replica identity index for USING INDEX,
+	// the primary key otherwise (including FULL, where every column is in the
+	// replica identity but only the key identifies the row). Empty when the
+	// table has neither.
+	KeyColumns         []string
 	Columns            []Column
 	IndexedColumns     map[string]bool
 	Policies           []Policy
@@ -99,10 +104,12 @@ func (r *Relation) InReplicaIdentity(name string) bool {
 // policies OR'd, restrictive policies AND'ed. That combination order is not
 // cosmetic -- getting it backwards would turn a restriction into a grant.
 //
-// roleBypassesRLS must come from Cache.BypassesRLS. It is a parameter rather
-// than a lookup because a Relation is a plain snapshot with no way back to the
-// cache, and passing it explicitly keeps the one caller honest about the fact
-// that this is the input that can turn a denial into a full grant.
+// memberOf must come from Cache.MemberOf and roleBypassesRLS from
+// Cache.BypassesRLS. They are parameters rather than lookups because a Relation
+// is a plain snapshot with no way back to the cache. A policy applies to every
+// role that has the privileges of one of its TO roles, exactly as PostgreSQL
+// checks it; missing a membership would drop a RESTRICTIVE policy and widen
+// access.
 //
 // The second return value carries a reason when a policy could not be parsed,
 // which forces Tier C rather than silently dropping the restriction.
@@ -112,7 +119,7 @@ func (r *Relation) InReplicaIdentity(name string) bool {
 // matters: it is the text handed back to PostgreSQL for Tier C evaluation and
 // for the Tier B soundness cross-check, so it must be PostgreSQL's own spelling,
 // not Sluice's approximation of it.
-func (r *Relation) Predicate(role string, roleBypassesRLS bool) (expr.Node, string, string) {
+func (r *Relation) Predicate(role string, memberOf map[string]bool, roleBypassesRLS bool) (expr.Node, string, string) {
 	// PostgreSQL's own rule, from check_enable_rls(): a relation with RLS off,
 	// or a role holding BYPASSRLS, sees every row. FORCE ROW LEVEL SECURITY
 	// does not claw that back -- it only subjects the table's OWNER to RLS.
@@ -131,7 +138,7 @@ func (r *Relation) Predicate(role string, roleBypassesRLS bool) (expr.Node, stri
 	var reason string
 
 	for _, p := range r.Policies {
-		if !policyAppliesTo(p, role) {
+		if !policyAppliesTo(p, role, memberOf) {
 			continue
 		}
 		node := p.Parsed
@@ -164,12 +171,12 @@ func (r *Relation) Predicate(role string, roleBypassesRLS bool) (expr.Node, stri
 	return expr.And(expr.Or(permissive...), expr.And(restrictive...)), reason, sql
 }
 
-func policyAppliesTo(p Policy, role string) bool {
+func policyAppliesTo(p Policy, role string, memberOf map[string]bool) bool {
 	if len(p.Roles) == 0 {
 		return true // PUBLIC
 	}
 	for _, r := range p.Roles {
-		if r == role || r == "public" {
+		if r == role || r == "public" || memberOf[r] {
 			return true
 		}
 	}
@@ -179,12 +186,16 @@ func policyAppliesTo(p Policy, role string) bool {
 // Cache holds relation metadata and refreshes it.
 type Cache struct {
 	pool *pgxpool.Pool
+	// roles are the JWT roles Sluice accepts; their memberships are loaded so
+	// policies written for a parent role apply to them.
+	roles []string
 
-	mu     sync.RWMutex
-	byOID  map[uint32]*Relation
-	byName map[string]*Relation
-	bypass map[string]bool
-	loaded time.Time
+	mu       sync.RWMutex
+	byOID    map[uint32]*Relation
+	byName   map[string]*Relation
+	bypass   map[string]bool
+	memberOf map[string]map[string]bool
+	loaded   time.Time
 
 	// authzFP fingerprints everything an authorization decision reads, and
 	// authzVer counts the times it changed. See AuthzVersion.
@@ -192,12 +203,16 @@ type Cache struct {
 	authzVer uint64
 }
 
-func New(pool *pgxpool.Pool) *Cache {
+// New creates an empty cache. roles are the JWT roles whose memberships
+// Predicate needs (SLUICE_ALLOWED_ROLES).
+func New(pool *pgxpool.Pool, roles ...string) *Cache {
 	return &Cache{
-		pool:   pool,
-		byOID:  map[uint32]*Relation{},
-		byName: map[string]*Relation{},
-		bypass: map[string]bool{},
+		pool:     pool,
+		roles:    roles,
+		byOID:    map[uint32]*Relation{},
+		byName:   map[string]*Relation{},
+		bypass:   map[string]bool{},
+		memberOf: map[string]map[string]bool{},
 	}
 }
 
@@ -268,6 +283,14 @@ SELECT c.oid::oid,
          ELSE false
        END AS ri_ok,
        COALESCE((
+         SELECT array_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum))
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = c.oid
+           AND ((c.relreplident = 'i' AND i.indisreplident)
+             OR (c.relreplident <> 'i' AND i.indisprimary))
+       ), '{}')::text[] AS key_columns,
+       COALESCE((
          SELECT array_agg(a.attname ORDER BY a.attnum)
          FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
        ), '{}')::text[] AS col_names,
@@ -299,6 +322,15 @@ JOIN pg_namespace n ON n.nspname = pt.schemaname
 JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
 WHERE pt.pubname = $1`
 
+// memberQuery lists, for each accepted JWT role, the roles whose privileges it
+// has. pg_has_role(..., 'USAGE') is has_privs_of_role, the same test PostgreSQL
+// applies to a policy's TO list.
+const memberQuery = `
+SELECT r.rolname, g.rolname
+  FROM pg_roles r
+  JOIN pg_roles g ON g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'USAGE')
+ WHERE r.rolname = ANY($1::text[])`
+
 // bypassQuery lists the roles for which RLS is not enforced at all.
 //
 // This mirrors PostgreSQL's has_bypassrls_privilege(): the attribute itself, or
@@ -324,6 +356,10 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 	if err != nil {
 		return err
 	}
+	memberOf, err := c.loadMemberships(ctx)
+	if err != nil {
+		return err
+	}
 
 	rows, err := c.pool.Query(ctx, relationQuery, publication)
 	if err != nil {
@@ -339,6 +375,7 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 		var (
 			r         Relation
 			riCols    []string
+			keyCols   []string
 			colNames  []string
 			colTypes  []string
 			colNums   []int16
@@ -346,11 +383,12 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 			indexed   []string
 		)
 		if err := rows.Scan(&r.OID, &r.Schema, &r.Name, &r.RLSEnabled, &r.ReplicaIdentity,
-			&riCols, &r.ReplicaIdentityOK, &colNames, &colTypes, &colNums, &colNotNul,
+			&riCols, &r.ReplicaIdentityOK, &keyCols, &colNames, &colTypes, &colNums, &colNotNul,
 			&indexed, &r.HasToastableColumn); err != nil {
 			return fmt.Errorf("catalog: scan relation: %w", err)
 		}
 		r.ReplicaIdentityColumns = riCols
+		r.KeyColumns = keyCols
 		r.IndexedColumns = make(map[string]bool, len(indexed))
 		for _, ic := range indexed {
 			r.IndexedColumns[ic] = true
@@ -415,14 +453,14 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 	for _, rel := range byOID {
 		rel.sortPolicies()
 	}
-	fp := authzFingerprint(byOID, bypass)
+	fp := authzFingerprint(byOID, bypass, memberOf)
 
 	c.mu.Lock()
 	if fp != c.authzFP {
 		c.authzFP = fp
 		c.authzVer++
 	}
-	c.byOID, c.byName, c.bypass, c.loaded = byOID, byName, bypass, time.Now()
+	c.byOID, c.byName, c.bypass, c.memberOf, c.loaded = byOID, byName, bypass, memberOf, time.Now()
 	c.mu.Unlock()
 	return nil
 }
@@ -437,7 +475,8 @@ func (r *Relation) sortPolicies() {
 }
 
 // AuthzVersion changes whenever anything an authorization decision reads
-// changes: RLS flags, SELECT policies, or the set of roles that bypass RLS.
+// changes: RLS flags, SELECT policies, role memberships, or the set of roles
+// that bypass RLS.
 //
 // It exists because a decision is resolved once, at subscribe time, and most
 // decisions carry no lease -- a stable Tier A or Tier B predicate is re-read
@@ -456,7 +495,7 @@ func (c *Cache) AuthzVersion() uint64 {
 // authzFingerprint hashes exactly the inputs Predicate and Resolve read. Fields
 // are length-prefixed so that no combination of policy, role or relation names
 // can be rearranged into the same byte stream.
-func authzFingerprint(byOID map[uint32]*Relation, bypass map[string]bool) [32]byte {
+func authzFingerprint(byOID map[uint32]*Relation, bypass map[string]bool, memberOf map[string]map[string]bool) [32]byte {
 	h := sha256.New()
 	var num [8]byte
 	put := func(s string) {
@@ -501,19 +540,67 @@ func authzFingerprint(byOID map[uint32]*Relation, bypass map[string]bool) [32]by
 		}
 	}
 
-	roles := make([]string, 0, len(bypass))
-	for r := range bypass {
-		roles = append(roles, r)
+	putSet := func(set map[string]bool) {
+		keys := make([]string, 0, len(set))
+		for k := range set {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		putUint(uint64(len(keys)))
+		for _, k := range keys {
+			put(k)
+		}
 	}
-	sort.Strings(roles)
-	putUint(uint64(len(roles)))
-	for _, r := range roles {
+	putSet(bypass)
+
+	members := make([]string, 0, len(memberOf))
+	for r := range memberOf {
+		members = append(members, r)
+	}
+	sort.Strings(members)
+	putUint(uint64(len(members)))
+	for _, r := range members {
 		put(r)
+		putSet(memberOf[r])
 	}
 
 	var out [32]byte
 	h.Sum(out[:0])
 	return out
+}
+
+func (c *Cache) loadMemberships(ctx context.Context) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
+	if len(c.roles) == 0 {
+		return out, nil
+	}
+	rows, err := c.pool.Query(ctx, memberQuery, c.roles)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: query role memberships: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var role, of string
+		if err := rows.Scan(&role, &of); err != nil {
+			return nil, fmt.Errorf("catalog: scan role membership: %w", err)
+		}
+		if out[role] == nil {
+			out[role] = map[string]bool{}
+		}
+		out[role][of] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: iterate role memberships: %w", err)
+	}
+	return out, nil
+}
+
+// MemberOf returns the roles whose privileges role has. The map is shared and
+// must not be modified.
+func (c *Cache) MemberOf(role string) map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.memberOf[role]
 }
 
 func (c *Cache) loadBypassRoles(ctx context.Context) (map[string]bool, error) {
@@ -556,7 +643,7 @@ func (c *Cache) BypassesRLS(role string) bool {
 //
 // Column-level grants are checked separately from RLS and always: a column the
 // role cannot select is never emitted, in any tier.
-func (c *Cache) HasColumnPrivilege(ctx context.Context, role, relation string, columns []string) (map[string]bool, error) {
+func (c *Cache) HasColumnPrivilege(ctx context.Context, role string, rel *Relation, columns []string) (map[string]bool, error) {
 	out := make(map[string]bool, len(columns))
 	if len(columns) == 0 {
 		return out, nil
@@ -564,7 +651,7 @@ func (c *Cache) HasColumnPrivilege(ctx context.Context, role, relation string, c
 	rows, err := c.pool.Query(ctx,
 		`SELECT col, has_column_privilege($1::regrole, $2::regclass, col, 'SELECT')
 		   FROM unnest($3::text[]) AS col`,
-		role, relation, columns)
+		role, QuoteQualified(rel.Schema, rel.Name), columns)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: has_column_privilege: %w", err)
 	}
@@ -582,7 +669,7 @@ func (c *Cache) HasColumnPrivilege(ctx context.Context, role, relation string, c
 
 // HasColumnPrivilegeCurrent is HasColumnPrivilege for the pool's current role.
 // Issuer snapshots and projections use physical SELECT, not the JWT role's ACL.
-func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, relation string, columns []string) (map[string]bool, error) {
+func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, rel *Relation, columns []string) (map[string]bool, error) {
 	out := make(map[string]bool, len(columns))
 	if len(columns) == 0 {
 		return out, nil
@@ -590,7 +677,7 @@ func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, relation string, 
 	rows, err := c.pool.Query(ctx,
 		`SELECT col, has_column_privilege($1::regclass, col, 'SELECT')
 		   FROM unnest($2::text[]) AS col`,
-		relation, columns)
+		QuoteQualified(rel.Schema, rel.Name), columns)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: has_column_privilege (current): %w", err)
 	}
@@ -604,13 +691,6 @@ func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, relation string, 
 		out[col] = ok
 	}
 	return out, rows.Err()
-}
-
-// RoleExists guards against interpolating an unknown role name anywhere.
-func (c *Cache) RoleExists(ctx context.Context, role string) (bool, error) {
-	var n int
-	err := c.pool.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname = $1`, role).Scan(&n)
-	return n > 0, err
 }
 
 // LoadedAt reports when the cache was last refreshed.

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -23,18 +25,19 @@ import (
 //
 // The ordering is what makes it gapless:
 //
-//  1. take the reader's CONFIRMED LSN as the replay floor, BEFORE opening the
-//     snapshot transaction. The reader is by definition at or behind the WAL
-//     head, so no transaction the snapshot can see committed below that point;
-//  2. read the rows in a REPEATABLE READ transaction under the caller's own role
-//     and claims, so PostgreSQL applies RLS exactly as it would for any query;
-//  3. replay the relation's ring buffer from the floor, re-filtered and
-//     re-authorized.
+//  1. the subscription is already registered, so every transaction the reader
+//     dispatches from here on reaches it live;
+//  2. the reader's confirmed LSN is taken as the floor BEFORE the snapshot
+//     transaction begins: everything dispatched up to the floor committed
+//     before the snapshot started, so the snapshot contains it;
+//  3. the rows are read in one REPEATABLE READ transaction (under the caller's
+//     role and claims in RLS mode, so PostgreSQL applies RLS as for any query);
+//  4. the relation's ring buffer is replayed from the floor, re-filtered and
+//     re-authorized, so a live change delivered before an older snapshot row
+//     arrives again after it.
 //
-// Duplicates between (2) and (3) are possible and intended: clients upsert by
-// primary key, and at-least-once is already the contract because PostgreSQL only
-// persists slot position at checkpoint. Gaps are not possible, which is the half
-// that matters.
+// Duplicates are possible and intended: clients upsert by primary key, and
+// at-least-once is already the contract. Gaps are not possible.
 func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	st := streamOf(sub)
 	if st == nil {
@@ -55,7 +58,7 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	}
 
 	start := time.Now()
-	rows, err := s.readSnapshot(ctx, sub)
+	rows, truncated, err := s.readSnapshot(ctx, sub)
 	if err != nil {
 		hub.SendError(st, event.Error{Sub: sub.Label, Code: "snapshot_failed",
 			Message: err.Error(), Retryable: true})
@@ -73,10 +76,15 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	}
 
 	st.Send(event.Event{Kind: event.KindSnapshotEnd, Data: event.SnapshotEnd{
-		Sub: sub.Label, Rows: len(rows), FloorLSN: reader.FormatLSN(floor),
+		Sub: sub.Label, Rows: len(rows), FloorLSN: reader.FormatLSN(floor), Truncated: truncated,
 	}})
 
-	s.replayFrom(sub, floor)
+	// Changes after the floor may already have been delivered live before the
+	// rows above, which could be older; replaying them puts the newest version
+	// last. If the buffer no longer covers the floor, the client must start over.
+	if !s.replayFrom(sub, floor) {
+		hub.SendError(st, errResumeTooOld(sub.Label))
+	}
 }
 
 // readSnapshot performs the initial consistent read.
@@ -84,7 +92,11 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 // RLS mode impersonates the caller so PostgreSQL applies the same policies as
 // any query. Issuer mode selects as the pool role (BYPASSRLS or RLS off) using
 // the effective filter; zero rows is success.
-func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) ([]map[string]any, error) {
+//
+// Rows are encoded by to_jsonb, so their values follow PostgreSQL's JSON
+// conversion (ISO 8601 timestamps, JSON arrays), and numbers are decoded
+// without passing through float64.
+func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (rows []map[string]any, truncated bool, err error) {
 	rel := sub.Relation
 
 	// The impersonation runs as its own statement with its own parameters, so the
@@ -94,37 +106,31 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 	for _, c := range sub.Columns {
 		cols = append(cols, catalog.QuoteIdent(c))
 	}
-	// The replica identity columns are always included so the client can key the
-	// row, matching what live change events guarantee.
-	for _, c := range rel.ReplicaIdentityColumns {
-		if !slices.Contains(sub.Columns, c) {
-			cols = append(cols, catalog.QuoteIdent(c))
+
+	// Order by the key so LIMIT is deterministic, using only key columns the
+	// caller may read.
+	var order []string
+	for _, c := range rel.KeyColumns {
+		if slices.Contains(sub.Columns, c) {
+			order = append(order, catalog.QuoteIdent(c))
 		}
 	}
-
-	order := "1"
-	if len(rel.ReplicaIdentityColumns) > 0 {
-		order = ""
-		for i, c := range rel.ReplicaIdentityColumns {
-			if i > 0 {
-				order += ", "
-			}
-			order += catalog.QuoteIdent(c)
-		}
+	if len(order) == 0 {
+		order = []string{"1"}
 	}
 
+	// One row past the cap tells a full result from a truncated one.
+	limit := s.cfg.SnapshotMaxRows
 	sql := fmt.Sprintf(`SELECT to_jsonb(t) FROM (SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d) t`,
-		strings.Join(cols, ", "), catalog.QuoteQualified(rel.Schema, rel.Name), where, order,
-		s.cfg.SnapshotMaxRows)
+		strings.Join(cols, ", "), catalog.QuoteQualified(rel.Schema, rel.Name), where,
+		strings.Join(order, ", "), limit+1)
 
-	// REPEATABLE READ so every page sees one consistent database state, and READ
-	// ONLY so an accidental write is impossible even under a misbehaving policy.
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
-		IsoLevel:   pgx.RepeatableRead,
-		AccessMode: pgx.ReadOnly,
-	})
+	// A single statement, so it sees one consistent state. READ ONLY so an
+	// accidental write is impossible even under a misbehaving policy; the
+	// transaction is what scopes the impersonation.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -133,23 +139,33 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 		if _, err := tx.Exec(ctx,
 			`SELECT set_config('role', $1, true), set_config('request.jwt.claims', $2, true)`,
 			id.Role, id.ClaimsRaw); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	qrows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("snapshot query: %w", err)
+		return nil, false, fmt.Errorf("snapshot query: %w", err)
 	}
 	defer qrows.Close()
 
-	out := make([]map[string]any, 0, 64)
+	rows = make([]map[string]any, 0, 64)
 	for qrows.Next() {
-		var m map[string]any
-		if err := qrows.Scan(&m); err != nil {
-			return nil, err
+		if len(rows) == limit {
+			truncated = true
+			break
 		}
-		out = append(out, m)
+		var raw []byte
+		if err := qrows.Scan(&raw); err != nil {
+			return nil, false, err
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			return nil, false, err
+		}
+		rows = append(rows, m)
 	}
-	return out, qrows.Err()
+	return rows, truncated, qrows.Err()
 }

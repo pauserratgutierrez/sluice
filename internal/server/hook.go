@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -16,14 +17,9 @@ import (
 // Hook authorization is the escape hatch for business rules Sluice cannot know.
 //
 // A channel namespace in `hook` mode delegates the subscribe decision to an HTTP
-// endpoint the application owns. This is deliberately the ONLY place where an
-// application's own logic enters the authorization path, and it is deliberately
-// at subscribe time rather than per message: the whole design rests on nothing
-// expensive happening per change, and an outbound HTTP call is very expensive.
-//
-// It is ElectricSQL's gatekeeper pattern and Centrifugo's proxy pattern. Both
-// projects also warn to colocate the endpoint -- Centrifugo recommends a sidecar
-// "keeping proxy latency in microseconds" -- because it sits on the join path.
+// endpoint the application owns. It is asked once per join, never per message:
+// publishing and presence only require that the stream already joined. The
+// endpoint sits on the join path, so it should be close to Sluice.
 type hookRequest struct {
 	Action    string          `json:"action"` // "subscribe"
 	Channel   string          `json:"channel"`
@@ -51,13 +47,20 @@ type hookVerdict struct {
 type hookCache struct {
 	ttl     time.Duration
 	timeout time.Duration
+	bearer  string
 	client  *http.Client
 
 	mu sync.RWMutex
 	m  map[string]hookVerdict
 }
 
-func newHookCache(ttl, timeout time.Duration) *hookCache {
+// hookRetryTTL is how long a verdict that says nothing about the caller -- a
+// transport failure, an unexpected status, an unreadable body, a rejected
+// Sluice credential -- is cached, so a blip does not become a minute-long
+// outage.
+const hookRetryTTL = 2 * time.Second
+
+func newHookCache(ttl, timeout time.Duration, bearer string) *hookCache {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
@@ -67,10 +70,18 @@ func newHookCache(ttl, timeout time.Duration) *hookCache {
 	return &hookCache{
 		ttl:     ttl,
 		timeout: timeout,
-		client:  &http.Client{Timeout: timeout},
+		bearer:  bearer,
+		client:  &http.Client{Timeout: timeout, CheckRedirect: noHookRedirect},
 		m:       map[string]hookVerdict{},
 	}
 }
+
+// noHookRedirect stops the client from following a redirect. Following would
+// accept a verdict from a URL nobody configured: a 302 turns the POST into a
+// GET without the body, so an allow:true there says nothing about the caller,
+// and a 307 re-sends the identity (and, on the same host, the bearer) to the
+// new location. The 3xx is then denied like any other non-2xx.
+func noHookRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // Authorize asks the configured endpoint whether this caller may join a channel,
 // caching the verdict.
@@ -125,26 +136,30 @@ func (h *hookCache) ask(ctx context.Context, ch config.Channel, id authz.Identit
 		return false, "invalid hook URL", h.ttl
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if h.bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+h.bearer)
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		// Do not cache a transport failure for the full TTL: the endpoint may come
-		// back in a second, and a minute of blanket denial would turn a blip into
-		// an outage.
-		return false, fmt.Sprintf("authorization endpoint unreachable: %v", err), 2 * time.Second
+		return false, fmt.Sprintf("authorization endpoint unreachable: %v", err), hookRetryTTL
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+	switch {
+	case resp.StatusCode == http.StatusForbidden:
 		return false, "the authorization endpoint denied this channel", h.ttl
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Sprintf("authorization endpoint returned %d", resp.StatusCode), 2 * time.Second
+	case resp.StatusCode == http.StatusUnauthorized:
+		// The endpoint rejected Sluice's own credential, which says nothing
+		// about this caller and is fixed by configuration, not by waiting.
+		return false, "the authorization endpoint rejected Sluice's credential (HTTP 401); check SLUICE_CHANNEL_HOOK_BEARER", hookRetryTTL
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		return false, fmt.Sprintf("authorization endpoint returned %d", resp.StatusCode), hookRetryTTL
 	}
 
 	var out hookResponse
-	if err := json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 64<<10)).Decode(&out); err != nil {
-		return false, "authorization endpoint returned an unreadable body", 2 * time.Second
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
+		return false, "authorization endpoint returned an unreadable body", hookRetryTTL
 	}
 	ttl := h.ttl
 	if out.TTL > 0 {

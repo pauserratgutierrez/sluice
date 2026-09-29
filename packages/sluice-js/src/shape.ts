@@ -6,6 +6,7 @@ import {
   type Operation,
   type RowOf,
   type ShapeSpec,
+  type SnapshotEndPayload,
   type SubscriptionResult,
   type SubscriptionWarning,
   type Oracle,
@@ -53,7 +54,7 @@ export class ShapeBuilder<
   private handlers: Array<{ op: Operation | '*'; fn: (c: ChangePayload<Row>) => void }> = []
   private errorHandler?: (e: SluiceError) => void
   private warningHandler?: (w: SubscriptionWarning) => void
-  private snapshotEndHandler?: (info: { rows: number }) => void
+  private snapshotEndHandler?: (info: SnapshotEndPayload) => void
 
   constructor(
     private readonly client: SluiceClient<GenericDatabase>,
@@ -118,8 +119,9 @@ export class ShapeBuilder<
   /**
    * Restricts the projection, narrowing the type handlers receive.
    *
-   * The replica identity columns are always included regardless, because without
-   * them a client cannot identify the row at all.
+   * The server also includes the table's key columns (the primary key, or the
+   * replica identity index) when the caller may read them, so each row can be
+   * identified.
    */
   select<C extends readonly (keyof Row & string)[]>(
     ...columns: C
@@ -175,7 +177,7 @@ export class ShapeBuilder<
     return this
   }
 
-  onSnapshotEnd(handler: (info: { rows: number }) => void): this {
+  onSnapshotEnd(handler: (info: SnapshotEndPayload) => void): this {
     this.snapshotEndHandler = handler
     return this
   }
@@ -214,7 +216,7 @@ export class ShapeBuilder<
             this.warningHandler?.(payload as SubscriptionWarning)
             return
           case 'snapshot_end':
-            this.snapshotEndHandler?.(payload as { rows: number })
+            this.snapshotEndHandler?.(payload as SnapshotEndPayload)
             return
         }
       },

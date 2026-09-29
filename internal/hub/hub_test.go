@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -27,9 +26,9 @@ func drain(s *Stream) []event.Event {
 	}
 }
 
-// Backpressure policy differs per plane on purpose, and each choice is a
+// The overflow policy differs by kind on purpose, and each choice is a
 // correctness statement rather than a tuning knob.
-func TestBackpressurePolicyPerPlane(t *testing.T) {
+func TestBackpressurePolicyPerKind(t *testing.T) {
 	t.Run("change closes the stream", func(t *testing.T) {
 		// A silently truncated change stream is worse than a closed one: the
 		// client would believe it has a complete view when it does not.
@@ -60,39 +59,40 @@ func TestBackpressurePolicyPerPlane(t *testing.T) {
 		if s.CloseCode() != "" {
 			t.Errorf("stream closed on a dropped broadcast: %q", s.CloseCode())
 		}
-		if s.Dropped() == 0 {
-			t.Error("the drop should be counted")
-		}
 	})
 
-	t.Run("presence coalesces", func(t *testing.T) {
-		// A newer presence diff supersedes an older one, so making room by
-		// discarding the old one loses nothing.
-		h := newHub(1)
+	t.Run("presence is dropped and never reorders the queue", func(t *testing.T) {
+		// Making room by taking something off the queue would reorder it: a
+		// change put back at the tail would arrive after later changes.
+		h := newHub(2)
 		s := h.Open("s", authz.Identity{})
-		s.Send(event.Event{Kind: event.KindPresence, Data: "old"})
-		if !s.Send(event.Event{Kind: event.KindPresence, Data: "new"}) {
-			t.Fatal("presence should coalesce rather than drop")
-		}
-		got := drain(s)
-		if len(got) != 1 || got[0].Data != "new" {
-			t.Errorf("queue = %v, want only the newest presence event", got)
-		}
-	})
-
-	t.Run("presence never evicts a change", func(t *testing.T) {
-		// Making room for presence must not sacrifice a change event.
-		h := newHub(1)
-		s := h.Open("s", authz.Identity{})
-		s.Send(event.Event{Kind: event.KindChange, Data: "important"})
+		s.Send(event.Event{Kind: event.KindChange, Data: "first"})
+		s.Send(event.Event{Kind: event.KindChange, Data: "second"})
 		if s.Send(event.Event{Kind: event.KindPresence, Data: "presence"}) {
-			t.Fatal("presence should be dropped rather than evict a change")
+			t.Fatal("presence should be dropped when the queue is full")
 		}
 		got := drain(s)
-		if len(got) != 1 || got[0].Data != "important" {
-			t.Errorf("queue = %v, want the change to survive", got)
+		if len(got) != 2 || got[0].Data != "first" || got[1].Data != "second" {
+			t.Errorf("queue = %v, want the changes untouched and in order", got)
+		}
+		if s.CloseCode() != "" {
+			t.Errorf("stream closed on a dropped presence event: %q", s.CloseCode())
 		}
 	})
+}
+
+// A join that races a disconnect must not put a closed stream back into a
+// channel's fan-out set, where it would stay forever.
+func TestJoinAfterCloseIsRefused(t *testing.T) {
+	h := newHub(4)
+	s := h.Open("s", authz.Identity{})
+	h.Close("s", "client_closed")
+	if h.JoinChannel("room:1", s, "r") {
+		t.Fatal("joining a channel on a closed stream must fail")
+	}
+	if len(h.ChannelMembers("room:1")) != 0 {
+		t.Error("a closed stream was added to a channel")
+	}
 }
 
 func TestSendAfterCloseIsRejected(t *testing.T) {
@@ -147,7 +147,7 @@ func TestCloseRemovesChannelAndPresence(t *testing.T) {
 
 	s := h.Open("s", authz.Identity{Sub: "u1"})
 	h.JoinChannel("room:1", s, "r")
-	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"n":1}`))
+	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"n":1}`), 0)
 
 	if h.Presence().Count("room:1") != 1 {
 		t.Fatal("presence should have one member")
@@ -173,7 +173,7 @@ func TestPresenceStateAndDiff(t *testing.T) {
 	s := h.Open("s", authz.Identity{Sub: "u1"})
 	h.JoinChannel("room:1", s, "r")
 
-	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"name":"a"}`))
+	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"name":"a"}`), 0)
 	state := h.Presence().State("room:1")
 	if len(state) != 1 || state["u1"].Ref == "" {
 		t.Fatalf("state = %v", state)
@@ -202,9 +202,30 @@ func TestPresenceStateAndDiff(t *testing.T) {
 		t.Error("untrack should remove the member")
 	}
 	// A stream may not untrack a key it does not own.
-	h.Presence().Track("room:1", "u1", "s", nil)
+	h.Presence().Track("room:1", "u1", "s", nil, 0)
 	if h.Presence().UntrackKey("room:1", "u1", "other-stream") {
 		t.Error("a stream must not be able to untrack another stream's key")
+	}
+}
+
+// A key over the limit is refused before it is stored, so the channel never
+// broadcasts a join or a leave for a member that was never admitted.
+func TestPresenceKeyLimit(t *testing.T) {
+	p := NewPresence(newHub(4), time.Hour)
+	if _, ok := p.Track("room:1", "u1", "s1", nil, 1); !ok {
+		t.Fatal("the first key must fit")
+	}
+	if n, ok := p.Track("room:1", "u2", "s2", nil, 1); ok || n != 1 {
+		t.Fatalf("a second key over the limit: n=%d ok=%v, want refused", n, ok)
+	}
+	if _, ok := p.Track("room:1", "u1", "s1", json.RawMessage(`{"x":1}`), 1); !ok {
+		t.Fatal("updating an existing key must not count against the limit")
+	}
+	p.mu.Lock()
+	_, leaked := p.channels["room:1"].leaves["u2"]
+	p.mu.Unlock()
+	if leaked {
+		t.Error("the refused key produced a leave")
 	}
 }
 
@@ -222,11 +243,14 @@ func ringEntry(lsn uint64) RingEntry {
 
 func TestRingReplay(t *testing.T) {
 	r := NewRings(4, time.Minute)
+	r.SetStart(5)
 	for i := uint64(1); i <= 3; i++ {
 		r.Append(ringEntry(i * 10))
 	}
 
-	got, ok := r.Replay(1, 10)
+	// From a commit LSN is inclusive: a client cut off part-way through that
+	// transaction must get the rest of it.
+	got, ok := r.Replay(1, 20)
 	if !ok {
 		t.Fatal("replay from a covered position should succeed")
 	}
@@ -234,40 +258,65 @@ func TestRingReplay(t *testing.T) {
 		t.Errorf("replay = %v, want LSNs 20 and 30", lsns(got))
 	}
 
-	// Everything after the newest entry is nothing, not a gap.
-	if got, ok := r.Replay(1, 30); !ok || len(got) != 0 {
-		t.Errorf("replay from head = %v ok=%v", lsns(got), ok)
+	// Past the newest entry is nothing, not a gap.
+	if got, ok := r.Replay(1, 31); !ok || len(got) != 0 {
+		t.Errorf("replay past head = %v ok=%v", lsns(got), ok)
 	}
 }
 
 // The buffer is bounded, and being honest about that boundary is the whole point:
-// a client asking for a position that has aged out must be told to resnapshot
-// rather than silently handed a gap.
+// a client asking for a position that has been evicted must be told to
+// resnapshot rather than silently handed a gap.
 func TestRingReportsGapWhenOverwritten(t *testing.T) {
 	r := NewRings(3, time.Minute)
+	r.SetStart(5)
 	for i := uint64(1); i <= 10; i++ {
 		r.Append(ringEntry(i * 10))
 	}
-	if _, ok := r.Replay(1, 10); ok {
-		t.Fatal("a position older than the buffer must report a gap")
+	for _, from := range []uint64{10, 70} {
+		if _, ok := r.Replay(1, from); ok {
+			t.Errorf("replay from %d reaches evicted entries and must report a gap", from)
+		}
 	}
-	if got, ok := r.Replay(1, 80); !ok || len(got) != 2 {
+	if got, ok := r.Replay(1, 80); !ok || len(got) != 3 {
 		t.Errorf("a covered position should replay: %v ok=%v", lsns(got), ok)
-	}
-	if floor := r.Floor(1); floor != 80 {
-		t.Errorf("floor = %d, want 80", floor)
 	}
 }
 
-func TestRingUnknownRelation(t *testing.T) {
+// A ring covers only what this process replicated. Before replication starts
+// nothing is covered; after, a quiet table with no buffered change is covered
+// from the start LSN on.
+func TestRingCoverageStartsWithReplication(t *testing.T) {
 	r := NewRings(4, time.Minute)
-	// Nothing buffered: resuming from the beginning is fine, resuming from a
-	// specific position cannot be proven gapless.
-	if _, ok := r.Replay(99, 0); !ok {
-		t.Error("replay from 0 with an empty ring should be allowed")
-	}
 	if _, ok := r.Replay(99, 500); ok {
-		t.Error("replay from a position with an empty ring must report a gap")
+		t.Fatal("nothing is covered before replication starts")
+	}
+	r.SetStart(100)
+	r.SetStart(900) // a reconnect must not move the start forward
+	if _, ok := r.Replay(99, 50); ok {
+		t.Error("a position before the start of replication must report a gap")
+	}
+	if got, ok := r.Replay(99, 500); !ok || len(got) != 0 {
+		t.Errorf("a quiet relation after the start must replay nothing, cleanly: %v ok=%v", lsns(got), ok)
+	}
+}
+
+// Age is a memory bound, not a coverage rule: a table that went quiet keeps
+// its newest transaction, so a client that saw it can still resume.
+func TestRingSweepKeepsNewestTransaction(t *testing.T) {
+	r := NewRings(8, time.Millisecond)
+	r.SetStart(5)
+	r.Append(ringEntry(10))
+	r.Append(ringEntry(20))
+	r.Append(ringEntry(20))
+	time.Sleep(5 * time.Millisecond)
+	r.Sweep()
+
+	if got, ok := r.Replay(1, 20); !ok || len(got) != 2 {
+		t.Errorf("the newest transaction must survive the sweep: %v ok=%v", lsns(got), ok)
+	}
+	if _, ok := r.Replay(1, 10); ok {
+		t.Error("a swept transaction must report a gap")
 	}
 }
 
@@ -315,16 +364,6 @@ func TestConcurrentStreamsAndBroadcast(t *testing.T) {
 	if h.Count() > n {
 		t.Errorf("stream count = %d, want at most %d", h.Count(), n)
 	}
-}
-
-func TestWheelDoesNotDeadlockOnSelfCancel(t *testing.T) {
-	// A stream cancels its own wheel entry as it closes, which happens from
-	// inside the callback. Taking a write lock there would deadlock.
-	h := newHub(4)
-	_ = h
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_ = ctx
 }
 
 func lsns(entries []RingEntry) []uint64 {

@@ -127,6 +127,51 @@ func TestUnknownRoutingValueFallsBackConservatively(t *testing.T) {
 	}
 }
 
+// An UPDATE is routed on both tuples, so a row leaving a shape still reaches
+// the subscriptions watching its old value -- without listing anyone twice.
+func TestCandidatesRoutesBothTuplesWithoutDuplicates(t *testing.T) {
+	r := New()
+	r.Add(sub(t, &fakeSink{id: "x"}, "a", "owner_id=eq.x"))
+	r.Add(sub(t, &fakeSink{id: "y"}, "a", "owner_id=eq.y"))
+	r.Add(sub(t, &fakeSink{id: "scan"}, "a", "title=like.z*"))
+
+	moved := r.Candidates(16400,
+		lookup(map[string]string{"owner_id": "y"}),
+		lookup(map[string]string{"owner_id": "x"}))
+	if len(moved) != 3 {
+		t.Fatalf("candidates = %v, want x, y and the unindexed one", ids(moved))
+	}
+
+	same := r.Candidates(16400,
+		lookup(map[string]string{"owner_id": "x"}),
+		lookup(map[string]string{"owner_id": "x"}))
+	if len(same) != 2 {
+		t.Fatalf("candidates = %v, want x once plus the unindexed one", ids(same))
+	}
+}
+
+// A published subscription is read without the registry lock, so Rebind must
+// leave the old value untouched and publish a new one.
+func TestRebindPublishesACopy(t *testing.T) {
+	r := New()
+	r.Add(sub(t, &fakeSink{id: "s"}, "docs", "owner_id=eq.x"))
+	before := r.Get("s", "docs")
+	narrow, err := shape.Parse("owner_id=eq.y", testRel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := r.Rebind("s", "docs", narrow, []string{"id"})
+	if after == before {
+		t.Fatal("Rebind modified the published subscription in place")
+	}
+	if before.Filter.Equalities["owner_id"].String() != "x" {
+		t.Fatal("the old subscription's filter changed under a concurrent reader")
+	}
+	if before.NextSeq() != 1 || after.NextSeq() != 2 {
+		t.Error("the copy must share the event sequence with the original")
+	}
+}
+
 func TestDuplicateLabelRejected(t *testing.T) {
 	r := New()
 	s := &fakeSink{id: "s"}

@@ -1,6 +1,6 @@
 // Command smoke-issuer is the issuer-oracle overlay for the Sluice harness.
 //
-// It does not replace cmd/smoke (the 36 RLS assertions). Same compose up, same
+// It does not replace cmd/smoke (the RLS assertions). Same compose up, same
 // private network; talk to the issuer process, not the RLS one.
 //
 //	docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \

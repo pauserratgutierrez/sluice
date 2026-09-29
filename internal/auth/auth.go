@@ -54,7 +54,17 @@ type Verifier struct {
 	mu        sync.RWMutex
 	keys      map[string]any // kid -> *ecdsa.PublicKey or *rsa.PublicKey
 	fetchedAt time.Time
+
+	// kidMu serialises refetches triggered by an unknown kid, and kidTried
+	// throttles them: without it, any unauthenticated request carrying a random
+	// kid would make Sluice fetch the JWKS.
+	kidMu    sync.Mutex
+	kidTried time.Time
 }
+
+// unknownKidRefetchEvery bounds how often an unknown kid may trigger a JWKS
+// fetch. A real key rotation is picked up within this interval.
+const unknownKidRefetchEvery = 10 * time.Second
 
 func NewVerifier(url, alg, issuer, audience string, leeway, refresh time.Duration, allowedRoles []string) *Verifier {
 	allowed := make(map[string]bool, len(allowedRoles))
@@ -109,12 +119,14 @@ func (v *Verifier) Refresh(ctx context.Context) error {
 		return fmt.Errorf("auth: parse JWKS: %w", err)
 	}
 
+	// Only keys usable with the pinned algorithm are loaded: P-256 EC keys for
+	// ES256, RSA keys for RS256.
 	keys := map[string]any{}
 	symmetric := 0
 	for _, k := range set.Keys {
 		switch k.Kty {
 		case "EC":
-			if k.Crv != "P-256" {
+			if v.alg != "ES256" || k.Crv != "P-256" {
 				continue
 			}
 			x, err1 := b64(k.X)
@@ -128,6 +140,9 @@ func (v *Verifier) Refresh(ctx context.Context) error {
 				Y:     new(big.Int).SetBytes(y),
 			}
 		case "RSA":
+			if v.alg != "RS256" {
+				continue
+			}
 			n, err1 := b64(k.N)
 			e, err2 := b64(k.E)
 			if err1 != nil || err2 != nil {
@@ -180,13 +195,25 @@ func (v *Verifier) EnsureFresh(ctx context.Context) {
 
 var ErrNoToken = errors.New("auth: no bearer token")
 
-// Verify parses and validates a token, returning the caller's identity.
+// refetchForUnknownKid refetches the JWKS at most once per
+// unknownKidRefetchEvery. Concurrent callers wait for the one fetch in flight
+// instead of starting their own.
+func (v *Verifier) refetchForUnknownKid(ctx context.Context) {
+	v.kidMu.Lock()
+	defer v.kidMu.Unlock()
+	if time.Since(v.kidTried) < unknownKidRefetchEvery {
+		return
+	}
+	v.kidTried = time.Now()
+	_ = v.Refresh(ctx)
+}
+
+// Verify parses and validates a token, returning the caller's identity. The
+// token may be given with or without the "Bearer " prefix.
 func (v *Verifier) Verify(ctx context.Context, bearer string) (authz.Identity, error) {
 	tok := strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
-	if tok == "" || tok == bearer && !strings.HasPrefix(bearer, "Bearer") {
-		if tok == "" {
-			return authz.Identity{}, ErrNoToken
-		}
+	if tok == "" {
+		return authz.Identity{}, ErrNoToken
 	}
 	// Opaque publishable/secret keys are not JWTs. Reject them explicitly rather
 	// than producing a confusing parse error.
@@ -211,12 +238,7 @@ func (v *Verifier) Verify(ctx context.Context, bearer string) (authz.Identity, e
 			return key, nil
 		}
 		// Unknown kid: could be a rotation that happened since the last fetch.
-		if err := v.Refresh(ctx); err != nil {
-			var warn *WarnSymmetricKey
-			if !errors.As(err, &warn) {
-				return nil, err
-			}
-		}
+		v.refetchForUnknownKid(ctx)
 		v.mu.RLock()
 		key, ok = v.keys[kid]
 		v.mu.RUnlock()

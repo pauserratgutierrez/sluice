@@ -194,12 +194,7 @@ func (i *Issuer) decide(ctx context.Context, req Request) (*Grant, error) {
 		return nil, &ErrDenied{Reason: err.Error()}
 	}
 
-	requested := req.Columns
-	if len(requested) == 0 {
-		for _, c := range req.Relation.Columns {
-			requested = append(requested, c.Name)
-		}
-	}
+	requested := projection(req.Relation, req.Columns)
 	var allowlist []string
 	if body.Shape.Columns == nil {
 		allowlist = requested
@@ -337,7 +332,7 @@ func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPRespons
 }
 
 func physicalColumns(ctx context.Context, cat *catalog.Cache, rel *catalog.Relation, requested []string) ([]string, []string, error) {
-	granted, err := cat.HasColumnPrivilegeCurrent(ctx, rel.FullName(), requested)
+	granted, err := cat.HasColumnPrivilegeCurrent(ctx, rel, requested)
 	if err != nil {
 		return nil, nil, err
 	}

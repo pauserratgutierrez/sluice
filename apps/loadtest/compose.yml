@@ -112,8 +112,6 @@ x-sluice: &sluice
     SLUICE_DB_REPL_URL: postgres://sluice_repl:${SLUICE_REPL_PASSWORD:-loadtest-repl}@db:5432/postgres?replication=database
     SLUICE_DB_AUTHZ_URL: postgres://sluice_authz:${SLUICE_AUTHZ_PASSWORD:-loadtest-authz}@db:5432/postgres
     SLUICE_PROTO_VERSION: "4"
-    SLUICE_STREAMING: "off"
-    SLUICE_BINARY: "false"
     SLUICE_MESSAGES: "true"
     SLUICE_MESSAGE_PREFIX: "sluice:"
     SLUICE_JWKS_URL: http://jwks:8080/.well-known/jwks.json

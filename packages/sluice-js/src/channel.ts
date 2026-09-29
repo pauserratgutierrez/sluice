@@ -1,12 +1,12 @@
 import type { SluiceClient } from './client.js'
 import type { GenericDatabase } from './types.js'
-import type {
-  BroadcastPayload,
-  Json,
-  PresenceMember,
-  PresencePayload,
+import {
+  type BroadcastPayload,
+  type Json,
+  type PresenceMember,
+  type PresencePayload,
   SluiceError,
-  SubscriptionResult,
+  type SubscriptionResult,
 } from './types.js'
 
 let counter = 0
@@ -107,7 +107,7 @@ export class Channel<M = Json> {
     this.subscribed = final.ok
     return {
       ok: final.ok,
-      error: final.error as unknown as SluiceError | undefined,
+      error: final.error ? new SluiceError(final.error) : undefined,
       unsubscribe: async () => {
         this.subscribed = false
         await this.client.unregister(this.label)

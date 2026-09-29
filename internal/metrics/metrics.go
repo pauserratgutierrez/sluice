@@ -1,9 +1,8 @@
 // Package metrics exposes Sluice's Prometheus collectors.
 //
-// The design principle is that the expensive path must be LOUD. Supabase's
-// central ergonomic failure is that you can write a policy that costs 100x and
-// never be told; TierCProbes and AuthzCompileFailures exist so that cannot
-// happen here. Alert on TierCProbes.
+// The design principle is that the expensive path must be LOUD: a policy that
+// costs a query per subscriber per change must not go unnoticed. TierCProbes
+// and AuthzCompileFailures exist for that. Alert on TierCProbes.
 package metrics
 
 import (
@@ -33,14 +32,14 @@ var (
 		Help: "Decoded pgoutput messages by type.",
 	}, []string{"type"})
 
-	ReaderReconnects = promauto.NewCounterVec(prometheus.CounterOpts{
+	ReaderReconnects = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "sluice_reader_reconnects_total",
-		Help: "Replication reconnections by reason.",
-	}, []string{"reason"})
+		Help: "Times the replication stream failed and was reopened.",
+	})
 
 	ReaderIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_reader_is_leader",
-		Help: "1 when this process holds the single-reader advisory lock.",
+		Help: "1 when this process holds the single-reader advisory lock; 0 while it stands by.",
 	})
 
 	// ---- dispatch --------------------------------------------------------
@@ -97,7 +96,7 @@ var (
 
 	TierCWithheld = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_authz_tier_c_withheld_total",
-		Help: "Changes withheld from Tier C subscribers because the probe budget was exhausted.",
+		Help: "Changes withheld from Tier C subscribers because no decision could be made (probe budget exhausted, probe failed, or an incomplete DELETE tuple).",
 	}, []string{"schema", "table"})
 
 	AuthzCompileFailures = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -130,10 +129,12 @@ var (
 		Help: "Open SSE streams.",
 	})
 
+	// A dropped change is always followed by the stream being closed as
+	// stream_lagging; broadcast and presence events are simply dropped.
 	StreamDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_stream_dropped_events_total",
-		Help: "Events dropped by plane and reason.",
-	}, []string{"plane", "reason"})
+		Help: "Events dropped because a stream's queue was full, by event kind.",
+	}, []string{"kind"})
 
 	StreamClosed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_stream_closed_total",
@@ -146,10 +147,11 @@ var (
 		Help: "Broadcasts published by namespace and origin.",
 	}, []string{"namespace", "origin"})
 
-	PresenceMembers = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "sluice_presence_members",
-		Help: "Presence members per channel.",
-	}, []string{"channel"})
+	// Labelled by namespace, not channel: channel names can be per user.
+	PresenceUpdates = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_presence_updates_total",
+		Help: "Accepted presence track/update/untrack requests, by namespace and action.",
+	}, []string{"namespace", "action"})
 
 	SnapshotSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "sluice_snapshot_seconds",

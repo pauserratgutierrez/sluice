@@ -10,13 +10,15 @@
 // distinction is explicit in the type system.
 //
 // The supporting reasons: pglogrepl parses only protocol versions 1 and 2 (no
-// ParseV3/ParseV4 exists), and it has never had a tagged release. Sluice needs
-// the full v4 message set, so it owns this code.
+// ParseV3/ParseV4 exists), and it has never had a tagged release. This decoder
+// recognises every message type up to protocol 4, so an unexpected one is
+// reported instead of desynchronising the stream.
 //
 // Reference: https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html
 package pgoutput
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -59,9 +61,8 @@ const (
 	// ColText is 't': the value is in the type's text output format.
 	ColText ColumnKind = 't'
 	// ColBinary is 'b': the value is in the type's binary output format. Sluice
-	// requests binary='false', but pgoutput can still emit 'b' if a future
-	// configuration enables it, so the decoder carries the bytes through rather
-	// than silently mangling them.
+	// never requests binary, so this should not arrive; if it does, the decoder
+	// carries the bytes through and callers treat the value as unknown.
 	ColBinary ColumnKind = 'b'
 )
 
@@ -129,7 +130,10 @@ func (r *Relation) KeyColumns() []string {
 // Column is one decoded column value.
 type Column struct {
 	Kind ColumnKind
-	Data []byte // valid for ColText and ColBinary only
+	// Data is valid for ColText and ColBinary only. It is owned by the decoded
+	// message, never by the caller's input buffer, so a tuple can be retained
+	// (the resume ring does) after the next message is received.
+	Data []byte
 }
 
 // Tuple is a decoded row: one Column per relation column, in relation order.
@@ -197,9 +201,8 @@ type Decoder struct {
 	relations map[uint32]*Relation
 	typeNames map[uint32]string
 
-	// inStream tracks whether we are between StreamStart and StreamStop, which
-	// changes nothing about the message bodies but is required state when
-	// streaming is enabled.
+	// inStream tracks whether we are between StreamStart and StreamStop: inside
+	// a stream, DML messages carry a leading transaction id.
 	inStream bool
 
 	// OnRelation, if set, is called whenever a Relation message arrives --
@@ -220,11 +223,6 @@ func (d *Decoder) Relation(oid uint32) (*Relation, bool) {
 	r, ok := d.relations[oid]
 	return r, ok
 }
-
-// InStream reports whether a streamed (uncommitted) transaction is in progress.
-// With streaming='off', which is Sluice's default, this is always false and
-// every message the decoder emits belongs to an already-committed transaction.
-func (d *Decoder) InStream() bool { return d.inStream }
 
 type reader struct {
 	b   []byte
@@ -305,10 +303,18 @@ func (r *reader) timestamp() time.Time {
 
 func (r *reader) remaining() int { return len(r.b) - r.i }
 
-// Decode parses one pgoutput message.
+// Decode parses one pgoutput message. data may be reused by the caller as soon
+// as Decode returns.
 func (d *Decoder) Decode(data []byte) (*Message, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("pgoutput: empty message")
+	}
+	switch data[0] {
+	case MsgInsert, MsgUpdate, MsgDelete:
+		// Tuple columns are sub-slices of the message. The replication
+		// connection reuses its receive buffer for the next message, so the
+		// tuples must own a copy: one allocation per change.
+		data = bytes.Clone(data)
 	}
 	r := &reader{b: data}
 	m := &Message{Type: r.u8()}

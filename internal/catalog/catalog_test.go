@@ -36,7 +36,7 @@ func TestPredicateBypassRLS(t *testing.T) {
 		"owner_id = current_setting('request.jwt.claims')"))
 
 	t.Run("bypass role sees everything", func(t *testing.T) {
-		node, reason, sql := rel.Predicate("service_role", true)
+		node, reason, sql := rel.Predicate("service_role", nil, true)
 		if !expr.IsAlwaysTrue(node) {
 			t.Fatalf("BYPASSRLS role got a restricting predicate: %#v", node)
 		}
@@ -51,7 +51,7 @@ func TestPredicateBypassRLS(t *testing.T) {
 	// The same role without the attribute must still be default-denied: the
 	// bypass has to come from the catalog, never from the role's name.
 	t.Run("same role without the attribute is denied", func(t *testing.T) {
-		node, _, sql := rel.Predicate("service_role", false)
+		node, _, sql := rel.Predicate("service_role", nil, false)
 		if !expr.IsAlwaysFalse(node) {
 			t.Fatalf("role with no applicable policy was not denied: %#v", node)
 		}
@@ -61,7 +61,7 @@ func TestPredicateBypassRLS(t *testing.T) {
 	})
 
 	t.Run("non-bypass role still gets its policy", func(t *testing.T) {
-		node, _, sql := rel.Predicate("authenticated", false)
+		node, _, sql := rel.Predicate("authenticated", nil, false)
 		if expr.IsAlwaysTrue(node) || expr.IsAlwaysFalse(node) {
 			t.Fatalf("policy predicate collapsed to a constant: %#v", node)
 		}
@@ -78,10 +78,10 @@ func TestPredicateBypassIgnoresRestrictivePolicy(t *testing.T) {
 		policy(t, "all_read", true, nil, "true"),
 		policy(t, "not_archived", false, nil, "archived = false"),
 	)
-	if node, _, _ := rel.Predicate("postgres", true); !expr.IsAlwaysTrue(node) {
+	if node, _, _ := rel.Predicate("postgres", nil, true); !expr.IsAlwaysTrue(node) {
 		t.Fatalf("restrictive policy survived BYPASSRLS: %#v", node)
 	}
-	if node, _, _ := rel.Predicate("authenticated", false); expr.IsAlwaysTrue(node) {
+	if node, _, _ := rel.Predicate("authenticated", nil, false); expr.IsAlwaysTrue(node) {
 		t.Fatal("restrictive policy was dropped for a non-bypass role")
 	}
 }
@@ -101,11 +101,11 @@ func TestAuthzFingerprint(t *testing.T) {
 	}
 
 	rels, bypass := base()
-	want := authzFingerprint(rels, bypass)
+	want := authzFingerprint(rels, bypass, nil)
 
 	t.Run("stable across identical loads", func(t *testing.T) {
 		rels2, bypass2 := base()
-		if got := authzFingerprint(rels2, bypass2); got != want {
+		if got := authzFingerprint(rels2, bypass2, nil); got != want {
 			t.Error("fingerprint changed without any input changing")
 		}
 	})
@@ -118,7 +118,7 @@ func TestAuthzFingerprint(t *testing.T) {
 		p := rels2[42].Policies
 		p[0], p[1] = p[1], p[0]
 		rels2[42].sortPolicies()
-		if got := authzFingerprint(rels2, bypass2); got != want {
+		if got := authzFingerprint(rels2, bypass2, nil); got != want {
 			t.Error("fingerprint depends on the order policies were loaded in")
 		}
 	})
@@ -156,7 +156,7 @@ func TestAuthzFingerprint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rels2, bypass2 := base()
 			tc.mutate(rels2, bypass2)
-			if got := authzFingerprint(rels2, bypass2); got == want {
+			if got := authzFingerprint(rels2, bypass2, nil); got == want {
 				t.Errorf("%s did not move the fingerprint, so a live subscription would never be re-resolved", tc.name)
 			}
 		})
@@ -173,10 +173,36 @@ func TestAuthzFingerprint(t *testing.T) {
 		a[42].Policies[0].Roles = []string{"ab", "c"}
 		b, bb := base()
 		b[42].Policies[0].Roles = []string{"a", "bc"}
-		if authzFingerprint(a, ab) == authzFingerprint(b, bb) {
+		if authzFingerprint(a, ab, nil) == authzFingerprint(b, bb, nil) {
 			t.Error("adjacent fields collided; the hash is not length-prefixed")
 		}
 	})
+}
+
+// PostgreSQL applies a policy to every role that has the privileges of one of
+// its TO roles. Checking the role name alone would drop a RESTRICTIVE policy
+// for a child role and widen what it sees.
+func TestPredicateAppliesPoliciesThroughMembership(t *testing.T) {
+	rel := rlsRelation(
+		policy(t, "all_read", true, nil, "true"),
+		policy(t, "not_archived", false, []string{"authenticated"}, "archived = false"),
+	)
+	if node, _, _ := rel.Predicate("premium", nil, false); !expr.IsAlwaysTrue(node) {
+		t.Fatalf("without membership the restrictive policy should not apply: %#v", node)
+	}
+	node, _, sql := rel.Predicate("premium", map[string]bool{"authenticated": true}, false)
+	if expr.IsAlwaysTrue(node) {
+		t.Fatal("a member of authenticated escaped the restrictive policy written for authenticated")
+	}
+	if sql != "((true)) AND ((archived = false))" {
+		t.Errorf("PredicateSQL = %q", sql)
+	}
+
+	rels := map[uint32]*Relation{42: rel}
+	if authzFingerprint(rels, nil, nil) ==
+		authzFingerprint(rels, nil, map[string]map[string]bool{"premium": {"authenticated": true}}) {
+		t.Error("a membership change did not move the fingerprint")
+	}
 }
 
 func TestBypassesRLSDefaultsClosed(t *testing.T) {

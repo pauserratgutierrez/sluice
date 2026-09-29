@@ -117,10 +117,8 @@ func (v Value) String() string {
 }
 
 // ParseText converts a PostgreSQL text-format datum into a Value, guided by the
-// declared type name. Sluice requests `binary 'false'` from pgoutput precisely
-// so that this is the only decoding path it needs: measured, the binary format
-// was actually *larger* (112 vs 88 bytes for a representative row) and would
-// require per-type decoders including array headers and jsonb's version byte.
+// declared type name. Sluice never asks pgoutput for the binary format, so this
+// is the only decoding path it needs.
 func ParseText(typeName, s string) Value {
 	switch normalizeType(typeName) {
 	case "bool":

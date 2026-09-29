@@ -16,16 +16,19 @@ import (
 //
 // It lives in memory only. Never in the database.
 //
-// Diffs are coalesced on a tick (default 1500ms, matching Phoenix.Tracker's
-// broadcast period) so that a client calling track() on every mouse move cannot
-// amplify into N-squared messages -- the documented failure mode of Supabase
-// Presence.
+// Diffs are coalesced on a tick (SLUICE_PRESENCE_BROADCAST, default 1500ms) so
+// that a client calling track() on every mouse move produces at most one diff
+// per channel per tick rather than one message per call per member.
 type Presence struct {
 	hub  *Hub
 	tick time.Duration
 
 	mu       sync.Mutex
 	channels map[string]*channelState
+	// byStream lists the channels a stream has tracked keys in, so a disconnect
+	// visits only those. It may name a channel where the stream no longer owns
+	// a key; RemoveStream tolerates that.
+	byStream map[string]map[string]struct{}
 
 	stop chan struct{}
 	once sync.Once
@@ -53,6 +56,7 @@ func NewPresence(h *Hub, tick time.Duration) *Presence {
 		hub:      h,
 		tick:     tick,
 		channels: map[string]*channelState{},
+		byStream: map[string]map[string]struct{}{},
 		stop:     make(chan struct{}),
 	}
 }
@@ -73,24 +77,43 @@ func (p *Presence) Run() {
 
 func (p *Presence) Stop() { p.once.Do(func() { close(p.stop) }) }
 
-// Track adds or replaces a member. Returns the number of keys the channel now
-// holds so the caller can enforce a cap.
-func (p *Presence) Track(channel, key, streamID string, meta json.RawMessage) int {
+// Track adds or replaces a member, last write wins. A new key is refused when
+// the channel already holds maxKeys (0 means no limit). It returns the number
+// of keys the channel holds and whether the key was tracked.
+func (p *Presence) Track(channel, key, streamID string, meta json.RawMessage, maxKeys int) (int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cs := p.channelLocked(channel)
-	ref := time.Now().UTC().Format("20060102T150405.000000000")
-	cs.members[key] = &member{streamID: streamID, meta: meta, since: time.Now(), ref: ref}
-	cs.joins[key] = event.Member{Meta: meta, Since: cs.members[key].since.UTC().Format(time.RFC3339Nano), Ref: ref}
+	if _, exists := cs.members[key]; !exists && maxKeys > 0 && len(cs.members) >= maxKeys {
+		return len(cs.members), false
+	}
+	now := time.Now()
+	ref := now.UTC().Format("20060102T150405.000000000")
+	cs.members[key] = &member{streamID: streamID, meta: meta, since: now, ref: ref}
+	cs.joins[key] = event.Member{Meta: meta, Since: now.UTC().Format(time.RFC3339Nano), Ref: ref}
 	delete(cs.leaves, key)
 	cs.dirty = true
-	return len(cs.members)
+	if p.byStream[streamID] == nil {
+		p.byStream[streamID] = map[string]struct{}{}
+	}
+	p.byStream[streamID][channel] = struct{}{}
+	return len(cs.members), true
 }
 
 // Untrack removes every key a stream owns from one channel.
 func (p *Presence) Untrack(channel, streamID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.untrackLocked(channel, streamID)
+	if chans := p.byStream[streamID]; chans != nil {
+		delete(chans, channel)
+		if len(chans) == 0 {
+			delete(p.byStream, streamID)
+		}
+	}
+}
+
+func (p *Presence) untrackLocked(channel, streamID string) {
 	cs := p.channels[channel]
 	if cs == nil {
 		return
@@ -125,18 +148,15 @@ func (p *Presence) UntrackKey(channel, key, streamID string) bool {
 	return true
 }
 
-// RemoveStream removes a stream from every channel it appears in. Driven by the
-// transport close, which is the only leave signal Sluice needs.
+// RemoveStream removes a stream from every channel it tracked keys in. Driven
+// by the transport close, which is the only leave signal Sluice needs.
 func (p *Presence) RemoveStream(streamID string) {
 	p.mu.Lock()
-	var channels []string
-	for name := range p.channels {
-		channels = append(channels, name)
+	defer p.mu.Unlock()
+	for channel := range p.byStream[streamID] {
+		p.untrackLocked(channel, streamID)
 	}
-	p.mu.Unlock()
-	for _, c := range channels {
-		p.Untrack(c, streamID)
-	}
+	delete(p.byStream, streamID)
 }
 
 // State returns the full membership of a channel, for a joining client.

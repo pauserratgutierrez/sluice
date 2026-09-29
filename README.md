@@ -1,393 +1,578 @@
 # Sluice
 
-A realtime data-streaming server for PostgreSQL.
+A realtime data-streaming server for PostgreSQL. It reads the write-ahead log through one logical replication slot and streams row changes, broadcasts and presence to authenticated clients over Server-Sent Events, giving every subscriber exactly the rows it may read.
 
-A sluice is a gate on a channel. It takes one flow — the write-ahead log — and meters it out to each consumer, giving every subscriber exactly what it is entitled to and nothing more.
+It is built to replace `supabase/realtime` in a self-hosted stack. It is not protocol-compatible with it, and it installs **nothing in the database**: no extensions, tables, functions or schemas.
 
-Sluice replaces `supabase/realtime` in a self-hosted stack. It is not protocol-compatible with it, and it requires **nothing installed in the database**: no extensions, no tables, no functions, no schemas. Four server settings, two roles, and a publication.
+> **Status: working prototype.** Everything below is implemented and exercised by the suites in this repository against PostgreSQL 18.4, GoTrue, PostgREST and Caddy. It has not been burned in under production traffic. Planned work and known gaps are in [ROADMAP.md](ROADMAP.md).
 
-> **Status: working prototype, not yet production.** The critical path is implemented and validated end-to-end against a live PostgreSQL 18.4, GoTrue, PostgREST and Caddy: 36 server assertions, 15 SDK unit tests, 16 SDK live checks, and a race-clean Go suite, all passing.
+## Contents
 
----
+- [How it works](#how-it-works)
+- [What PostgreSQL must provide](#what-postgresql-must-provide)
+- [Running it](#running-it)
+- [Authorization](#authorization)
+- [Shapes](#shapes)
+- [Wire protocol](#wire-protocol)
+- [Channels: broadcast and presence](#channels-broadcast-and-presence)
+- [Session revocation](#session-revocation)
+- [Delivery guarantees and backpressure](#delivery-guarantees-and-backpressure)
+- [Operating it](#operating-it)
+- [Security model](#security-model)
+- [Configuration reference](#configuration-reference)
+- [Clients](#clients)
+- [Development and testing](#development-and-testing)
+- [Repository layout](#repository-layout)
 
-## Why
+## How it works
 
-`supabase/realtime` authorizes **every change against every subscriber**. Its own documentation says so:
+Authorization is decided **once per subscription, at subscribe time**, never once per change per subscriber. The decision is either a constant (Tier A), an in-process predicate evaluated against the tuple the WAL already carries (Tier B), or, only for policies that cannot be evaluated in process, one impersonated query per change (Tier C, reported as a defect).
 
-> Postgres Changes authorizes every event against each subscriber. When you make a single change to a table with 100 subscribed users, Realtime performs 100 authorization checks — one per user — so throughput scales with the number of subscribers, not the write rate. Changes are also processed on a single thread to preserve their order, which means larger compute add-ons don't meaningfully increase Postgres Changes throughput.
+Subscriptions are indexed by the constant their filter pins a column to (`owner_id=eq.<uuid>`), so a change is routed to its subscribers with a map lookup instead of a scan.
 
-Measured on PostgreSQL 18.4, that model costs **~9–13 µs per subscriber per change**:
+One process reads one permanent replication slot (`pgoutput`, text format, streaming off: everything it receives is already committed). Each client holds one long-lived `POST` whose response is `text/event-stream`, plus short control `POST`s. The access token travels in `Authorization: Bearer`, never in a URL.
 
-| Subscribers on one change | Per-subscriber impersonation | Indexed / constant-reduced |
-| --- | --- | --- |
-| 100 | 739 changes/sec | 6,098 changes/sec |
-| 1,000 | **108 changes/sec** | 4,405 changes/sec |
-| 5,000 | **18.6 changes/sec** | 1,873 changes/sec |
+Two process-wide **shape oracles** decide what a shape may see:
 
-Sluice resolves authorization **once, at subscribe time**, into something that costs nothing per change. That single decision is the whole point; everything else follows from it.
-
-Which **oracle** produces the grant is chosen per process: `SLUICE_SHAPE_ORACLE=rls` (default — the same policies as a `SELECT`) or `issuer` (an HTTP call to your app at join, a concrete filter, and a hold row on the WAL as the kick). One tube either way. The harness stays on `rls`.
-
-## What it does differently
-
-| | `supabase/realtime` | Sluice |
-| --- | --- | --- |
-| Database objects required | `_realtime` schema, `realtime` schema, 3 tables, 5 types, 15 functions, 81 migrations, a dedicated owner role, a partition janitor | **none** |
-| Change source | `pg_logical_slot_get_changes` polled every 100 ms, on a **temporary** slot | `START_REPLICATION` streaming protocol, permanent slot, LSN feedback and real backpressure |
-| Output plugin | `wal2json` | `pgoutput` (in-core) |
-| Unchanged TOASTed column | dropped from the JSON with **no marker** | explicit `unchanged: ["body"]` |
-| Authorization | one impersonated probe per subscriber per change | resolved once: RLS in three tiers, or an issuer grant + hold |
-| `DELETE` under RLS | `old_record` truncated to primary keys | full old row, correctly authorized |
-| Database broadcast | day-partitioned `realtime.messages` + a second replication connection + a janitor | `pg_logical_emit_message`, atomic with your transaction, zero tables |
-| Session revocation | none; a signed-out user streams until the JWT expires | pushed on the same slot, milliseconds |
-| Transport | WebSocket, so the token travels in the URL | SSE over POST, `Authorization: Bearer` |
-| Expensive configuration | silent | reported at `/diagnostics` with a runnable remedy |
-
-## The two shape oracles
-
-`SLUICE_SHAPE_ORACLE=rls | issuer`. One per process. Channels still combine with either.
-
-### RLS (default)
-
-Chosen automatically at subscribe time, reported back as `tier` A/B/C, and visible in metrics.
-
-**Tier A — constant reduction.** If the RLS predicate reads only columns the shape's filter pins to equality constants, then its truth value is the same for every row in the shape. Evaluate it once; never again. A policy of `owner_id = auth.uid()` with a shape filtered on `owner_id` lands here — the canonical Supabase case, and the reason the numbers above are 40× apart.
-
-**Tier B — compiled predicate.** Row-dependent but pure over the row, so it is compiled to an in-process evaluator and run against the tuple the WAL already delivered. Zero database round trips, full RLS semantics — **including `DELETE`**, which Supabase documents as impossible precisely because it probes a live table instead of the old tuple.
-
-**Tier C — impersonated probe.** Subqueries, joins, volatile functions. Correct, but ~13 µs per subscriber per change. Treated as a defect to surface, not a normal mode: rate-budgeted, counted in `sluice_authz_tier_c_probes_total`, and reported at `/diagnostics` with the offending policy and a concrete rewrite. Set `SLUICE_TIER_C=deny` to refuse such subscriptions outright.
-
-### Issuer
-
-Your API is the judge. Sluice POSTs verified identity plus the requested shape to `SLUICE_ISSUER_URL` **once at join** and **once per shape on `/token`** (`Authorization: Bearer <SLUICE_ISSUER_BEARER>`). Fail closed. No TTL cache, no lease back to the issuer, no user access token forwarded.
-
-The issuer returns a concrete filter (≥1 equality), an optional column allowlist, and ≥1 **hold** — a row that already exists for the permission, typically the membership row your kick already deletes. `shape.schema` / `shape.table` must be the catalog names (`relname`, not an alias). `Documents` ≠ `documents`; a grant for another name is denied. PostgreSQL folds unquoted identifiers to lowercase; quoted names that differ are distinct relations. Sluice ANDs that filter with the client's (narrowing only), installs the hold watches on the same slot **then** EXISTS the holds. Zero matching rows on the *subscribed* table is fine. When a hold is deleted (or updated out of its filter), that shape gets `shape_not_authorized`; the stream and other subscriptions continue. An expired JWT still closes the stream (`token_expired`). `session_revoked` is the other identity axis and is unchanged.
-
-Snapshots run as the pool role (no `SET ROLE`). Startup refuses if a published table has RLS and that role does not bypass it. Ops can `POST /admin/shapes/drop` with `service_role` or the issuer bearer — it walks this node's subscriptions; it is not the hot path.
-
-The client `from` / `eq` / `subscribe` tube does not change. The ready event has `oracle: "issuer"` and the effective `filter`, and does **not** send `tier`.
-
-## How to write policies
-
-Two rules, both from Supabase's own RLS performance guide, both of which Sluice understands and checks.
-
-**Wrap per-query calls in a scalar subquery.** `auth.uid()` is `STABLE`, so PostgreSQL re-invokes it for every row it scans. `(select auth.uid())` becomes an InitPlan evaluated once per query — 9 ms instead of 179 ms over 100,000 rows.
-
-**Give every policy a `TO` clause**, so an ineligible role is rejected before the predicate runs rather than after.
-
-```sql
-CREATE POLICY documents_own ON public.documents
-  FOR SELECT TO authenticated
-  USING (owner_id = (select auth.uid()));
-
-CREATE INDEX ON public.documents (owner_id);   -- every column a policy reads
-```
-
-PostgreSQL stores that wrapper as a subquery — `(owner_id = ( SELECT auth.uid() AS uid))` — so a naive reader would call the recommended spelling uncompilable and drop it to Tier C. Sluice unwraps FROM-less selects, in all the positions PostgreSQL emits them, and the two spellings resolve to **exactly the same tier**. A select with a `FROM` is a real subquery and still Tier C.
-
-What you have not done is reported, with a runnable statement:
-`policy_function_not_wrapped`, `policy_applies_to_public`, `unindexed_policy_column`.
+- **`rls`** (default): the same row-level security policies and column grants that govern a `SELECT` by the caller's role.
+- **`issuer`**: your API decides over HTTP when a client joins, and names a **hold** row whose deletion revokes the grant through the WAL.
 
 ## What PostgreSQL must provide
 
-That's the whole contract:
+Tested with PostgreSQL 18.4. The default `SLUICE_PROTO_VERSION=4` needs PostgreSQL 16 or newer; older versions are untested.
 
 ```sql
--- server settings (restart for wal_level)
+-- server settings (wal_level needs a restart)
 --   wal_level = logical
---   max_replication_slots >= 1
+--   max_replication_slots >= 1          -- one slot per Sluice deployment
 --   max_wal_senders >= 1
---   max_slot_wal_keep_size = <bounded>     -- the default -1 is unlimited
+--   max_slot_wal_keep_size = <bounded>  -- the default -1 is unlimited
 
 CREATE ROLE sluice_repl  WITH LOGIN REPLICATION PASSWORD '...';
 CREATE ROLE sluice_authz WITH LOGIN NOINHERIT   PASSWORD '...';
-GRANT anon, authenticated TO sluice_authz;
+GRANT anon, authenticated TO sluice_authz;   -- every role in SLUICE_ALLOWED_ROLES
 
 CREATE PUBLICATION sluice;
 ALTER PUBLICATION sluice ADD TABLE public.documents;
 ```
 
-`sluice_repl` needs **no table privileges at all** — logical decoding is not subject to RLS or grants, which is exactly why it is used for nothing else and why its credential must be treated as a superuser's.
+- **`sluice_repl`** is used only for the replication connection (`SLUICE_DB_REPL_URL`, with `replication=database`). It needs no table privileges: logical decoding is not subject to RLS or grants, so it reads every column of every published table. Treat its credential like a superuser's.
+- **`sluice_authz`** is the pool role (`SLUICE_DB_AUTHZ_URL`). `NOINHERIT` means it can only act as an application role deliberately, with a transaction-scoped `SET LOCAL ROLE`. In `rls` mode it must be able to assume every non-`BYPASSRLS` role in `SLUICE_ALLOWED_ROLES`. It needs no other grant.
+- **Snapshots for a `BYPASSRLS` role** such as `service_role` also `SET ROLE` to it, so they fail unless you `GRANT service_role TO sluice_authz`, which lets `sluice_authz` bypass RLS itself. Sluice only does that for a verified token of that role; startup warns (`role_not_assumable`) when the grant is missing.
+- **Issuer mode** reads with the pool role itself (no `SET ROLE`): it needs `SELECT` on every published table and `BYPASSRLS` (or RLS off on those tables). Startup refuses otherwise.
+- **Publications:** tables can be added explicitly, `FOR TABLES IN SCHEMA` or `FOR ALL TABLES`. **Do not use row filters**: a column in a publication `WHERE` must be in the replica identity or the application's own `UPDATE`/`DELETE` fail, so Sluice refuses to start with one. Column lists are not checked; columns they leave out are simply absent from events.
+- **Replica identity** decides which old columns reach Sluice on `UPDATE`/`DELETE`; see [Replica identity](#replica-identity).
+- **`pg_logical_emit_message`** (database broadcasts) is executable by every role by default.
 
-Do not add publication row filters. Verified: a column used in a publication `WHERE` expression must be part of the replica identity, and when it is not, the **application's own** `UPDATE` and `DELETE` statements fail. Sluice validates for this at startup and refuses to run.
+## Running it
 
-## Try it
+### Harness
 
-The harness is a full stack: PostgreSQL 18.4 (the **plain** upstream image — no custom build, no `wal2json`), GoTrue for real ES256 tokens, PostgREST as the authorization oracle, Caddy, and Sluice.
+`deploy/compose.yml` runs the plain `postgres:18.4-trixie` image, GoTrue (real ES256 tokens), PostgREST (the oracle the tests compare against), Caddy, the RLS-mode Sluice, and an issuer-mode Sluice with its stub issuer.
 
 ```bash
-git clone https://github.com/pauserratgutierrez/sluice && cd sluice
-
 cp .env.example .env
-sh deploy/keygen.sh >> .env      # runs in a container; no local Go needed
-# then delete the empty duplicates the example left behind
-
+sh deploy/keygen.sh >> .env        # runs in a container; then delete the empty duplicates
 docker compose -f deploy/compose.yml --env-file .env up -d --build
-docker compose -f deploy/compose.yml --env-file .env ps
 ```
 
-The same `up` starts `sluice-issuer` and `issuer-stub`. The `sluice` process stays on `rls`.
+The gateway listens on `GATEWAY_PORT` (default 8000): `/auth/v1`, `/rest/v1`, `/sluice/v1` and `/sluice-issuer/v1`.
 
-## Run the published image
+### Published image
 
-The runtime image is only the `sluice` binary (plus CA certs). It does not include Compose, Postgres, GoTrue, or the harness.
+`ghcr.io/pauserratgutierrez/sluice` contains only the static `sluice` binary and CA certificates. Required variables are `SLUICE_DB_REPL_URL`, `SLUICE_DB_AUTHZ_URL` and `SLUICE_JWKS_URL`; [`deploy/sluice.env.example`](deploy/sluice.env.example) lists every variable with its default.
 
 ```bash
-docker pull ghcr.io/pauserratgutierrez/sluice:latest
-
-docker run --rm -p 4000:4000 \
-  --env-file deploy/sluice.env.example \
+docker run --rm -p 4000:4000 --env-file deploy/sluice.env.example \
   -e SLUICE_DB_REPL_URL='postgres://sluice_repl:...@db:5432/postgres?replication=database' \
   -e SLUICE_DB_AUTHZ_URL='postgres://sluice_authz:...@db:5432/postgres' \
   -e SLUICE_JWKS_URL='http://auth:9999/.well-known/jwks.json' \
   ghcr.io/pauserratgutierrez/sluice:latest
 ```
 
-Required env vars are `SLUICE_DB_REPL_URL`, `SLUICE_DB_AUTHZ_URL`, and `SLUICE_JWKS_URL`. Every other knob and its default is listed in [`deploy/sluice.env.example`](deploy/sluice.env.example). The image healthcheck runs `/sluice -healthcheck` against `GET /healthz`.
+`sluice -healthcheck` probes `GET /healthz` (the image's `HEALTHCHECK`); `sluice -version` prints the version.
 
-Run the end-to-end validation:
+Behind a proxy, disable response buffering for the stream route (Caddy: `flush_interval -1`; nginx honours the `X-Accel-Buffering: no` header Sluice sends) and do not time out long-lived responses. CORS is the gateway's job; Sluice sends no CORS headers.
 
-```bash
-docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
-  golang:1.26-alpine go build -o .bin/smoke ./cmd/smoke
+## Authorization
 
-docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
-  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" \
-  alpine:3.22 /b/smoke
+### RLS oracle
+
+For a relation and the caller's role, Sluice combines the relation's `SELECT` policies the way PostgreSQL does: permissive policies `OR`ed, restrictive policies `AND`ed. A policy applies when its `TO` list names the role, or a role whose privileges the caller's role has (`pg_has_role(..., 'USAGE')`), or when it has no `TO` (`PUBLIC`). No RLS on the table, or a role with `BYPASSRLS` or superuser, means every row. The owner bypass (a table's owner without `FORCE ROW LEVEL SECURITY`) is not modeled, so an owner's subscription is judged by the policies: fail-closed. Claim-derived parts (`auth.uid()`, `current_setting('request.jwt.claims', true)::jsonb ->> 'sub'`) are folded to constants for the subscription.
+
+Policy text is parsed with [`pgplex/pgparser`](https://github.com/pgplex/pgparser), a pure-Go port of PostgreSQL's grammar. What Sluice evaluates in process is a whitelist of node types (`internal/expr/convert.go`); anything else makes the predicate non-compilable, which can only move a subscription to Tier C, never grant it.
+
+| Tier | When | Per-change cost |
+| --- | --- | --- |
+| **A** | The predicate only reads columns the shape pins with `eq` filters (or there is no predicate). Sluice substitutes the constants and evaluates it once; `false` refuses the subscription with `shape_not_authorized`. | none |
+| **B** | The predicate is compilable but reads other columns. It is evaluated in process against the WAL tuple, `DELETE` included (against the old tuple). The first `SLUICE_TIER_B_VERIFY` decisions per subscription made on a complete tuple are also asked of PostgreSQL (`jsonb_populate_record` under the caller's role); any disagreement demotes the subscription to Tier C for good, logs at `ERROR` and increments `sluice_authz_downgrades_total`. | in-process evaluation |
+| **C** | The predicate has a subquery, a function outside the whitelist, or anything else not compilable. | one query per subscriber per change |
+
+Tier C evaluates the policy under the caller's role and claims against the WAL tuple rebuilt with `jsonb_populate_record` when the tuple carries every column (a new tuple unless it has unchanged TOASTed columns; an old tuple only with `REPLICA IDENTITY FULL`). Otherwise an `INSERT`/`UPDATE` is checked by probing the live row by primary key, and a `DELETE` cannot be decided. Probes run on the replication path, so they slow every subscriber. They are capped globally by `SLUICE_TIER_C_MAX_PROBES_PER_SECOND`; over the cap the change is withheld from Tier C subscribers, never delivered unauthorized. `SLUICE_TIER_C=deny` refuses such subscriptions with `policy_requires_impersonation`. Tier C reads live tables, so a policy reading another table can see a different state than the one at commit time.
+
+**Undecidable changes are withheld.** When the filter or the policy needs a value the WAL did not carry — an unchanged TOASTed column, or a column outside a narrow replica identity on `DELETE` — the change is not delivered and `sluice_authz_unknown_total` counts it. With `SLUICE_DEGRADED_DELETES=deliver`, such a `DELETE` is delivered with `"degraded": "delete_authz_unavailable"`.
+
+**Revocation.** Every `SLUICE_CATALOG_REFRESH` tick reloads the catalog. When anything a decision reads changed — policies, RLS flags, roles with `BYPASSRLS`, role memberships — every RLS subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`. Time-dependent predicates (`now()`) and Tier C decisions are also re-resolved when their `SLUICE_AUTHZ_LEASE` has expired, checked on the same tick; `POST /token` re-resolves every subscription of the stream. So a policy change reaches open streams within one tick, not instantly. `REVOKE SELECT (column)` does not reach open streams: column grants are checked only at subscribe time.
+
+**Columns.** The projection is the requested columns (all columns when none are requested) plus the table's key columns (primary key, or the replica identity index), intersected with the caller's `SELECT` privileges. Denied columns are reported with `columns_not_granted`; nothing outside the projection is ever emitted.
+
+**Writing policies Sluice (and PostgreSQL) handle well.** Wrap per-query calls in a scalar subquery, `(select auth.uid())`: PostgreSQL then evaluates them once per query, and Sluice unwraps the `FROM`-less select, so both spellings resolve to the same tier. Give every policy a `TO` clause. Index every column a policy reads. `/diagnostics` reports `policy_function_not_wrapped`, `policy_applies_to_public` and `unindexed_policy_column` with a statement to run. Filtering on the column a policy compares (`owner_id = auth.uid()` with `.eq('owner_id', me)`) is what makes a subscription Tier A.
+
+### Issuer oracle
+
+`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded). Redirects are not followed; a timeout (`SLUICE_ISSUER_TIMEOUT`), a non-2xx or an unreadable body denies.
+
+```json
+{
+  "action": "subscribe",
+  "identity": { "role": "authenticated", "sub": "…", "session_id": "…", "claims": { } },
+  "requested": { "schema": "public", "table": "documents",
+                 "filter": "project_id=eq.42", "columns": ["id", "title"], "ops": ["INSERT"] }
+}
 ```
 
-It signs a user up through GoTrue, opens a stream, and asserts the design's claims — tier selection, RLS delivery including `DELETE`, TOAST `unchanged` markers, transactional broadcast, PostgREST agreement, snapshots, differential evaluation against PostgreSQL, security negatives, and a small fan-out load:
+`action` is `refresh` when the stream presents a new token (`POST /token`). A grant:
 
-```
-subscription           tier  indexed  routing key   note
----------------------  ----  -------  ------------  ----
-docs                   A     yes      owner_id
-posts                  B     no                     warn:unindexed_shape warn:replica_identity_full_with_toast
-invoices               C     yes      team_id
-metrics                A     no                     warn:unindexed_shape
-articles               A     yes      owner_id      warn:replica_identity_insufficient
-
-  PASS  only the caller's own INSERT is delivered
-  PASS  per-row evaluation delivers own+public and withholds others' private
-  PASS  the caller's own DELETE is delivered with the full old row
-  PASS  another user's DELETE is withheld
-  PASS  an untouched TOASTed column arrives as unchanged:["body"]
-  PASS  a transactional WAL message is delivered as a broadcast
-  PASS  a message emitted in a rolled-back transaction never arrives
-  PASS  PostgREST sees exactly the pre-existing rows plus the ones Sluice streamed
-  PASS  a shape whose predicate reduces to FALSE is refused at subscribe time
-  …
-  PASS  compiled evaluator agrees with PostgreSQL on N evaluations
-  PASS  another user's token cannot drive someone else's stream
-  …
-
-== 36 checks, 0 failures ==
+```json
+{
+  "allow": true,
+  "shape": { "schema": "public", "table": "documents",
+             "filter": "project_id=eq.42", "columns": ["id", "title", "body"] },
+  "holds": [ { "schema": "public", "table": "project_members",
+               "filter": "project_id=eq.42,user_id=eq.<sub>" } ]
+}
 ```
 
-The issuer overlay is a second Sluice on the same compose network (`sluice-issuer` + `issuer-stub`). The harness process stays on `rls`. `cmd/smoke-issuer` does not replace the 36 assertions; run it after `cmd/smoke`, not in parallel.
+Sluice checks the grant before using it:
 
-```bash
-docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
-  golang:1.26-alpine go build -o .bin/smoke-issuer ./cmd/smoke-issuer
+- `shape` names the requested table (catalog name, case-sensitive).
+- `shape.filter` uses the [filter grammar](#filters) and has at least one non-negated equality, so it can never mean the whole table.
+- The effective filter is `authorized AND client`. The client may omit or repeat an authorized equality; a different constant is a deny.
+- Columns are the requested ones (or all) plus the key columns, intersected with `shape.columns` when present (an empty list denies), and with the pool role's physical `SELECT`.
+- `holds` is non-empty. Every hold table is published, and every hold filter has an equality and only reads columns in that table's replica identity (otherwise its `DELETE` could not be detected).
 
-docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
-  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" \
-  alpine:3.22 /b/smoke-issuer
+Sluice then installs the hold watches and the shape, and only after that checks that every hold row exists, so a `DELETE` racing the join is still caught. When a hold row is deleted, or updated out of its filter, the shape is dropped with `shape_not_authorized`; the stream and its other subscriptions continue. Zero rows in the subscribed table is a valid, empty shape. The ready result carries `oracle: "issuer"` and the effective `filter`, and no `tier`. Snapshots and `EXISTS` run as the pool role.
+
+`POST /admin/shapes/drop` (service_role token, or the issuer bearer) drops this process's subscriptions matching a table, equalities and optionally an identity:
+
+```json
+{ "schema": "public", "table": "documents", "equalities": { "project_id": "42" },
+  "identity": { "sub": "…", "role": "authenticated" } }
 ```
 
-Smoke's fan-out is a correctness check (200 streams × 25 changes by default). `cmd/load` is a separate soak on the same compose network, not a replay of the numbers in [Measured behaviour](#measured-behaviour). Default `LOAD_SCENARIO=all` is a laptop ladder: Tier A and no-RLS at 1500 streams × 80 changes, B capped at 800×60, C at 150×40, then multi-user, then extreme A at 4000×100. Not a CI check.
+## Shapes
 
-```bash
-docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 \
-  golang:1.26-alpine go build -o .bin/load ./cmd/load
-
-docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
-  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" \
-  alpine:3.22 /b/load
+```json
+{ "sub": "docs", "shape": {
+    "schema": "public", "table": "documents",
+    "filter": "owner_id=eq.7f3a…,status=in.(open,pending)",
+    "columns": ["id", "title"], "ops": ["INSERT", "UPDATE", "DELETE"],
+    "transitions": true, "initial": "snapshot" } }
 ```
 
-Knobs: `LOAD_SCENARIO` (`all` | `A` | `B` | `C` | `none` | `multi`), `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`. Same harness URLs as smoke (`SMOKE_AUTH_URL`, `SMOKE_SLUICE_URL`, `SMOKE_DB_URL`).
+`sub` is a label you choose, unique within the stream. `schema` defaults to `public`. `ops` defaults to `INSERT`, `UPDATE`, `DELETE` (`*` or `ALL` means the same three); `TRUNCATE` is opt-in and is delivered to every subscription on the table that asked for it, without filtering or authorization. `initial` is `none` (default) or `snapshot`.
 
-Capacity hunts against the **published** image (not this tree) live in [`apps/loadtest`](apps/loadtest/README.md): Compose profiles `rls-a`, `rls-b`, `rls-c`, and `issuer`, pulling `ghcr.io/pauserratgutierrez/sluice:0.1.4`.
+### Filters
 
-`cmd/audit` is the production-readiness battery (RLS spectrum, WAL edges, `/diagnostics`). Same two-step build/run as smoke, targeting `./cmd/audit`.
+PostgREST spelling, AND-only: `column=op.value`, joined with commas.
 
-## Using it from a client
+| Operator | Meaning |
+| --- | --- |
+| `eq`, `neq`, `lt`, `lte`, `gt`, `gte` | comparison; the value is typed by the column |
+| `in.(a,b,…)` | membership, 1 to 100 values |
+| `like`, `ilike` | pattern, `*` as the wildcard |
+| `is.null`, `is.true`, `is.false` | null and boolean tests |
+| `not.` prefix | negation, e.g. `status=not.eq.draft` |
 
-### JavaScript / TypeScript
+Values may be double-quoted (`title=eq."a,b"`). A filter naming an unknown column is refused; values are never interpolated into SQL. There is no `OR`: it would defeat constant routing. Subscribe twice instead.
 
-Use [`@pauserratgutierrez/sluice-js`](https://www.npmjs.com/package/@pauserratgutierrez/sluice-js) — one client, one SSE connection, typed against the same generated `Database` types as PostgREST:
+**Routing.** Among the non-negated `eq` terms, Sluice prefers a column that leads an index and is in the replica identity, then any indexed column, then any `eq` column. A shape with none is **unindexed**: it is scanned on every change to its table, gets the `unindexed_shape` warning, and at most `SLUICE_UNINDEXED_SHAPES_MAX` of them are admitted per process.
 
-```bash
-npm install @pauserratgutierrez/sluice-js
+### Replica identity
+
+The old tuple of an `UPDATE`/`DELETE` carries only the replica identity columns (`DEFAULT`: primary key; `USING INDEX`: that index; `FULL`: every column). An `UPDATE` that does not change the replica identity key carries no old tuple at all. So:
+
+- A `DELETE` is delivered only if the filter and the policy can be evaluated on the old tuple. A filter on a column outside the replica identity withholds deletes.
+- With `transitions: true`, an `UPDATE` that moves a row into the shape arrives as `op: "INSERT"` with `transition: "enter"`, and one that moves it out arrives as `op: "DELETE"` with `transition: "leave"` (the `record` then holds the new values, `old` the previous ones). The same entry is also delivered as `INSERT`/`enter` to subscriptions that receive `UPDATE`s without asking for transitions. Detecting either requires the old tuple to carry the filter columns. Without an old tuple a matching row is an `UPDATE`, and a row leaving the shape is not detected.
+- Subscribing with `DELETE` or `transitions` on a filter column outside the replica identity returns a `replica_identity_insufficient` warning with the `CREATE UNIQUE INDEX … ; ALTER TABLE … REPLICA IDENTITY USING INDEX …` to run; `SLUICE_REPLICA_IDENTITY=strict` refuses it instead.
+
+`REPLICA IDENTITY USING INDEX` on a unique index over `(filter columns…, primary key)` gives deletes and transitions what they need without `FULL`, which carries every old column — including unchanged TOASTed values — in every `UPDATE` and `DELETE` (warned as `replica_identity_full_with_toast`). Dropping the index a `USING INDEX` identity names breaks the application's own deletes; Sluice refuses to start in that state.
+
+### Values
+
+`record` and `old` hold the projected columns. In live changes: booleans as JSON booleans, integers, floats and `numeric` as JSON numbers with PostgreSQL's exact digits (`NaN`/`Infinity` as strings), `json`/`jsonb` embedded, everything else as PostgreSQL's text output (`2026-09-29 20:24:42.39+00`, `{a,b}`, …). Snapshot rows are encoded by `to_jsonb`, so timestamps are ISO 8601 (`2026-09-29T20:24:42.39+00:00`) and arrays are JSON arrays; numbers keep their exact digits there too. An unchanged TOASTed column is not sent: it is listed in `unchanged` and absent from `record`, and the client keeps its previous value. When `record` + `old` exceed `SLUICE_MAX_CHANGE_BYTES`, both are trimmed to the key columns and the event carries `"degraded": "change_too_large"`.
+
+### Initial snapshots
+
+With `initial: "snapshot"`, Sluice reads the rows itself in the same projection and filter, then keeps streaming, with no gap between the two:
+
+1. The subscription is registered, so every change dispatched from then on reaches it live.
+2. The replay floor is the reader's confirmed LSN, taken before the snapshot query: everything dispatched up to it is in the snapshot.
+3. One read-only query (under the caller's role and claims in RLS mode, so RLS applies) returns at most `SLUICE_SNAPSHOT_MAX_ROWS` rows, ordered by the key. Rows arrive as `change` events with `op: "INSERT"`, `snapshot: true` and `commit_lsn` = the floor, then `snapshot_end` (with `truncated: true` if more rows matched). See [Values](#values) for how their encoding differs from live changes.
+4. Buffered changes from the floor on are replayed, so a live change delivered before an older snapshot row arrives again after it.
+
+Duplicates are possible; clients upsert by primary key. At most `SLUICE_SNAPSHOT_MAX_CONCURRENT` snapshots run at once. A failure sends `snapshot_failed` (retryable).
+
+## Wire protocol
+
+All paths are under `SLUICE_PATH_PREFIX` (default `/sluice/v1`). Every endpoint except health checks and `/metrics` requires `Authorization: Bearer <jwt>`. JSON bodies are limited to 1 MiB (publish: `SLUICE_MAX_PAYLOAD_BYTES` plus envelope). Errors are `{"error": "<code>", "message": "…"}`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/stream` | open the SSE stream, optionally with subscriptions and a resume map |
+| `POST` | `/subscribe` | add subscriptions to a stream |
+| `POST` | `/unsubscribe` | remove subscriptions by label |
+| `POST` | `/publish` | broadcast to a joined channel |
+| `POST` | `/presence` | track, update or untrack presence on a joined channel |
+| `POST` | `/token` | rebind the stream to a refreshed token |
+| `POST` | `/admin/jwks/refresh` | refetch the JWKS (service_role) |
+| `POST` | `/admin/shapes/drop` | drop matching shapes (service_role or the issuer bearer) |
+| `GET` | `/healthz` | liveness; also served without the prefix |
+| `GET` | `/readyz` | readiness; also served without the prefix |
+| `GET` | `/metrics` | Prometheus, unauthenticated; also without the prefix (`SLUICE_METRICS_ENABLED`) |
+| `GET` | `/diagnostics` | configuration findings (service_role, `SLUICE_DIAGNOSTICS_ENABLED`) |
+
+The stream and every JSON response carry `Cache-Control: no-store` and `Vary: Authorization`.
+
+### Opening a stream
+
+```http
+POST /sluice/v1/stream
+Authorization: Bearer eyJ…
+Content-Type: application/json
+Accept: text/event-stream
+
+{ "subscriptions": [ { "sub": "docs", "shape": { … } },
+                     { "sub": "room", "channel": "room:42", "presence": true } ],
+  "resume": { "public.documents": "0/1A2B3C4" } }
 ```
 
-```ts
-import { createClient } from '@pauserratgutierrez/sluice-js'
-import type { Database } from './database.types'
+The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON) or `503 too_many_streams` (`SLUICE_MAX_STREAMS`). Closing the response is how a client leaves: everything the stream held, presence included, is released.
 
-const sluice = createClient<Database>('https://api.example.com/sluice/v1', {
-  accessToken: async () => (await supabase.auth.getSession()).data.session?.access_token,
-})
+Control requests name the stream with `stream_id` in the body, the `Sluice-Stream-Id` header, or both; if both are present and differ the request is rejected (`400 stream_id_mismatch`). The token must name the same `sub` and `role` as the stream (`403 forbidden`); stream ids are not secrets. A stream id from another process is `404 unknown_stream`.
 
-const docs = await sluice
-  .from('documents')
-  .eq('owner_id', userId)               // pins the policy column -> Tier A
-  .select('id', 'title', 'updated_at')
-  .withInitialSnapshot()
-  .on('*', ({ op, record }) => console.log(op, record?.title))
-  .subscribe()
+### Events
+
+Each event is an SSE frame `event: <name>` + `data: <one JSON line>`. A heartbeat comment `: hb` is written every `SLUICE_HEARTBEAT`.
+
+**`ready`** — first, always:
+
+```json
+{ "stream_id": "n1.1790…-7", "server_time": "…", "heartbeat_ms": 20000, "wal_lsn": "0/1A2B3C4",
+  "subscriptions": [
+    { "sub": "docs", "ok": true, "tier": "A", "indexed": true, "routing_key": "owner_id",
+      "reason": "predicate reduces to a constant over the shape and is stable", "warnings": [] },
+    { "sub": "room", "ok": true } ] }
 ```
 
-Full API, filters, broadcast, presence, and reconnection: [`packages/sluice-js/README.md`](packages/sluice-js/README.md).
+A subscription result has `sub`, `ok`, and then either an `error` (`{code, message}`) or: `tier` (RLS) or `oracle: "issuer"` and `filter` (issuer), `indexed`, `routing_key`, `reason`, `warnings`. The same warnings are also sent as `warning` events.
 
-### Wire protocol (any language)
+**`change`** — `id: <commit_lsn>:<seq>` (not on snapshot rows or `TRUNCATE`):
 
-One long-lived `POST` whose response is `text/event-stream`, plus short control POSTs. Over HTTP/2 that is **one connection**, not two: the stream is one multiplexed stream and each POST is another.
-
-```js
-const res = await fetch('/sluice/v1/stream', {
-  method: 'POST',
-  headers: {
-    Authorization: `Bearer ${accessToken}`,   // a header, not a query parameter
-    'Content-Type': 'application/json',
-    Accept: 'text/event-stream',
-  },
-  body: JSON.stringify({
-    subscriptions: [
-      { sub: 'docs', shape: {
-          schema: 'public', table: 'documents',
-          filter: `owner_id=eq.${userId}`,
-          columns: ['id', 'title', 'updated_at'],
-          transitions: true,
-      }},
-      { sub: 'room', channel: 'room:42', presence: true },
-    ],
-  }),
-})
+```json
+{ "sub": "docs", "op": "UPDATE", "schema": "public", "table": "documents",
+  "commit_lsn": "0/1A2B3C4", "commit_time": "…", "seq": 3,
+  "record": { "id": 91, "title": "Q3 plan" }, "old": { "id": 91 },
+  "unchanged": ["body"], "transition": "enter", "degraded": "change_too_large", "snapshot": true }
 ```
 
-Events arrive as named SSE frames:
+`op` is `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`; `record` is absent for `DELETE`; `old` is present when the WAL carried an old tuple; the last five fields appear only when they apply. `seq` increases per subscription.
 
-```
-event: ready
-data: {"stream_id":"n1.…","subscriptions":[{"sub":"docs","tier":"A","indexed":true,…}]}
+**`snapshot_end`** — `{ "sub", "rows", "floor_lsn", "truncated"? }`.
 
-event: change
-id: 1A2B/3C4D18:3
-data: {"sub":"docs","op":"UPDATE","record":{…},"old":{…},"unchanged":["body"]}
-```
+**`broadcast`** — `{ "sub", "channel", "event", "payload", "from"?, "origin": "client" | "database", "commit_lsn"?, "at" }`. `from` is the publisher's `sub`; `commit_lsn` is set for transactional database messages.
 
-Issuer mode sends `oracle:"issuer"` and the effective `filter` instead of `tier`.
+**`presence`** — `{ "sub", "channel", "type": "state", "members": { key: member } }` on join, then `{ …, "type": "diff", "joins"?: {…}, "leaves"?: {…} }`. A member is `{ "meta", "since", "ref" }`.
 
-`EventSource` is deliberately not used: it cannot set headers, cannot POST, and cannot change its subscription set without reconnecting. Those three limitations are the only reason realtime tokens ever travelled in URLs.
+**`warning`** — `{ "sub"?, "code", "message", "effect"?, "remedy"? }`.
 
-## Broadcast from the database, atomically
+**`error`** — `{ "sub"?, "code", "message", "retryable", "action"? }`. With `sub` it ends that subscription (or reports a retryable problem with it) and the stream continues; without `sub` the stream is closing.
+
+| Code | Where | Meaning |
+| --- | --- | --- |
+| `shape_not_authorized` | subscribe, later | denied, revoked by a policy change or `/token`, hold removed, or dropped by an operator |
+| `column_not_granted` | subscribe | the role may read none of the requested columns |
+| `policy_requires_impersonation` | subscribe | Tier C with `SLUICE_TIER_C=deny` |
+| `relation_not_published`, `relation_unpublished` | subscribe, later | the table (or a hold table) is not, or no longer, in the publication |
+| `invalid_filter`, `invalid_columns`, `invalid_ops`, `invalid_subscription` | subscribe | malformed request |
+| `duplicate_sub`, `too_many_subscriptions`, `too_many_shapes`, `too_many_unindexed_shapes` | subscribe | limits |
+| `replica_identity_insufficient` | subscribe | `SLUICE_REPLICA_IDENTITY=strict` |
+| `unknown_namespace`, `channel_not_authorized` | subscribe | channel refused |
+| `resume_too_old` | subscribe, after a snapshot | the position is no longer buffered; `action: "resnapshot"` |
+| `invalid_resume`, `snapshot_failed`, `internal` | subscribe | as named |
+| `stream_lagging` | stream | the client did not keep up; `action: "resnapshot"` |
+| `token_expired`, `session_revoked`, `user_banned` | stream | the identity behind the stream is gone |
+
+Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insufficient`, `replica_identity_full_with_toast`, `replica_identity_broken`, `snapshot_disabled`, `schema_changed`.
+
+### Control requests
+
+| Request body | Response |
+| --- | --- |
+| `/subscribe` `{ "stream_id", "subscriptions": [ … ] }` | `{ "results": [ … ] }`; `429 rate_limited` past `SLUICE_SUBSCRIBE_RATE`/s |
+| `/unsubscribe` `{ "stream_id", "subs": ["docs"] }` | `{ "removed": n }` |
+| `/publish` `{ "stream_id", "channel", "event", "payload", "self" }` | `{ "delivered": n }`; `403 channel_not_subscribed`, `413 payload_too_large`, `429 rate_limited` |
+| `/presence` `{ "stream_id", "channel", "action": "track" \| "update" \| "untrack", "meta" }` | `{ "ok": true }`; `403 presence_key_not_allowed`, `403 channel_not_subscribed`, `429 rate_limited`, `429 presence_too_many_keys` |
+| `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch` |
+
+`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape); channels are not re-checked.
+
+### Resume
+
+A client that reconnects sends `resume: { "schema.table": "<commit_lsn>" }` with the last commit LSN it saw per table. For each shape on that table Sluice replays, from its in-memory buffer, every change whose commit LSN is **at or after** that position, re-filtered and re-authorized; the snapshot is skipped. The buffer holds up to `SLUICE_RING_EVENTS` changes per table since this process started replicating; entries older than `SLUICE_RING_MAX_AGE` are swept, except each table's newest transaction. A position the buffer cannot cover — older than what it holds, or from before this process started — returns `resume_too_old` (`action: "resnapshot"`); the subscription is live, but the client must discard its state and resubscribe (for example with a snapshot). Broadcasts, presence and `TRUNCATE` are not replayed.
+
+## Channels: broadcast and presence
+
+A channel is `namespace:name`; the namespace is everything before the first `:`. Each namespace is declared in `SLUICE_CHANNELS` as `namespace:mode[:hook_url]`, comma-separated (default `room:public`). An undeclared namespace is refused, never public. The mode decides who may **join**; publishing and presence only require that the stream joined.
+
+| Mode | Who may join |
+| --- | --- |
+| `public` | any valid token |
+| `owner` | a token whose `sub` the channel name ends with, after a `:` (`notify:<sub>`) |
+| `hook` | whoever your endpoint allows |
+
+**Hook.** Sluice POSTs `{ "action": "subscribe", "channel", "namespace", "role", "sub", "session_id", "claims" }` to the namespace's URL, with `Authorization: Bearer <SLUICE_CHANNEL_HOOK_BEARER>` when that variable is set, and caches the verdict per URL, channel, role, sub and session. Redirects are not followed.
+
+| Response | Verdict | Cached for |
+| --- | --- | --- |
+| `2xx` `{ "allow": true \| false, "reason"?, "ttl"? }` | as returned | `ttl` seconds, else `SLUICE_CHANNEL_HOOK_TTL` |
+| `403` | deny | `SLUICE_CHANNEL_HOOK_TTL` |
+| `401` (Sluice's credential rejected), other status, unreadable body, timeout (`SLUICE_CHANNEL_HOOK_TIMEOUT`) | deny | 2 s |
+
+**Broadcast from clients.** `POST /publish` delivers `payload` to every stream that joined the channel (the sender too with `self: true`) and returns how many streams it was queued on. At most `SLUICE_PUBLISH_RATE` per second per stream, `SLUICE_MAX_PAYLOAD_BYTES` per payload.
+
+**Broadcast from the database.** A logical message whose prefix starts with `SLUICE_MESSAGE_PREFIX` is delivered to the channel named by the rest of the prefix, in commit order with the changes around it:
 
 ```sql
 BEGIN;
   UPDATE orders SET status = 'paid' WHERE id = 1;
-  SELECT pg_logical_emit_message(true, 'sluice:orders:1', '{"event":"paid"}');
+  SELECT pg_logical_emit_message(true, 'sluice:orders:1', '{"event":"paid","payload":{"id":1}}');
 COMMIT;
 ```
 
-Both arrive on the same slot, in transaction order. Roll back and the message never existed — the dual-write problem solved with no outbox table, no retention policy, and no janitor. Needs one grant:
+A transactional message (`true`) exists only if the transaction commits. Content that is JSON is the payload; if it is an object with an `event` field it is an envelope (`event` names the broadcast, `payload` is the payload); anything else is sent as a JSON string. The default event name is `message`.
+
+**Presence.** Keyed membership held in memory, last write wins. The key is always the token's `sub`, so presence needs a token with one; `key` in the request may only repeat it. `track`/`update` set the key's `meta`; `untrack` removes it; closing the stream or unsubscribing from the channel removes every key it tracked. Joins and leaves are coalesced into one `diff` per channel every `SLUICE_PRESENCE_BROADCAST` and sent to every stream that joined the channel; a stream that joined with `presence: true` first receives the full `state`. At most `SLUICE_PRESENCE_RATE` requests per `SLUICE_PRESENCE_WINDOW` per stream and `SLUICE_PRESENCE_MAX_KEYS` keys per channel. Two streams of the same user share one key.
+
+## Session revocation
+
+Optional (`SLUICE_REVOCATION_ENABLED`), for GoTrue-style auth schemas. Add the tables to the publication:
 
 ```sql
-GRANT EXECUTE ON FUNCTION pg_logical_emit_message(boolean, text, text) TO your_app_role;
+ALTER PUBLICATION sluice ADD TABLE auth.sessions, auth.users;
 ```
+
+A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `session_id` claim) closes every stream holding that session with `session_revoked`. An `UPDATE` on `SLUICE_REVOCATION_USERS_TABLE` that leaves `banned_until` non-null closes the user's streams with `user_banned`. Revoked sessions and users are remembered for two hours: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
+
+Streams are also closed with `token_expired` at the first heartbeat after the token's `exp`.
+
+## Delivery guarantees and backpressure
+
+- **At least once.** PostgreSQL may re-send transactions after a restart, resumes replay whole transactions, and snapshots overlap the live stream. Clients upsert by primary key.
+- **Order.** Changes reach a stream in commit order; the queue is never reordered.
+- **Per-stream queue** (`SLUICE_STREAM_QUEUE` events). When it is full, a `change` or `snapshot_end` closes the stream with `stream_lagging` (the client resumes or resnapshots); any other event is dropped and counted in `sluice_stream_dropped_events_total`. Each write is bounded by `SLUICE_WRITE_TIMEOUT`; a stream that cannot be written is closed.
+- **Replication backpressure.** The reader dispatches every change before it acknowledges the transaction, and acknowledges only committed, dispatched positions (every `SLUICE_STATUS_INTERVAL` and when the server asks). Between transactions it acknowledges the server's WAL end, so a quiet publication does not hold WAL back. A slow dispatch — Tier C probes, Tier B cross-checks, a full queue closing streams — delays the slot, and PostgreSQL retains WAL up to `max_slot_wal_keep_size`.
 
 ## Operating it
 
-```bash
-curl -H "Authorization: Bearer $SERVICE_ROLE_KEY" localhost:4000/sluice/v1/diagnostics
-```
+**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded and this process is streaming from the slot; its body reports `catalog_loaded`, `replicating`, `streams` and `confirmed_lsn`.
+
+**One reader per slot.** At startup a process takes a session advisory lock keyed by the slot name (on a pool connection it keeps for its lifetime). A second process with the same slot stands by: it retries every 5 seconds, reports `503` on `/readyz`, and starts replicating when the lock is released. The slot itself allows only one streaming connection. The standby does not share the load; a takeover is a reconnect of every client.
+
+**Startup validation.** Sluice refuses to start when:
+
+- `wal_level` is not `logical`;
+- no replication slot is free for a slot that does not exist yet;
+- the publication is missing or has a row filter;
+- a published table that publishes `UPDATE`/`DELETE` has an inadequate replica identity (`USING INDEX` on a dropped index, `DEFAULT` without a primary key, `NOTHING`), which is already breaking the application's writes;
+- (RLS mode) a role in `SLUICE_ALLOWED_ROLES` does not exist, or `sluice_authz` cannot assume one that does not bypass RLS;
+- (issuer mode) the pool role lacks `SELECT` or the RLS bypass on a published table;
+- the JWKS cannot be fetched or has no usable key for the pinned algorithm.
+
+It starts with a warning, kept in `/diagnostics`, for: `max_slot_wal_keep_size = -1` (`unbounded_wal_retention`), a non-zero `idle_replication_slot_timeout` (`idle_slot_timeout`), published tables without a primary key (`no_primary_key`), a replication role without `REPLICATION` (`replication_role_attribute`), and a `BYPASSRLS` allowed role `sluice_authz` cannot assume (`role_not_assumable`). A JWKS that contains symmetric keys is logged; they are never loaded.
+
+**`GET /diagnostics`** (service_role):
 
 ```json
-{
-  "oracle": "rls",
-  "slot": { "active": true, "retained_bytes": 1280, "wal_status": "reserved" },
-  "replication_options": { "proto_version": 4, "streaming": "off", "binary": false },
-  "warnings": [
-    { "code": "tier_c_policy", "severity": "high",
-      "relation": "public.invoices", "policy": "invoices_team_member",
-      "reason": "contains a subquery (EXISTS (SELECT ...)), which cannot be evaluated against the WAL tuple",
-      "impact": "measured at roughly 13 microseconds per subscriber per change, which caps throughput near 100 changes/sec at 1,000 subscribers",
-      "remedy": "denormalise the joined column onto public.invoices so the policy becomes a direct comparison …" }
-  ]
-}
+{ "oracle": "rls",
+  "slot": { "name": "sluice", "active": true, "wal_status": "reserved", "retained_bytes": 8048,
+            "confirmed_lsn": "0/80551F8", "received_lsn": "0/80551F8" },
+  "subscriptions": { "total": 3, "streams": 2, "relations": 2, "unindexed": 1,
+                     "by_tier": { "A": 2, "B": 1, "C": 0 } },
+  "publication": { "name": "sluice", "tables": 12 },
+  "replication_options": { "proto_version": 4, "messages": true },
+  "warnings": [ { "code": "tier_c_policy", "severity": "high", "relation": "public.invoices",
+                  "policy": "invoices_team_member", "reason": "…", "impact": "…", "remedy": "…" } ] }
 ```
 
-Every warning carries a remedy that is a runnable statement. In issuer mode `/diagnostics` reports `oracle=issuer` (holds, URL) and does not treat RLS policies as the judge. The metric to alert on in RLS mode is `sluice_authz_tier_c_probes_total`.
+Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers. Warning codes, besides the startup ones: `replica_identity_broken`, `replica_identity_full_with_toast`, `policy_unparseable`, `policy_applies_to_public`, `policy_function_not_wrapped`, `unindexed_policy_column`, `tier_c_policy`, `tier_c_subscriptions` (RLS), `hold_replica_identity` (issuer), `unindexed_shape`.
 
-## Measured behaviour
+**Metrics** (`/metrics`, Prometheus). The one to alert on is `sluice_authz_tier_c_probes_total`; `sluice_authz_downgrades_total` should always be 0.
 
-The design claim is that dispatch cost is flat in subscriber count. Measured on the harness, delivering the same 20 changes:
+| Metric | Labels |
+| --- | --- |
+| `sluice_wal_lsn` (gauge), `sluice_wal_lag_bytes`, `sluice_slot_retained_bytes` | `kind` = received, confirmed |
+| `sluice_wal_messages_total` | `type` |
+| `sluice_reader_reconnects_total`, `sluice_reader_is_leader` | |
+| `sluice_changes_total` | `schema`, `table`, `op` |
+| `sluice_change_dispatch_seconds`, `sluice_routing_candidates` (histograms) | `schema`, `table` |
+| `sluice_toast_unchanged_total` | `schema`, `table`, `column` |
+| `sluice_changes_truncated_total` | `schema`, `table` |
+| `sluice_subscriptions` (gauge) | `schema`, `table`, `tier`, `indexed` |
+| `sluice_authz_resolutions_total` | `tier`, `result` = granted, denied, refused |
+| `sluice_authz_resolve_seconds` | `tier` |
+| `sluice_authz_tier_c_probes_total`, `sluice_authz_tier_c_withheld_total`, `sluice_authz_downgrades_total` | `schema`, `table` |
+| `sluice_authz_compile_failures_total` | `schema`, `table`, `reason` |
+| `sluice_authz_unknown_total` | `schema`, `table`, `op` |
+| `sluice_authz_lease_refreshes_total` | `result` = held, revoked |
+| `sluice_streams` (gauge) | |
+| `sluice_stream_dropped_events_total` | `kind` |
+| `sluice_stream_closed_total` | `reason` |
+| `sluice_broadcast_published_total` | `namespace`, `origin` |
+| `sluice_presence_updates_total` | `namespace`, `action` |
+| `sluice_snapshot_seconds`, `sluice_snapshot_rows_total` | `schema`, `table` |
+| `sluice_revocations_total` | `source` = session, ban |
+| `sluice_config_warnings` (gauge, 1 per active `/diagnostics` warning) | `code` |
 
-| Subscribers | Events delivered | Wall time | Events/s |
-| --- | ---: | ---: | ---: |
-| 100 | 2,000 | 349 ms | 5,727 |
-| 400 | 8,000 | 359 ms | 22,297 |
-| 1,000 | 20,000 | 359 ms | 55,722 |
+The slot and warning metrics refresh every `SLUICE_CATALOG_REFRESH`.
 
-Wall time is constant; only the event count scales. That table is a small fan-out through the local harness.
+**Failures.**
 
-Independent numbers against the published image live in [`apps/loadtest`](apps/loadtest/README.md). On that laptop Docker run, 20 changes still took ~410 ms out to 1,600 subscribers (78k events/s). 28,000 streams opened and delivered every event; past ~3,000 the wall clock grows because the process is flushing SSE, not because authorization got more expensive. End-to-end latency from `INSERT` to a browser event, through Caddy: **48 ms**.
+- **PostgreSQL restart or dropped replication connection:** the reader reconnects with backoff (1 s, doubling to about 30 s) from the slot's confirmed position; streams stay open.
+- **Slot invalidated:** the reader stops and the process exits, because resuming would hide a gap. Recreate the slot; clients must resnapshot.
+- **Sluice restart:** streams are closed; clients reconnect, and their resume positions are no longer buffered, so they resnapshot.
+- **A table leaves the publication:** its shapes are dropped with `relation_unpublished`.
+- **A table's definition changes:** its subscriptions get `schema_changed`; dropped columns disappear from events, and new columns are not added until the client resubscribes.
 
-For comparison, `supabase/realtime`'s published figure for the RLS path is 5 database changes per second at 4,000 subscribers, because it authorizes every change against every subscriber.
+**Logs** are `log/slog`, JSON by default (`SLUICE_LOG_FORMAT=text` for text). Sluice does not log tokens, claims or row data.
 
-## What's left before production
+## Security model
 
-Sluice is a working prototype with good test coverage, not production software. In rough order of importance:
+- **Tokens.** The algorithm is pinned (`SLUICE_JWT_ALG`, ES256 or RS256; HS256 is not offered), `exp` is required, the `role` must be in `SLUICE_ALLOWED_ROLES`, `iss` is checked when `SLUICE_JWT_ISSUER` is set, and `aud` for tokens that have a `sub`. `sb_*` opaque keys are refused. The JWKS is refetched every `SLUICE_JWKS_REFRESH` (checked on the catalog tick), on `POST /admin/jwks/refresh`, and when a token names an unknown `kid`, at most once every 10 seconds.
+- **No tokens in URLs.** The stream is a `POST`, so the token is always a header.
+- **Stream ownership.** A control request must carry a token with the stream's `sub` and `role`; a header/body disagreement on the stream id is rejected.
+- **Least data.** Filters only narrow what the oracle grants; projections are intersected with grants; undecidable changes are withheld; a failed catalog refresh keeps the previous state rather than widening it.
+- **Shared secrets.** `SLUICE_ISSUER_BEARER` authenticates Sluice to the issuer, `SLUICE_CHANNEL_HOOK_BEARER` to hook endpoints. Neither is a user credential, and neither client follows redirects, so neither secret is resent elsewhere.
+- **What `sluice_repl` sees.** Everything published, regardless of RLS. `REPLICA IDENTITY FULL` also puts every old column in the stream Sluice reads, so keep replica identities narrow where you can.
+- **Unauthenticated endpoints.** `/healthz`, `/readyz` and `/metrics` (which exposes table and namespace names); restrict them at the gateway if that matters.
 
-1. **Run it against a copy of your real schema and traffic.** Everything measured so far uses fixtures designed to exercise each RLS tier. Your policies (or your issuer) are the variable that matters; `/diagnostics` will tell you which RLS policies fall to Tier C.
-2. **Operational burn-in.** Kill the database mid-stream, fill the slot, restart under load, run for a week. The failure paths are implemented and reasoned about, but they have not been exercised for days at a time.
-3. **A CI pipeline.** Build, vet, `-race` tests, and the harness smoke suite on every push. None of that exists yet.
-4. **An open-source license** (SDK is still `UNLICENSED`).
-5. **Horizontal scale**, if you need more than one node: the `Bus` seam is designed ([design doc](design_doc.md) §22) but not built.
-6. **Backup/restore and slot lifecycle runbooks.** An invalidated slot is a deliberate hard stop; the recovery procedure should be written down before you need it.
+## Configuration reference
 
-Published artifacts are already cut from `v*.*.*` tags: the runtime image on GHCR (`ghcr.io/pauserratgutierrez/sluice`) and the SDK on npm. How to release is in [`MAINTENANCE.md`](MAINTENANCE.md).
+Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable template is [`deploy/sluice.env.example`](deploy/sluice.env.example).
 
-## Layout
+| Variable | Default | |
+| --- | --- | --- |
+| `SLUICE_LISTEN_ADDR` | `0.0.0.0:4000` | |
+| `SLUICE_PATH_PREFIX` | `/sluice/v1` | |
+| `SLUICE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `SLUICE_LOG_FORMAT` | `json` | or `text` |
+| `SLUICE_NODE_ID` | hostname | prefixes stream ids |
+| `SLUICE_SHUTDOWN_GRACE` | `15s` | |
+| `SLUICE_DB_REPL_URL` | required | must include `replication=database` |
+| `SLUICE_DB_AUTHZ_URL` | required | must not |
+| `SLUICE_DB_POOL_MAX_CONNS` / `_MIN_CONNS` | `8` / `2` | the reading process keeps one for its lock |
+| `SLUICE_PARANOID_POOL_RESET` | `false` | `DISCARD ALL` on every returned connection |
+| `SLUICE_SLOT_NAME` / `SLUICE_PUBLICATION` | `sluice` / `sluice` | |
+| `SLUICE_PROTO_VERSION` | `4` | 1–4 |
+| `SLUICE_MESSAGES` | `true` | deliver `pg_logical_emit_message` |
+| `SLUICE_STATUS_INTERVAL` | `10s` | slot acknowledgement interval |
+| `SLUICE_MESSAGE_PREFIX` | `sluice:` | must not be empty |
+| `SLUICE_RING_EVENTS` / `SLUICE_RING_MAX_AGE` | `4096` / `60s` | resume buffer per table |
+| `SLUICE_JWKS_URL` | required | |
+| `SLUICE_JWKS_REFRESH` | `5m` | |
+| `SLUICE_JWT_ALG` | `ES256` | or `RS256` |
+| `SLUICE_JWT_ISSUER` | empty | not checked when empty |
+| `SLUICE_JWT_AUDIENCE` | `authenticated` | |
+| `SLUICE_JWT_LEEWAY` | `10s` | |
+| `SLUICE_ALLOWED_ROLES` | `anon,authenticated,service_role` | |
+| `SLUICE_SHAPE_ORACLE` | `rls` | or `issuer` |
+| `SLUICE_ISSUER_URL` / `SLUICE_ISSUER_BEARER` | empty | required in issuer mode |
+| `SLUICE_ISSUER_TIMEOUT` | `2s` | |
+| `SLUICE_AUTHZ_LEASE` | `60s` | re-check of time-dependent and Tier C decisions |
+| `SLUICE_CATALOG_REFRESH` | `30s` | catalog, lease, JWKS and health tick |
+| `SLUICE_TIER_C` | `allow` | or `deny` |
+| `SLUICE_TIER_C_MAX_PROBES_PER_SECOND` | `2000` | per process |
+| `SLUICE_TIER_B_VERIFY` | `5` | cross-checks per Tier B subscription; 0 disables |
+| `SLUICE_UNINDEXED_SHAPES_MAX` | `200` | per process |
+| `SLUICE_REPLICA_IDENTITY` | `warn` | or `strict` |
+| `SLUICE_DEGRADED_DELETES` | `withhold` | or `deliver` |
+| `SLUICE_SNAPSHOT_ENABLED` | `true` | |
+| `SLUICE_SNAPSHOT_MAX_CONCURRENT` / `_MAX_ROWS` | `4` / `50000` | |
+| `SLUICE_HEARTBEAT` | `20s` | at least 5 s |
+| `SLUICE_STREAM_QUEUE` | `256` | events per stream |
+| `SLUICE_WRITE_TIMEOUT` | `10s` | per event |
+| `SLUICE_MAX_STREAMS` | `50000` | per process |
+| `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
+| `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |
+| `SLUICE_SUBSCRIBE_RATE` / `SLUICE_PUBLISH_RATE` | `20` / `100` | per second per stream |
+| `SLUICE_PRESENCE_RATE` / `SLUICE_PRESENCE_WINDOW` | `5` / `30s` | per stream |
+| `SLUICE_PRESENCE_BROADCAST` | `1500ms` | diff interval |
+| `SLUICE_PRESENCE_MAX_KEYS` | `10` | per channel |
+| `SLUICE_CHANNELS` | `room:public` | `namespace:mode[:hook_url]`, comma-separated |
+| `SLUICE_CHANNEL_HOOK_TTL` / `_TIMEOUT` | `60s` / `2s` | |
+| `SLUICE_CHANNEL_HOOK_BEARER` | empty | sent only when set |
+| `SLUICE_REVOCATION_ENABLED` | `false` | |
+| `SLUICE_REVOCATION_SESSIONS_TABLE` / `_USERS_TABLE` | `auth.sessions` / `auth.users` | |
+| `SLUICE_METRICS_ENABLED` / `SLUICE_DIAGNOSTICS_ENABLED` | `true` / `true` | |
+
+## Clients
+
+- **JavaScript/TypeScript:** [`@pauserratgutierrez/sluice-js`](packages/sluice-js/README.md), typed against the same generated `Database` types as a PostgREST client, with reconnect and resume built in.
+- **Anything else:** the [wire protocol](#wire-protocol) is plain HTTP. Read the stream with a streaming `fetch` (or equivalent), not `EventSource`, which cannot send an `Authorization` header or a request body.
+
+## Development and testing
+
+```bash
+go vet ./... && go test ./...        # unit tests (CI on release tags also runs -race)
+cd packages/sluice-js && npm test    # SDK unit and type-level tests
+```
+
+End-to-end suites run on the harness network. Build a tool, then run it with the database password:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 golang:1.26-alpine go build -o .bin/smoke ./cmd/smoke
+docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
+  -e POSTGRES_PASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)" alpine:3.22 /b/smoke
+```
+
+| Tool | What it checks |
+| --- | --- |
+| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, evaluator vs PostgreSQL, security negatives, a small fan-out |
+| `cmd/smoke-issuer` | the issuer process: grants, narrowing, hold cut, `/token` refresh (run after `cmd/smoke`) |
+| `cmd/audit` | a broad policy spectrum, DML and WAL edge cases, revocation, `/diagnostics`; needs `SERVICE_ROLE_KEY` and writes a JSON report to `/out` |
+| `cmd/load` | a fan-out soak on the harness (`LOAD_SCENARIO`, `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`) |
+| `node packages/sluice-js/test/live.mjs [baseUrl]` | the built SDK through the gateway |
+| [`apps/loadtest`](apps/loadtest/README.md) | capacity hunts against a published image, with its own compose stack |
+
+The harness applies `deploy/db/fixtures.sql`, `issuer_fixtures.sql` and `audit_fixtures.sql` on every `up`. Releases (image and SDK, from `v*.*.*` tags) are described in [MAINTENANCE.md](MAINTENANCE.md).
+
+## Repository layout
 
 ```
-cmd/sluice          the server
-cmd/keygen          harness secrets and ES256 API keys
-cmd/smoke           end-to-end validation (~36 assertions)
-cmd/smoke-issuer    issuer-oracle overlay (separate binary; does not replace the 36)
-cmd/issuer-stub     harness HTTP issuer used by cmd/smoke-issuer
-cmd/audit           production-readiness battery
-cmd/load            realtime stress probe against the local harness
-internal/expr       the expression engine: parse, analyze, fold, reduce, evaluate
-internal/authz      the three-tier authorization model (RLS oracle)
-internal/oracle     shape oracle: rls wrapper and issuer HTTP client
-internal/hold       issuer hold index, EXISTS, WAL cut
-internal/auth       JWT/JWKS verification and session revocation
-internal/pgoutput   the logical replication decoder (owns the 'u' marker)
-internal/reader     the single replication connection and LSN feedback
-internal/catalog    cached policies, grants, replica identity, index coverage
-internal/shape      filter grammar, narrowing, and routing-key selection
-internal/registry   the constant-indexed subscription index
-internal/hub        streams, fan-out, ring buffers, presence
-internal/server     HTTP surface, SSE, dispatch, snapshots, hooks, diagnostics
-internal/timer      shared jittered wheel: one timer for every stream on the node
+cmd/sluice          the server: wiring, startup validation, reader lock
+cmd/smoke           end-to-end RLS checks
+cmd/smoke-issuer    end-to-end issuer checks
+cmd/issuer-stub     the harness issuer
+cmd/audit           broad audit battery
+cmd/load            fan-out soak
+cmd/keygen          harness secrets and ES256 keys
+internal/config     environment parsing and validation
+internal/reader     the replication connection and slot acknowledgement
+internal/pgoutput   pgoutput decoding (including the unchanged-TOAST marker)
+internal/catalog    policies, roles, grants, replica identity, indexes
+internal/expr       policy and filter expressions: convert, analyze, fold, evaluate
+internal/authz      the RLS tiers, probes, cross-checks and leases
+internal/oracle     the rls and issuer oracles
+internal/hold       issuer hold watches
+internal/shape      filter grammar, narrowing, routing key
+internal/registry   the subscription routing index
+internal/hub        streams, channels, presence, resume buffer, rate limits
+internal/server     HTTP surface, dispatch, snapshots, hooks, diagnostics
+internal/auth       JWT verification and revocation
+internal/timer      the shared heartbeat wheel
 internal/metrics    Prometheus collectors
-internal/config     env parsing and defaults
-internal/event      shared event types
-deploy/             compose harness: db bootstrap, fixtures, Caddy; sluice.env.example lists every runtime SLUICE_* knob
-apps/loadtest       independent Docker load-test against ghcr.io/.../sluice:0.1.4 (changes, broadcast, presence, mixed, hold kick)
-packages/sluice-js  the typed TypeScript client
-design_doc.md       full design: protocol, authz tiers, config, failure modes
-MAINTENANCE.md      how to cut image and SDK releases
+internal/event      wire event types
+deploy/             compose harness, database bootstrap and fixtures, Caddy, env template
+packages/sluice-js  TypeScript client
+apps/loadtest       independent load test of a published image
 ```
-
-## Design decisions
-
-The full rationale lives in [`design_doc.md`](design_doc.md). The short version:
-
-- **`proto_version = 4`, `streaming = off`, `binary = false`.** All three look arbitrary and are not. The negotiated protocol version alone changes nothing on the wire (verified: 1, 4 and 4+parallel produce byte-identical output); the *options* determine the message set. `streaming = off` means everything received is already committed, so the reader forwards immediately and holds no buffer. And `binary = true` was measured **larger** than text (112 vs 88 bytes) while requiring per-type decoders.
-- **`REPLICA IDENTITY USING INDEX`, not `FULL`.** A unique index on `(filter columns…, pk)` puts the columns you filter on into old tuples at ~1/15 the WAL cost and ~1/3200 the message size of `FULL`, which inlines entire TOASTed values on every update.
-- **No `LISTEN/NOTIFY`.** Identical payloads in one transaction are silently deduplicated, throughput collapses 32× at 100 idle listeners on PostgreSQL 18, and a disconnected listener misses everything permanently.
-- **PostgreSQL's grammar, Sluice's semantics.** Policy text is parsed by [`pgplex/pgparser`](https://github.com/pgplex/pgparser), a pure-Go port of PostgreSQL's `gram.y` — no cgo, no `libpg_query`, still a static binary. Sluice does *not* maintain a grammar subset, because a missing production does not fail, it misparses: with no rule for `CURRENT_USER` a hand-written parser falls through to its identifier rule, and the resulting "column" the WAL can never supply withholds every row in silence. What Sluice does maintain is the set of parsed nodes it will evaluate, in `internal/expr/convert.go`, where a gap is structurally unrepresentable and reported by name.
-- **Fail closed everywhere.** An unrecognised expression node means Tier C, never Tier A. A value the WAL did not carry means *unknown*, never *visible*. Every operator the parser accepts is checked against the set the evaluator implements, because an operator that parses but cannot be evaluated would compile to a predicate that returns *unknown* for every row — withholding everything, silently, with nothing in `/diagnostics` to explain it.

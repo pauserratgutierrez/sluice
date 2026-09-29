@@ -9,6 +9,7 @@ package oracle
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -92,6 +93,28 @@ func New(cfg *config.Config, az *authz.Authorizer, cat *catalog.Cache) (Oracle, 
 	default:
 		return nil, fmt.Errorf("oracle: unknown SLUICE_SHAPE_ORACLE %q", cfg.ShapeOracle)
 	}
+}
+
+// projection is the column list a grant starts from: the requested columns (or
+// every column when none were requested) plus the relation's key columns, so
+// the client can identify each row. Column grants and an issuer allowlist are
+// intersected afterwards, so a key column the caller may not read is still
+// left out.
+func projection(rel *catalog.Relation, requested []string) []string {
+	if len(requested) == 0 {
+		out := make([]string, 0, len(rel.Columns))
+		for _, c := range rel.Columns {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+	out := make([]string, 0, len(requested)+len(rel.KeyColumns))
+	for _, c := range append(slices.Clone(requested), rel.KeyColumns...) {
+		if !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // grantedDecision is the internal no-op used in issuer mode so deliver can keep

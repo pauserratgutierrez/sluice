@@ -273,8 +273,7 @@ func compileTerm(t Term, col catalog.Column) (expr.Node, error) {
 // Preference order: an equality on a column that is BOTH indexed in PostgreSQL
 // and present in the replica identity (so DELETE events can be routed too),
 // then any indexed column, then any equality at all. Returning "" means the
-// shape is unindexed and will be scanned for every change to the relation --
-// exactly the case ElectricSQL measured at 140 changes/sec versus 5,000.
+// shape is unindexed and will be scanned for every change to the relation.
 func (f *Filter) RoutingKey(rel *catalog.Relation) string {
 	var indexedAndRI, indexed, any string
 	for col := range f.Equalities {

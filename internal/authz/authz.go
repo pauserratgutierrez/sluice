@@ -1,13 +1,11 @@
 // Package authz implements Sluice's three-tier authorization model.
 //
 // This is the core of the whole design. Authorization is resolved ONCE, at
-// subscribe time, into something that costs nothing per change. Measured on
-// PostgreSQL 18.4, the alternative -- per-subscriber impersonation, which is
-// what supabase/walrus does -- costs ~9-13 microseconds per subscriber per
-// change and caps at 108 changes/sec with 1,000 subscribers.
+// subscribe time, into something that costs nothing per change, instead of one
+// impersonated query per subscriber per change.
 //
 //	Tier A  the predicate reduces to a constant over the whole shape.
-//	        Decided once. Zero work per change, forever.
+//	        Decided once, in process. Zero work per change.
 //	Tier B  the predicate is row-dependent but compilable, so it is evaluated
 //	        in process against the tuple the WAL already delivered.
 //	        Zero database round trips.
@@ -262,7 +260,7 @@ func (a *Authorizer) Resolve(
 ) (*Decision, error) {
 
 	bypass := a.cat.BypassesRLS(id.Role)
-	pred, parseIssue, predSQL := rel.Predicate(id.Role, bypass)
+	pred, parseIssue, predSQL := rel.Predicate(id.Role, a.cat.MemberOf(id.Role), bypass)
 	d := &Decision{Predicate: pred, PredicateSQL: predSQL, verify: &verifyState{}}
 
 	// A role with BYPASSRLS, or a table without RLS, has nothing to evaluate.
@@ -550,16 +548,6 @@ func (a *Authorizer) Refresh(ctx context.Context, h *Handle, rel *catalog.Relati
 // Expired reports whether a leased decision is due for re-evaluation.
 func (d *Decision) Expired(now time.Time) bool {
 	return d.NeedsLease && !d.LeaseUntil.IsZero() && now.After(d.LeaseUntil)
-}
-
-// ParseClaims decodes a claim set into the form the evaluator wants, keeping the
-// raw JSON so that `current_setting('request.jwt.claims')` is byte-exact.
-func ParseClaims(raw []byte) (expr.Claims, string, error) {
-	var c expr.Claims
-	if err := json.Unmarshal(raw, &c); err != nil {
-		return nil, "", err
-	}
-	return c, string(raw), nil
 }
 
 func coveredBy(columns []string, equalities map[string]expr.Value) bool {

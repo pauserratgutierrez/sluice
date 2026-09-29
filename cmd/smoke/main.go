@@ -84,6 +84,22 @@ func main() {
 		"only the caller's own INSERT is delivered",
 		fmt.Sprintf("got %v", titles))
 
+	// documents uses REPLICA IDENTITY USING INDEX (owner_id, id), so an UPDATE
+	// that keeps both carries no old tuple. It is still an UPDATE, even on a
+	// subscription that asked for transitions.
+	mustExec(ctx, fmt.Sprintf(
+		`update documents set title = 'mine renamed' where owner_id = '%s' and title = 'mine'`, userID))
+	var updOp, updTransition string
+	for _, e := range stream.collect(3 * time.Second) {
+		var c changeEvent
+		if e.Name == "change" && json.Unmarshal(e.Data, &c) == nil && c.Sub == "docs" {
+			updOp, updTransition = c.Op, c.Transition
+		}
+	}
+	check(updOp == "UPDATE" && updTransition == "",
+		"an UPDATE that keeps the replica identity key arrives as an UPDATE",
+		fmt.Sprintf("got op=%q transition=%q", updOp, updTransition))
+
 	// ---- Tier B: row-dependent visibility --------------------------------
 	fmt.Println("\n-- Tier B (posts: visibility = 'public' OR owner_id = auth.uid()) --")
 	mustExec(ctx, fmt.Sprintf(
@@ -266,6 +282,41 @@ func main() {
 			fmt.Sprintf("snapshot=%d postgrest=%d", snapRows, restDocs))
 	}
 
+	// ---- resume -----------------------------------------------------------
+	// A reconnecting client resumes from the last commit it saw and must get the
+	// changes it missed with their original content -- even after the reader has
+	// decoded many unrelated messages since.
+	fmt.Println("\n-- resume --")
+	shapeReq := fmt.Sprintf(`{"subscriptions":[{"sub":"r","shape":{"table":"documents","filter":"owner_id=eq.%s"}}]`, userID)
+	first, err := openStream(ctx, tok, shapeReq+"}")
+	must(err, "open a stream to resume from")
+	_, _ = first.next(10 * time.Second)
+	for i := 1; i <= 3; i++ {
+		mustExec(ctx, fmt.Sprintf(
+			`insert into documents (owner_id, title, body) values ('%s', 'resume-%d', repeat('r', %d))`, userID, i, 40*i))
+	}
+	mustExec(ctx, `insert into documents (owner_id, title, body)
+	               select gen_random_uuid(), 'noise', repeat('z', 64) from generate_series(1, 50)`)
+	var from string
+	var live []string
+	for _, e := range first.collect(3 * time.Second) {
+		var c changeEvent
+		if e.Name == "change" && json.Unmarshal(e.Data, &c) == nil && c.Sub == "r" {
+			if from == "" {
+				from = c.CommitLSN
+			}
+			live = append(live, fmt.Sprint(c.Record["title"]))
+		}
+	}
+	first.Close()
+	resumed, err := openStream(ctx, tok, fmt.Sprintf(`%s,"resume":{"public.documents":%q}}`, shapeReq, from))
+	must(err, "open the resuming stream")
+	replayed := changeTitles(resumed.collect(3*time.Second), "r")
+	resumed.Close()
+	check(len(live) == 3 && slices.Equal(live, replayed),
+		"a resumed stream replays the missed changes with their original content",
+		fmt.Sprintf("live=%v replayed=%v", live, replayed))
+
 	// ---- deeper phases ----------------------------------------------------
 	phaseDifferential(ctx)
 
@@ -401,6 +452,7 @@ type changeEvent struct {
 	Sub        string         `json:"sub"`
 	Op         string         `json:"op"`
 	Table      string         `json:"table"`
+	CommitLSN  string         `json:"commit_lsn"`
 	Record     map[string]any `json:"record"`
 	Old        map[string]any `json:"old"`
 	Unchanged  []string       `json:"unchanged"`

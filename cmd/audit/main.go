@@ -1307,7 +1307,7 @@ func analyzeDiagnostics(d map[string]any) {
 func analyzeCodeFindings() {
 	flag("low", "owner_rls_bypass_not_modeled",
 		"A table owner's RLS bypass is not modeled in catalog.Predicate",
-		"BYPASSRLS and superuser are now read from pg_roles and short-circuit the predicate. The owner bypass (owner of a table without FORCE ROW LEVEL SECURITY) is not, because PostgreSQL decides it with has_privs_of_role, which means expanding role membership. It stays fail-closed, and in a Supabase layout the owner is a superuser anyway.")
+		"BYPASSRLS and superuser are read from pg_roles and short-circuit the predicate. The owner bypass (owner of a table without FORCE ROW LEVEL SECURITY) is not modeled. It stays fail-closed, and in a Supabase layout the owner is a superuser anyway.")
 
 	flag("medium", "column_grants_not_revocable",
 		"REVOKE SELECT (col) does not reach an open stream",
@@ -1321,13 +1321,9 @@ func analyzeCodeFindings() {
 		"No CI pipeline in the repository",
 		"Build, vet, -race and the harness suites all run by hand today. -race additionally needs CGO, which the Windows dev host does not have.")
 
-	flag("low", "sdk_unreleased",
-		"packages/sluice-js is still 0.0.0",
-		"No published versioned client or container image yet.")
-
 	flag("high", "no_horizontal_scale",
-		"Multi-node Bus not implemented",
-		"Single process, single slot. The advisory lock elects one reader, so a second node serves streams but cannot take over fan-out; a restart is a reconnect stampede.")
+		"One process serves all streams",
+		"Single process, single slot. A second process stands by for the reader lock and reports not ready until it takes over; it does not share the fan-out, and a takeover or restart is a reconnect of every client.")
 }
 
 // ---------------------------------------------------------------------------

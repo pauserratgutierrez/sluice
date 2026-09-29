@@ -1,15 +1,10 @@
-// Package timer provides a shared, jittered timer wheel.
+// Package timer provides a shared timer wheel.
 //
-// A `time.Ticker` per connection is the documented way to make a hundred thousand
-// connections expensive: every ticker is a runtime timer that must be inserted,
-// heap-managed and woken individually, and they all fire in lockstep. The wheel
-// replaces N timers with one, and spreads the work across the period so that a
-// hundred thousand heartbeats become a steady trickle rather than a spike every
-// twenty seconds.
-//
-// Go's stdlib hit the same class of problem with SO_KEEPALIVE on mobile
-// (golang/go#48622): it is not the work that hurts, it is waking everything at
-// once.
+// A `time.Ticker` per connection makes a hundred thousand connections expensive:
+// every ticker is a runtime timer that must be managed and woken individually.
+// The wheel replaces N timers with one, and spreads callbacks round-robin over
+// its buckets so that a hundred thousand heartbeats become a steady trickle
+// across the period rather than a spike.
 package timer
 
 import (

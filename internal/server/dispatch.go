@@ -51,6 +51,13 @@ func (r tupleRow) Column(name string) (expr.Value, bool) {
 	return expr.Null, false
 }
 
+// OnStart fixes the start of what the resume buffer can cover.
+func (s *Server) OnStart(lsn uint64) {
+	if lsn != 0 {
+		s.hub.Rings().SetStart(lsn)
+	}
+}
+
 func (s *Server) OnBegin(lsn uint64, commitTime time.Time, xid uint32) {
 	metrics.WALMessages.WithLabelValues("begin").Inc()
 }
@@ -69,9 +76,9 @@ func (s *Server) OnCommit(lsn uint64, commitTime time.Time) {
 // OnRelation reacts to a schema change.
 //
 // Because DDL is not replicated, a re-sent Relation message is the only in-band
-// signal that the schema moved. Sluice uses it to revalidate replica identity and
-// to invalidate the policy cache, and it tells affected subscriptions rather than
-// letting them quietly serve a stale projection.
+// signal that the schema moved. Sluice forces every subscription to be
+// re-resolved on the next catalog tick, and tells the affected subscriptions
+// rather than letting them quietly serve a stale projection.
 func (s *Server) OnRelation(old, nw *pgoutput.Relation) {
 	metrics.WALMessages.WithLabelValues("relation").Inc()
 
@@ -106,8 +113,9 @@ func (s *Server) OnRelation(old, nw *pgoutput.Relation) {
 		hub.SendWarning(streamOf(sub), event.Warning{
 			Sub:     sub.Label,
 			Code:    "schema_changed",
-			Message: "the definition of " + nw.FullName() + " changed; the projection and authorization for this subscription have been re-resolved",
-			Effect:  "columns that no longer exist are dropped from future events",
+			Message: "the definition of " + nw.FullName() + " changed; authorization for this subscription is re-resolved on the next catalog refresh",
+			Effect:  "columns that no longer exist are absent from future events; new columns are not added to the projection",
+			Remedy:  "resubscribe to pick up new columns",
 		})
 	}
 }
@@ -158,8 +166,9 @@ func (s *Server) OnMessage(m *pgoutput.Message, commitLSN uint64) error {
 		return nil
 	}
 
-	// A database-originated payload is trusted to be JSON but must not be able to
-	// corrupt the SSE frame if it is not.
+	// Content that is not JSON is delivered as a JSON string. A JSON object
+	// with an "event" field is an envelope: that field names the broadcast
+	// event and "payload", if present, becomes its payload.
 	payload := json.RawMessage(m.MessageContent)
 	if !json.Valid(payload) {
 		b, _ := json.Marshal(string(m.MessageContent))
@@ -183,11 +192,7 @@ func (s *Server) OnMessage(m *pgoutput.Message, commitLSN uint64) error {
 		lsn = reader.FormatLSN(commitLSN)
 	}
 	n := s.hub.PublishBroadcast(channel, evName, "", "database", lsn, payload, true, "")
-	ns := channel
-	if i := strings.IndexByte(channel, ':'); i >= 0 {
-		ns = channel[:i]
-	}
-	metrics.BroadcastPublished.WithLabelValues(ns, "database").Inc()
+	metrics.BroadcastPublished.WithLabelValues(namespaceOf(channel), "database").Inc()
 	if n == 0 {
 		s.log.Debug("database broadcast had no subscribers", "channel", channel)
 	}
@@ -240,20 +245,8 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	}
 
 	// Route on both tuples. Routing only on the new one would miss a row that
-	// left a shape, which is supabase/walrus#64 -- still open upstream.
-	candidates := s.reg.Candidates(rel.OID, func(col string) (expr.Value, bool) {
-		if v, ok := newRow.Column(col); ok {
-			return v, true
-		}
-		return oldRow.Column(col)
-	})
-	if m.Old != nil {
-		for _, extra := range s.reg.Candidates(rel.OID, oldRow.Column) {
-			if !slices.Contains(candidates, extra) {
-				candidates = append(candidates, extra)
-			}
-		}
-	}
+	// left a shape (supabase/walrus#64).
+	candidates := s.reg.Candidates(rel.OID, newRow.Column, oldRow.Column)
 	metrics.RoutingCandidates.WithLabelValues(rel.Namespace, rel.Name).Observe(float64(len(candidates)))
 
 	// Buffer for reconnect replay regardless of who is currently listening.
@@ -318,17 +311,27 @@ func (s *Server) deliver(
 		return
 	}
 
-	filterCtx := func(r tupleRow) *expr.Context {
-		return &expr.Context{Row: r, Claims: id.Claims, ClaimsJSON: id.ClaimsRaw, Now: time.Now()}
+	fctx := &expr.Context{Claims: id.Claims, ClaimsJSON: id.ClaimsRaw, Now: time.Now()}
+	visible := func(r tupleRow) (bool, bool) {
+		fctx.Row = r
+		return expr.Visible(sub.Filter.Node, fctx)
 	}
 
 	matchNew, unknownNew := false, false
 	if m.New != nil {
-		matchNew, unknownNew = expr.Visible(sub.Filter.Node, filterCtx(newRow))
+		matchNew, unknownNew = visible(newRow)
 	}
 	matchOld, unknownOld := false, false
-	if m.Old != nil {
-		matchOld, unknownOld = expr.Visible(sub.Filter.Node, filterCtx(oldRow))
+	switch {
+	case m.Old != nil:
+		matchOld, unknownOld = visible(oldRow)
+	case m.Type == pgoutput.MsgUpdate:
+		// No old tuple means the replica identity key did not change. The
+		// columns the filter reads may still have (only a replica identity
+		// that covers them would say), so presume the row was already in the
+		// shape: a matching row is an UPDATE, not an entry, and a leave cannot
+		// be detected -- which is what replica_identity_insufficient warns.
+		matchOld, unknownOld = matchNew, unknownNew
 	}
 
 	emitOp := op
@@ -393,7 +396,7 @@ func (s *Server) deliver(
 	// field read for this change has to belong to the same generation.
 	dec := sub.Decision.Load()
 	tier := dec.EffectiveTier()
-	visible, unknown := s.authz.Visible(s.ctx, dec, id, sub.Relation, authRow, authTuple)
+	allowed, unknown := s.authz.Visible(s.ctx, dec, id, sub.Relation, authRow, authTuple)
 	if tier == authz.TierC {
 		metrics.TierCProbes.WithLabelValues(rel.Namespace, rel.Name).Inc()
 		if unknown {
@@ -414,7 +417,7 @@ func (s *Server) deliver(
 		if !(s.cfg.DegradedDeletes == "deliver" && m.Type == pgoutput.MsgDelete) {
 			return
 		}
-	} else if !visible {
+	} else if !allowed {
 		return
 	}
 	degraded := ""
@@ -429,11 +432,11 @@ func (s *Server) deliver(
 	}
 
 	// One enormous row must not be able to evict a stream's whole queue. Trim to
-	// the replica identity so the client still learns which row changed and can
+	// the key columns so the client still learns which row changed and can
 	// refetch it, and say so rather than delivering a silently partial record.
 	if n := s.cfg.MaxChangeBytes; n > 0 && approxSize(rec)+approxSize(oldRec) > n {
-		rec = keyOnly(rec, sub.Relation.ReplicaIdentityColumns)
-		oldRec = keyOnly(oldRec, sub.Relation.ReplicaIdentityColumns)
+		rec = keyOnly(rec, sub.Relation.KeyColumns)
+		oldRec = keyOnly(oldRec, sub.Relation.KeyColumns)
 		unchangedNew = nil
 		degraded = "change_too_large"
 		metrics.ChangesTruncated.WithLabelValues(rel.Namespace, rel.Name).Inc()
@@ -457,13 +460,11 @@ func (s *Server) deliver(
 		ch.CommitTime = commitTime.UTC().Format(time.RFC3339Nano)
 	}
 
-	if !st.Send(event.Event{
+	st.Send(event.Event{
 		Kind: event.KindChange,
 		ID:   ch.CommitLSN + ":" + strconv.Itoa(ch.Seq),
 		Data: ch,
-	}) {
-		metrics.StreamDropped.WithLabelValues("change", st.CloseCode()).Inc()
-	}
+	})
 }
 
 func (s *Server) noteUnknown(rel *pgoutput.Relation, op string) {
@@ -536,17 +537,16 @@ func (s *Server) closeStreamsForUser(userID string) {
 	}
 }
 
-// project builds the emitted record, honouring the column projection and
-// reporting unchanged-TOAST columns explicitly.
+// project builds the emitted record from exactly the subscription's columns and
+// reports unchanged-TOAST columns explicitly. The key columns are already part
+// of the projection when the caller may read them (see the oracles); nothing
+// outside it is ever emitted, because the projection is what column grants and
+// an issuer allowlist were intersected into.
 func project(rel *pgoutput.Relation, t *pgoutput.Tuple, columns []string) (map[string]any, []string) {
 	if t == nil {
 		return nil, nil
 	}
-	want := map[string]bool{}
-	for _, c := range columns {
-		want[c] = true
-	}
-	out := make(map[string]any, len(t.Columns))
+	out := make(map[string]any, len(columns))
 	var unchanged []string
 
 	for i, col := range t.Columns {
@@ -554,9 +554,7 @@ func project(rel *pgoutput.Relation, t *pgoutput.Tuple, columns []string) (map[s
 			break
 		}
 		meta := rel.Columns[i]
-		// Replica identity columns are always included: without them the client
-		// cannot identify the row at all.
-		if len(want) > 0 && !want[meta.Name] && !meta.IsKey {
+		if !slices.Contains(columns, meta.Name) {
 			continue
 		}
 		switch col.Kind {
@@ -607,17 +605,20 @@ func keyOnly(rec map[string]any, keys []string) map[string]any {
 }
 
 // jsonValue converts a PostgreSQL text datum into a JSON-native value where that
-// is lossless, and leaves it as a string otherwise. Numerics that cannot be
-// represented exactly stay strings rather than silently losing precision.
+// is lossless, and leaves it as a string otherwise. Numbers are emitted as the
+// exact digits PostgreSQL produced, never round-tripped through float64, so a
+// numeric(20,2) keeps every digit; NaN and Infinity, which JSON cannot
+// represent, stay strings.
 func jsonValue(typeName, s string) any {
 	v := expr.ParseText(typeName, s)
 	switch v.Kind {
 	case expr.KindBool:
 		return v.Bool
-	case expr.KindInt:
-		return v.Int
-	case expr.KindFloat:
-		return v.Float
+	case expr.KindInt, expr.KindFloat:
+		if json.Valid([]byte(s)) {
+			return json.Number(s)
+		}
+		return s
 	case expr.KindJSON:
 		if json.Valid([]byte(v.Str)) {
 			return json.RawMessage(v.Str)

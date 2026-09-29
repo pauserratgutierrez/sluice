@@ -4,16 +4,13 @@
 // rather than the subscriber count. Subscriptions are indexed by the CONSTANT
 // their filter pins a column to, so a change is matched with a map lookup
 // instead of a scan.
-//
-// ElectricSQL measured the difference on the same workload: 1,400 changes/sec at
-// 10 shapes and 140 at 100 shapes without constant indexing, versus a flat
-// ~5,000 changes/sec at any shape count with it.
 package registry
 
 import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -30,6 +27,11 @@ type Sink interface {
 }
 
 // Subscription is one client interest in one relation.
+//
+// Once added to a Registry a Subscription is never modified, because dispatch
+// reads it without holding the registry lock: Rebind publishes a copy instead.
+// Only Decision (an atomic handle) and the event sequence change in place, and
+// both are safe for concurrent use.
 type Subscription struct {
 	// Label is the client-chosen name, unique within a stream.
 	Label string
@@ -47,22 +49,16 @@ type Subscription struct {
 	// unindexed and therefore scanned for every change to the relation.
 	RoutingKey string
 
-	// Warnings raised at subscribe time, replayed in the ready event.
-	Warnings []event.Warning
-
-	// Seq numbers change events within a commit so that (commit_lsn, seq) is a
-	// total order the client can dedupe against. At-least-once delivery is
-	// inherent to logical decoding -- PostgreSQL persists slot position only at
-	// checkpoint, so a crash can replay -- and this is what makes it tolerable.
-	seq int
+	// seq numbers the subscription's change events. It is shared by every copy
+	// Rebind makes, and advanced by the reader, snapshots and replays alike.
+	seq *atomic.Int64
 }
 
 // Indexed reports whether this subscription avoids the per-change scan.
 func (s *Subscription) Indexed() bool { return s.RoutingKey != "" }
 
-// NextSeq is called by the reader while holding no registry lock; each
-// subscription is only ever advanced by the single reader goroutine.
-func (s *Subscription) NextSeq() int { s.seq++; return s.seq }
+// NextSeq returns the next event sequence number for this subscription.
+func (s *Subscription) NextSeq() int { return int(s.seq.Add(1)) }
 
 // relIndex is the per-relation routing structure.
 type relIndex struct {
@@ -113,6 +109,9 @@ func (r *Registry) Add(s *Subscription) bool {
 	}
 	if _, exists := subs[s.Label]; exists {
 		return false
+	}
+	if s.seq == nil {
+		s.seq = new(atomic.Int64)
 	}
 	subs[s.Label] = s
 	r.indexRelLocked(s)
@@ -205,23 +204,26 @@ func (r *Registry) Get(streamID, label string) *Subscription {
 	return r.byStream[streamID][label]
 }
 
-// Rebind applies a new effective filter, projection, and routing key to a live
-// subscription under one lock. Remove+Add would leave an interval where
-// Candidates misses the shape (under-delivery) or, if a caller also swapped
-// holds across two lock acquisitions, a DELETE could miss the watch.
+// Rebind replaces a live subscription with a copy carrying a new effective
+// filter, projection, and routing key, under one lock. Remove+Add would leave an
+// interval where Candidates misses the shape (under-delivery) or, if a caller
+// also swapped holds across two lock acquisitions, a DELETE could miss the
+// watch. A change already being dispatched keeps the version it started with.
 func (r *Registry) Rebind(streamID, label string, filter *shape.Filter, columns []string) *Subscription {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	s := r.byStream[streamID][label]
-	if s == nil || filter == nil {
+	old := r.byStream[streamID][label]
+	if old == nil || filter == nil {
 		return nil
 	}
-	r.unindexRelLocked(s)
-	s.Filter = filter
-	s.Columns = append([]string(nil), columns...)
-	s.RoutingKey = filter.RoutingKey(s.Relation)
-	r.indexRelLocked(s)
-	return s
+	nu := *old
+	nu.Filter = filter
+	nu.Columns = append([]string(nil), columns...)
+	nu.RoutingKey = filter.RoutingKey(old.Relation)
+	r.unindexRelLocked(old)
+	r.byStream[streamID][label] = &nu
+	r.indexRelLocked(&nu)
+	return &nu
 }
 
 // RemoveStream drops everything a stream held. Called on disconnect, where the
@@ -259,14 +261,20 @@ func (r *Registry) StreamSubscriptions(streamID string) []*Subscription {
 	return out
 }
 
-// Candidates returns the subscriptions that could match a tuple, using the
+// Candidates returns the subscriptions that could match a change, using the
 // routing index.
 //
-// `lookup` reads a column value from the tuple. It returns known=false for
-// values the WAL did not carry, in which case that column's index cannot be
-// consulted and the subscriptions under it are added conservatively -- correctness
-// before speed, since the residual filter and the authorizer still run.
-func (r *Registry) Candidates(oid uint32, lookup func(column string) (v expr.Value, known bool)) []*Subscription {
+// Each lookup reads a column value from one tuple of the change -- the new and
+// the old one for an UPDATE, so a row leaving a shape is still routed to it. A
+// lookup returns known=false for a value the WAL did not carry. When no tuple
+// carries the routing column, its index cannot be consulted and every
+// subscription under it is added conservatively -- correctness before speed,
+// since the residual filter and the authorizer still run.
+//
+// Every subscription sits in exactly one list (one constant of its routing
+// column, or unindexed), and each list is added at most once, so the result
+// has no duplicates without needing a set.
+func (r *Registry) Candidates(oid uint32, lookups ...func(column string) (v expr.Value, known bool)) []*Subscription {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -275,32 +283,39 @@ func (r *Registry) Candidates(oid uint32, lookup func(column string) (v expr.Val
 		return nil
 	}
 
-	seen := make(map[*Subscription]bool, 8)
 	var out []*Subscription
-	add := func(list []*Subscription) {
-		for _, s := range list {
-			if !seen[s] {
-				seen[s] = true
-				out = append(out, s)
-			}
-		}
-	}
-
 	for col, byConst := range ri.byColumn {
-		v, known := lookup(col)
-		if !known {
-			// The routing column is absent (unchanged TOAST, or not in the
-			// replica identity for an old tuple). Fall back to considering every
-			// subscription indexed on this column.
-			for _, list := range byConst {
-				add(list)
+		var first string
+		found := false
+		for _, lookup := range lookups {
+			v, known := lookup(col)
+			if !known {
+				continue
 			}
-			continue
+			key := v.String()
+			if found && key == first {
+				continue
+			}
+			out = append(out, byConst[key]...)
+			if !found {
+				first, found = key, true
+			}
 		}
-		add(byConst[v.String()])
+		if !found {
+			for _, list := range byConst {
+				out = append(out, list...)
+			}
+		}
 	}
-	add(ri.unindexed)
-	return out
+	return append(out, ri.unindexed...)
+}
+
+// UnindexedCount is the number of subscriptions scanned for every change to
+// their relation.
+func (r *Registry) UnindexedCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.unindexedCount
 }
 
 // Stats describes the index, for metrics and diagnostics.

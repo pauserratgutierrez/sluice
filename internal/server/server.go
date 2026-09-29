@@ -1,16 +1,15 @@
 // Package server exposes Sluice's HTTP surface and wires the pieces together.
 //
-// The transport shape follows MCP's 2026-07-28 revision rather than its earlier
-// one, because MCP built the naive POST+SSE hybrid, hit the problems, and
-// documented them:
+// Transport rules:
 //
 //   - POST only. The long-lived stream is a POST whose response is
-//     text/event-stream, not an EventSource. That is what makes
-//     `Authorization: Bearer` possible and removes every token-in-URL hack.
-//   - Closing the stream IS the signal. No unsubscribe-on-disconnect message.
-//   - Routing metadata mirrored into headers, and REJECTED when it disagrees
-//     with the body -- a load balancer routing on the header while the server
-//     acts on the body is a real vulnerability class.
+//     text/event-stream, not an EventSource, so the token travels in
+//     `Authorization: Bearer` and never in a URL.
+//   - Closing the stream is the signal. There is no unsubscribe-on-disconnect
+//     message; everything the stream held is released when it closes.
+//   - The stream id may be mirrored into the Sluice-Stream-Id header, and a
+//     request whose header and body disagree is rejected, so an intermediary
+//     routing on the header cannot act on a different stream than the server.
 package server
 
 import (
@@ -20,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -76,6 +76,11 @@ type Server struct {
 	sessionsOID atomic.Uint32
 	usersOID    atomic.Uint32
 
+	// startupWarnings are the non-fatal findings of startup validation, kept so
+	// /diagnostics and sluice_config_warnings report them for the process's
+	// whole life.
+	startupWarnings []Diagnostic
+
 	// holdExists, if set, replaces hold.Exists. Tests inject it so /token can
 	// verify holds without a database pool.
 	holdExists func(ctx context.Context, specs []hold.Spec) error
@@ -95,6 +100,8 @@ type Options struct {
 	Hub     *hub.Hub
 	Verify  *auth.Verifier
 	Revoker *auth.Revoker
+	// StartupWarnings are reported by /diagnostics alongside the live findings.
+	StartupWarnings []Diagnostic
 }
 
 func New(ctx context.Context, o Options) *Server {
@@ -107,9 +114,10 @@ func New(ctx context.Context, o Options) *Server {
 		ctx: ctx,
 		// 64 buckets spreads a heartbeat period into batches rather than waking
 		// every stream at once.
-		wheel:   timer.New(o.Config.Heartbeat, 64),
-		snapSem: make(chan struct{}, max(1, o.Config.SnapshotMaxConc)),
-		hooks:   newHookCache(o.Config.HookTTL, o.Config.HookTimeout),
+		wheel:           timer.New(o.Config.Heartbeat, 64),
+		snapSem:         make(chan struct{}, max(1, o.Config.SnapshotMaxConc)),
+		hooks:           newHookCache(o.Config.HookTTL, o.Config.HookTimeout, o.Config.HookBearer),
+		startupWarnings: o.StartupWarnings,
 	}
 	if o.Catalog != nil {
 		// The catalog is loaded before the server exists, so start level with it
@@ -228,15 +236,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An empty body opens a stream with no subscriptions; a malformed one is an
+	// error, not an empty stream the client would wait on forever.
 	var req streamReq
 	if r.Body != nil {
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
 	}
 
-	// stream_id carries the node so that a control POST landing on any node can be
-	// forwarded to the owning one. That is the alternative to sticky sessions,
-	// which MCP SEP-2575 documents as the thing that made stateful HTTP hard to
-	// scale.
+	// The node id prefix says which process owns the stream; control requests
+	// must reach that process.
 	streamID := fmt.Sprintf("%s.%d-%d", s.cfg.NodeID, time.Now().UnixNano(), s.streamSeq.Add(1))
 
 	st := s.hub.Open(streamID, id)
@@ -251,9 +262,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		metrics.Streams.Set(float64(s.hub.Count()))
 	}()
 
-	// SSE headers. X-Accel-Buffering is normative in MCP's spec and is a
-	// documented, first-class nginx feature; without it a proxy accumulates
-	// events before forwarding them.
+	// SSE headers. X-Accel-Buffering: no stops nginx-style proxies from
+	// accumulating events before forwarding them.
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-store")
@@ -289,10 +299,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case ev, ok := <-st.Events():
-			if !ok {
-				return
-			}
+		case ev := <-st.Events():
 			if err := s.writeEvent(w, rc, ev); err != nil {
 				st.CloseWith("write_failed")
 				return
@@ -303,12 +310,24 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			for {
 				select {
 				case ev := <-st.Events():
-					_ = s.writeEvent(w, rc, ev)
+					if s.writeEvent(w, rc, ev) != nil {
+						return
+					}
 					continue
 				default:
 				}
-				return
+				break
 			}
+			// A lagging stream is closed because its queue was full, so the
+			// error could not be queued; it is written here instead.
+			if st.CloseCode() == "stream_lagging" {
+				_ = s.writeEvent(w, rc, event.Event{Kind: event.KindError, Data: event.Error{
+					Code:      "stream_lagging",
+					Message:   "the client did not keep up with the change stream",
+					Retryable: true, Action: "resnapshot",
+				}})
+			}
+			return
 		}
 	}
 }
@@ -349,22 +368,22 @@ func (s *Server) writeEvent(w http.ResponseWriter, rc *http.ResponseController, 
 	if err != nil {
 		return err
 	}
-	var b strings.Builder
-	b.WriteString("event: ")
-	b.WriteString(string(ev.Kind))
-	b.WriteByte('\n')
+	frame := make([]byte, 0, len(body)+len(ev.Kind)+len(ev.ID)+24)
+	frame = append(frame, "event: "...)
+	frame = append(frame, ev.Kind...)
+	frame = append(frame, '\n')
 	if ev.ID != "" {
-		b.WriteString("id: ")
-		b.WriteString(ev.ID)
-		b.WriteByte('\n')
+		frame = append(frame, "id: "...)
+		frame = append(frame, ev.ID...)
+		frame = append(frame, '\n')
 	}
-	b.WriteString("data: ")
-	b.Write(body)
+	frame = append(frame, "data: "...)
+	frame = append(frame, body...)
 	// The blank line is what dispatches the event; an event without it is
 	// discarded by the client.
-	b.WriteString("\n\n")
+	frame = append(frame, "\n\n"...)
 
-	if _, err := w.Write([]byte(b.String())); err != nil {
+	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return rc.Flush()
@@ -389,7 +408,7 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !st.Allow("subscribe", s.cfg.SubscribeRate) {
+	if !st.Allow("subscribe", s.cfg.SubscribeRate, time.Second) {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
 			"this stream may issue at most %d subscribe requests per second", s.cfg.SubscribeRate))
 		return
@@ -522,6 +541,13 @@ func (s *Server) subscribeShape(
 		res.Error = &event.Error{Code: "invalid_filter", Message: err.Error()}
 		return res
 	}
+	for _, c := range sp.Columns {
+		if _, ok := rel.Column(c); !ok {
+			res.Error = &event.Error{Code: "invalid_columns", Message: fmt.Sprintf(
+				"column %q does not exist on %s", c, rel.FullName())}
+			return res
+		}
+	}
 
 	if s.oracle == nil {
 		res.Error = &event.Error{Code: "internal", Message: "shape oracle is not configured"}
@@ -564,12 +590,13 @@ func (s *Server) subscribeShape(
 
 	// Warnings. Every one carries a remedy that is a runnable statement, because
 	// a warning nobody can act on is noise.
+	var warnings []event.Warning
 	if len(grant.Denied) > 0 {
 		remedy := fmt.Sprintf("GRANT SELECT (%s) ON %s TO %s;", strings.Join(grant.Denied, ", "), rel.FullName(), id.Role)
 		if s.oracle.Name() == oracle.NameIssuer {
 			remedy = fmt.Sprintf("GRANT SELECT (%s) ON %s TO the Sluice role, or ask the issuer to allow those columns;", strings.Join(grant.Denied, ", "), rel.FullName())
 		}
-		sub.Warnings = append(sub.Warnings, event.Warning{
+		warnings = append(warnings, event.Warning{
 			Sub: spec.Sub, Code: "columns_not_granted",
 			Message: "these columns were dropped from the projection: " + strings.Join(grant.Denied, ", "),
 			Effect:  "events will not contain them",
@@ -577,7 +604,7 @@ func (s *Server) subscribeShape(
 		})
 	}
 	if sub.RoutingKey == "" {
-		sub.Warnings = append(sub.Warnings, event.Warning{
+		warnings = append(warnings, event.Warning{
 			Sub: spec.Sub, Code: "unindexed_shape",
 			Message: "this shape has no equality filter on an indexed column",
 			Effect:  "it is scanned for every change to " + rel.FullName() + " instead of being found by a map lookup",
@@ -595,7 +622,7 @@ func (s *Server) subscribeShape(
 			case 'n':
 				ri = "NOTHING"
 			}
-			pk := strings.Join(rel.ReplicaIdentityColumns, ", ")
+			pk := strings.Join(rel.KeyColumns, ", ")
 			if pk == "" {
 				pk = "id"
 			}
@@ -603,9 +630,9 @@ func (s *Server) subscribeShape(
 			w := event.Warning{
 				Sub: spec.Sub, Code: "replica_identity_insufficient",
 				Message: fmt.Sprintf(
-					"DELETE events for this shape cannot be filtered or authorized: column(s) %s are not in the replica identity of %s (currently %s)",
+					"DELETE events and rows leaving this shape cannot be detected: column(s) %s are not in the replica identity of %s (currently %s)",
 					strings.Join(missing, ", "), rel.FullName(), ri),
-				Effect: "DELETE events will be withheld or marked degraded",
+				Effect: "DELETE events are withheld (or delivered marked degraded with SLUICE_DEGRADED_DELETES=deliver), and transitions cannot report a leave",
 				Remedy: fmt.Sprintf(
 					"CREATE UNIQUE INDEX %s ON %s (%s, %s); ALTER TABLE %s REPLICA IDENTITY USING INDEX %s;",
 					idx, rel.FullName(), strings.Join(missing, ", "), pk, rel.FullName(), idx),
@@ -614,19 +641,19 @@ func (s *Server) subscribeShape(
 				res.Error = &event.Error{Code: w.Code, Message: w.Message + ". Remedy: " + w.Remedy}
 				return res
 			}
-			sub.Warnings = append(sub.Warnings, w)
+			warnings = append(warnings, w)
 		}
 	}
 	if rel.ReplicaIdentity == 'f' && rel.HasToastableColumn {
-		sub.Warnings = append(sub.Warnings, event.Warning{
+		warnings = append(warnings, event.Warning{
 			Sub: spec.Sub, Code: "replica_identity_full_with_toast",
 			Message: rel.FullName() + " uses REPLICA IDENTITY FULL and has a TOAST-able column",
-			Effect:  "every UPDATE and DELETE inlines the whole column into the old tuple; measured 15x WAL amplification and 3000x larger messages",
+			Effect:  "every UPDATE and DELETE carries the whole out-of-line value in the old tuple, even when that column did not change",
 			Remedy:  "switch to REPLICA IDENTITY USING INDEX over only the columns actually needed",
 		})
 	}
 	if !rel.ReplicaIdentityOK {
-		sub.Warnings = append(sub.Warnings, event.Warning{
+		warnings = append(warnings, event.Warning{
 			Sub: spec.Sub, Code: "replica_identity_broken",
 			Message: rel.FullName() + " has an inadequate replica identity",
 			Effect:  "the APPLICATION's own UPDATE and DELETE statements on this table are failing, not just replication",
@@ -638,12 +665,22 @@ func (s *Server) subscribeShape(
 	// cost of admitting one is paid by every other subscriber to that table.
 	// Past a threshold the node stops being O(1) in subscription count, which is
 	// the property the whole design rests on.
-	if sub.RoutingKey == "" && s.reg.Stats().Unindexed >= s.cfg.UnindexedMax {
+	if sub.RoutingKey == "" && s.reg.UnindexedCount() >= s.cfg.UnindexedMax {
 		res.Error = &event.Error{Code: "too_many_unindexed_shapes", Message: fmt.Sprintf(
 			"this node already has %d unindexed subscriptions, the configured maximum; "+
 				"filter on an indexed column with an equality, or index the filtered column",
 			s.cfg.UnindexedMax)}
 		return res
+	}
+
+	wantSnapshot := sp.Initial == "snapshot"
+	if wantSnapshot && !s.cfg.SnapshotEnabled {
+		wantSnapshot = false
+		warnings = append(warnings, event.Warning{
+			Sub: spec.Sub, Code: "snapshot_disabled",
+			Message: "initial snapshots are disabled on this server",
+			Remedy:  "set SLUICE_SNAPSHOT_ENABLED=true, or fetch the initial state yourself",
+		})
 	}
 
 	if err := s.installShape(ctx, sub, grant.Holds); err != nil {
@@ -662,7 +699,7 @@ func (s *Server) subscribeShape(
 	res.Indexed = &indexed
 	res.RoutingKey = sub.RoutingKey
 	res.Reason = grant.Reason
-	res.Warnings = sub.Warnings
+	res.Warnings = warnings
 	if s.oracle.Name() == oracle.NameIssuer {
 		res.Oracle = oracle.NameIssuer
 		if filter != nil {
@@ -674,54 +711,44 @@ func (s *Server) subscribeShape(
 		res.Tier = string(decision.Tier)
 	}
 
-	for _, w := range sub.Warnings {
+	for _, w := range warnings {
 		hub.SendWarning(st, w)
-		metrics.ConfigWarnings.WithLabelValues(w.Code).Set(1)
 	}
 
-	// Resume replay, re-filtered and re-authorized. Replay is never trusted to
-	// have been authorized on its first pass.
-	resumed := false
-	if resume != nil {
-		if lsnStr, ok := resume[rel.FullName()]; ok && lsnStr != "" {
-			s.replay(sub, lsnStr)
-			resumed = true
+	// A resume and a snapshot are alternatives: resuming means the client
+	// already holds a base state to apply changes to. A resume the buffer
+	// cannot cover is reported rather than silently replaced by a snapshot,
+	// because only the client knows to discard the state it holds.
+	if lsnStr := resume[rel.FullName()]; lsnStr != "" {
+		from, err := reader.ParseLSN(lsnStr)
+		switch {
+		case err != nil:
+			hub.SendError(st, event.Error{Sub: sub.Label, Code: "invalid_resume",
+				Message: "resume LSN could not be parsed"})
+		case !s.replayFrom(sub, from):
+			hub.SendError(st, errResumeTooOld(sub.Label))
 		}
+		return res
 	}
-	// A snapshot and a resume are alternatives: resuming means the client already
-	// holds a base state for changes to apply to.
-	if !resumed && sp.Initial == "snapshot" {
-		if !s.cfg.SnapshotEnabled {
-			sub.Warnings = append(sub.Warnings, event.Warning{
-				Sub: spec.Sub, Code: "snapshot_disabled",
-				Message: "initial snapshots are disabled on this server",
-				Remedy:  "set SLUICE_SNAPSHOT_ENABLED=true, or fetch the initial state yourself",
-			})
-		} else {
-			go s.snapshot(s.ctx, sub)
-		}
+	if wantSnapshot {
+		go s.snapshot(s.ctx, sub)
 	}
 	return res
 }
 
-func (s *Server) replay(sub *registry.Subscription, lsnStr string) {
-	from, err := reader.ParseLSN(lsnStr)
-	if err != nil {
-		hub.SendError(streamOf(sub), event.Error{Sub: sub.Label, Code: "invalid_resume",
-			Message: "resume LSN could not be parsed", Retryable: false})
-		return
-	}
-	s.replayFrom(sub, from)
+func errResumeTooOld(label string) event.Error {
+	return event.Error{Sub: label, Code: "resume_too_old",
+		Message:   "the requested position is no longer in the server's buffer",
+		Retryable: true, Action: "resnapshot"}
 }
 
-func (s *Server) replayFrom(sub *registry.Subscription, from uint64) {
-	st := streamOf(sub)
+// replayFrom re-delivers buffered changes at or after `from`, re-filtered and
+// re-authorized: replay is never trusted to have been authorized on its first
+// pass. It returns false, delivering nothing, when the buffer cannot cover it.
+func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 	entries, ok := s.hub.Rings().Replay(sub.Relation.OID, from)
 	if !ok {
-		hub.SendError(st, event.Error{Sub: sub.Label, Code: "resume_too_old",
-			Message:   "the requested position is older than the retained buffer",
-			Retryable: true, Action: "resnapshot"})
-		return
+		return false
 	}
 	for _, e := range entries {
 		m := messageFromRing(e)
@@ -730,6 +757,7 @@ func (s *Server) replayFrom(sub *registry.Subscription, from uint64) {
 			newTuples(e.Relation, m),
 			e.LSN, e.CommitTime, opName(e.Op), false)
 	}
+	return true
 }
 
 func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpec) subResult {
@@ -758,7 +786,10 @@ func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpe
 		}
 	}
 
-	s.hub.JoinChannel(spec.Channel, st, spec.Sub)
+	if !s.hub.JoinChannel(spec.Channel, st, spec.Sub) {
+		res.Error = &event.Error{Code: "stream_closed", Message: "the stream closed during the subscribe"}
+		return res
+	}
 	if spec.Presence {
 		st.Send(event.Event{Kind: event.KindPresence, Data: event.Presence{
 			Sub: spec.Sub, Channel: spec.Channel, Type: "state",
@@ -806,7 +837,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 			"subscribe to a channel before publishing to it")
 		return
 	}
-	if !st.Allow("publish", s.cfg.PublishRate) {
+	if !st.Allow("publish", s.cfg.PublishRate, time.Second) {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
 			"this stream may publish at most %d messages per second", s.cfg.PublishRate))
 		return
@@ -814,12 +845,16 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	n := s.hub.PublishBroadcast(req.Channel, cmp.Or(req.Event, "message"),
 		id.Sub, "client", "", req.Payload, req.Self, st.StreamID())
 
-	ns := req.Channel
-	if i := strings.IndexByte(ns, ':'); i >= 0 {
-		ns = ns[:i]
-	}
-	metrics.BroadcastPublished.WithLabelValues(ns, "client").Inc()
+	metrics.BroadcastPublished.WithLabelValues(namespaceOf(req.Channel), "client").Inc()
 	writeJSON(w, http.StatusOK, map[string]any{"delivered": n})
+}
+
+// namespaceOf returns the part of a channel name before the first colon.
+func namespaceOf(channel string) string {
+	if i := strings.IndexByte(channel, ':'); i >= 0 {
+		return channel[:i]
+	}
+	return channel
 }
 
 func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
@@ -848,37 +883,34 @@ func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
 			"subscribe to a channel before tracking presence on it")
 		return
 	}
-	if !st.Allow("presence", s.cfg.PresenceRate) {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
-			"this stream may send at most %d presence updates per second", s.cfg.PresenceRate))
+	// A presence key is the caller's subject, so a roster can only ever list
+	// identities the JWT proves. A token without a subject has nothing to track.
+	if id.Sub == "" || cmp.Or(req.Key, id.Sub) != id.Sub {
+		writeErr(w, http.StatusForbidden, "presence_key_not_allowed",
+			"presence requires a token with a sub, and the key must equal it")
 		return
 	}
-	key := cmp.Or(req.Key, id.Sub)
-	// A client may not claim someone else's identity in a presence roster.
-	if id.Sub != "" && key != id.Sub {
-		writeErr(w, http.StatusForbidden, "presence_key_not_allowed",
-			"a presence key must equal the caller's subject")
+	key := id.Sub
+	if !st.Allow("presence", s.cfg.PresenceRate, s.cfg.PresenceWindow) {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may send at most %d presence updates per %s", s.cfg.PresenceRate, s.cfg.PresenceWindow))
 		return
 	}
 
 	switch req.Action {
 	case "track", "update", "":
-		n := s.hub.Presence().Track(req.Channel, key, st.StreamID(), req.Meta)
-		if n > s.cfg.PresenceMaxKeys {
-			s.hub.Presence().UntrackKey(req.Channel, key, st.StreamID())
+		if _, ok := s.hub.Presence().Track(req.Channel, key, st.StreamID(), req.Meta, s.cfg.PresenceMaxKeys); !ok {
 			writeErr(w, http.StatusTooManyRequests, "presence_too_many_keys", fmt.Sprintf(
 				"channel %q is at its %d-key limit", req.Channel, s.cfg.PresenceMaxKeys))
 			return
 		}
-		metrics.PresenceMembers.WithLabelValues(req.Channel).Set(float64(n))
 	case "untrack":
 		s.hub.Presence().UntrackKey(req.Channel, key, st.StreamID())
-		metrics.PresenceMembers.WithLabelValues(req.Channel).
-			Set(float64(s.hub.Presence().Count(req.Channel)))
 	default:
 		writeErr(w, http.StatusBadRequest, "bad_request", "action must be track, update or untrack")
 		return
 	}
+	metrics.PresenceUpdates.WithLabelValues(namespaceOf(req.Channel), cmp.Or(req.Action, "track")).Inc()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -893,7 +925,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	newID, err := s.verify.Verify(r.Context(), "Bearer "+req.AccessToken)
+	newID, err := s.verifyToken(r.Context(), "Bearer "+req.AccessToken)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
@@ -962,13 +994,17 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// handleReadyz reports whether this process should receive streams: its
+// catalog is loaded and it is the one reading the replication slot. A process
+// standing by for the reader lock serves no changes, so it is not ready.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	ready := s.cat.LoadedAt().IsZero() == false
+	catalogLoaded := !s.cat.LoadedAt().IsZero()
+	replicating := s.reader != nil && s.reader.Streaming()
 	code := http.StatusOK
-	if !ready {
+	if !catalogLoaded || !replicating {
 		code = http.StatusServiceUnavailable
 	}
-	body := map[string]any{"catalog_loaded": ready, "streams": s.hub.Count()}
+	body := map[string]any{"catalog_loaded": catalogLoaded, "replicating": replicating, "streams": s.hub.Count()}
 	if s.reader != nil {
 		body["confirmed_lsn"] = reader.FormatLSN(s.reader.ConfirmedLSN())
 	}
@@ -1011,19 +1047,17 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 		if st == nil {
 			continue
 		}
-		// Re-read the relation: the cached pointer may predate a refresh.
-		rel, ok := s.cat.Lookup(sub.Relation.Schema, sub.Relation.Name)
+		// Resolve against the current catalog entry for the same table. A
+		// published subscription is never modified, so the fresh relation is
+		// passed along rather than stored.
+		rel, ok := s.cat.Get(sub.Relation.OID)
 		if !ok {
 			s.dropShape(st, sub.Label, event.Error{Code: "relation_unpublished",
 				Message: sub.Relation.FullName() + " is no longer in the publication"})
 			continue
 		}
-		sub.Relation = rel
 
-		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
-			continue
-		}
-		if s.oracle == nil {
+		if s.oracle == nil || s.oracle.Name() == oracle.NameIssuer {
 			continue
 		}
 		if !catalogMoved && !sub.Decision.Load().Expired(now) {
@@ -1049,7 +1083,7 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 				unpublished = true
 				break
 			}
-			rel, ok := s.cat.Lookup(h.Rel.Schema, h.Rel.Name)
+			rel, ok := s.cat.Get(h.Rel.OID)
 			if !ok {
 				unpublished = true
 				break
@@ -1083,7 +1117,23 @@ func (s *Server) RefreshLeases(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) identify(r *http.Request) (authz.Identity, error) {
-	return s.verify.Verify(r.Context(), r.Header.Get("Authorization"))
+	return s.verifyToken(r.Context(), r.Header.Get("Authorization"))
+}
+
+var errSessionRevoked = errors.New("auth: the session behind this token was signed out or the user was banned")
+
+// verifyToken verifies a bearer token and refuses one whose session this
+// process has already seen revoked, so a signed-out token cannot open a new
+// stream or read a snapshot while it is still unexpired.
+func (s *Server) verifyToken(ctx context.Context, bearer string) (authz.Identity, error) {
+	id, err := s.verify.Verify(ctx, bearer)
+	if err != nil {
+		return id, err
+	}
+	if s.revoker != nil && s.revoker.Revoked(id) {
+		return authz.Identity{}, errSessionRevoked
+	}
+	return id, nil
 }
 
 // resolveStream finds the stream a control request targets, and enforces the

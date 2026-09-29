@@ -46,13 +46,8 @@ func (r *RLS) decide(ctx context.Context, req Request) (*Grant, error) {
 		filter = empty
 	}
 
-	columns := req.Columns
-	if len(columns) == 0 {
-		for _, c := range rel.Columns {
-			columns = append(columns, c.Name)
-		}
-	}
-	granted, err := r.cat.HasColumnPrivilege(ctx, req.Identity.Role, rel.FullName(), columns)
+	columns := projection(rel, req.Columns)
+	granted, err := r.cat.HasColumnPrivilege(ctx, req.Identity.Role, rel, columns)
 	if err != nil {
 		return nil, err
 	}

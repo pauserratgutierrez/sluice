@@ -125,18 +125,25 @@ test('sends the token in an Authorization header, never in the URL', async () =>
   client.close()
 })
 
+/** A fetch that answers /stream the way the server does: one result per subscription sent. */
+function echoFetch(onBody?: (body: any) => void): typeof fetch {
+  return async (_input, init) => {
+    const body = JSON.parse(String(init?.body))
+    onBody?.(body)
+    const results = body.subscriptions.map((s: { sub: string }) => ({ sub: s.sub, ok: true }))
+    return new Response('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: results }) + '\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })
+  }
+}
+
 test('builds a PostgREST-shaped filter string', async () => {
   let body: any
   const client = createClient<Database>('https://example.test/sluice/v1', {
     accessToken: 'tok',
     pauseWhenHidden: false,
-    fetch: async (_input, init) => {
-      body = JSON.parse(String(init?.body))
-      return new Response('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[]}\n\n', {
-        status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
-      })
-    },
+    fetch: echoFetch((b) => (body = b)),
   })
 
   await client
@@ -286,11 +293,7 @@ test('a duplicate subscription label is rejected', async () => {
   const client = createClient<Database>('https://example.test/sluice/v1', {
     accessToken: 'tok',
     pauseWhenHidden: false,
-    fetch: async () =>
-      new Response('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[]}\n\n', {
-        status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
-      }),
+    fetch: echoFetch(),
   })
   await client.from('documents').as('dup').on('*', () => {}).subscribe()
   await assert.rejects(
@@ -314,6 +317,130 @@ test('a non-retryable HTTP status does not spin in a reconnect loop', async () =
   await client.from('documents').as('s1').on('*', () => {}).subscribe().catch(() => {})
   await new Promise((r) => setTimeout(r, 60))
   assert.ok(calls <= 2, `401 should not be retried, saw ${calls} attempts`)
+  client.close()
+})
+
+/** An SSE body that stays open until the client aborts it. */
+function openStream(first: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(first))
+    },
+  })
+}
+
+const sse = (body: ReadableStream<Uint8Array> | string) =>
+  new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+
+test('a subscription registered after the stream request was sent is subscribed separately', async () => {
+  const subscribed: string[] = []
+  let streamOpened!: () => void
+  const opened = new Promise<void>((r) => (streamOpened = r))
+  let release!: () => void
+  const released = new Promise<void>((r) => (release = r))
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (input, init) => {
+      const body = JSON.parse(String(init?.body))
+      if (String(input).endsWith('/subscribe')) {
+        subscribed.push(body.subscriptions[0].sub)
+        return new Response(JSON.stringify({ results: [{ sub: body.subscriptions[0].sub, ok: true }] }))
+      }
+      // The stream request carries only what was registered when it was sent.
+      streamOpened()
+      await released
+      const results = body.subscriptions.map((s: { sub: string }) => ({ sub: s.sub, ok: true }))
+      return sse(openStream('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: results }) + '\n\n'))
+    },
+  })
+
+  const first = client.from('documents').as('a').on('*', () => {}).subscribe()
+  await opened
+  const second = client.from('metrics').as('b').on('*', () => {}).subscribe()
+  release()
+  const [a, b] = await Promise.all([first, second])
+
+  assert.ok(a.ok && b.ok)
+  assert.deepEqual(subscribed, ['b'], 'the late subscription must be sent with /subscribe')
+  client.close()
+})
+
+test('resume_too_old forgets the position instead of resending it', async () => {
+  const resumes: Record<string, string>[] = []
+  const change = { sub: 's1', op: 'INSERT', schema: 'public', table: 'documents', commit_lsn: '0/10', seq: 1, record: { id: 1 } }
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (_input, init) => {
+      resumes.push(JSON.parse(String(init?.body)).resume)
+      const ready = 'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'
+      if (resumes.length === 1) return sse(ready + 'event: change\ndata: ' + JSON.stringify(change) + '\n\n')
+      if (resumes.length === 2) {
+        return sse(ready + 'event: error\ndata: {"sub":"s1","code":"resume_too_old","message":"gone","retryable":true,"action":"resnapshot"}\n\n')
+      }
+      return sse(openStream(ready))
+    },
+  })
+
+  await client.from('documents').as('s1').on('*', () => {}).onError(() => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 80))
+  assert.ok(resumes.length >= 3, `expected three stream requests, saw ${resumes.length}`)
+  assert.deepEqual(resumes[1], { 'public.documents': '0/10' })
+  assert.deepEqual(resumes[2], {}, 'the position the server no longer has must not be resent')
+  client.close()
+})
+
+test('a refused subscription is not resent on reconnect', async () => {
+  let calls = 0
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async () => {
+      calls++
+      return sse(
+        'event: ready\ndata: ' +
+          JSON.stringify({
+            stream_id: 'n1.x',
+            subscriptions: [{ sub: 's1', ok: false, error: { code: 'shape_not_authorized', message: 'no' } }],
+          }) +
+          '\n\n',
+      )
+    },
+  })
+  const sub = await client.from('documents').as('s1').on('*', () => {}).onError(() => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(sub.ok, false)
+  assert.equal(calls, 1, 'with nothing left to subscribe, the client must not reconnect')
+  client.close()
+})
+
+// The server closes a stream whose token expired; the reconnect with the same
+// token is refused, so the client stops. A refreshed token brings it back.
+test('setAuth reconnects a stream that stopped on an expired token', async () => {
+  const auths: string[] = []
+  const ready = 'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'old',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (_input, init) => {
+      const auth = new Headers(init?.headers).get('Authorization') ?? ''
+      auths.push(auth)
+      if (auths.length === 1) return sse(ready + 'event: error\ndata: {"code":"token_expired","message":"expired"}\n\n')
+      if (auth === 'Bearer old') return new Response('{"error":"unauthorized"}', { status: 401 })
+      return sse(openStream(ready))
+    },
+    onError: () => {},
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 40))
+  await client.setAuth('fresh')
+  assert.deepEqual(auths, ['Bearer old', 'Bearer old', 'Bearer fresh'])
+  assert.equal(client.connectionStatus, 'open')
   client.close()
 })
 

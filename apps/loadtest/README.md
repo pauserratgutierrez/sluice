@@ -41,7 +41,7 @@ This is the design claim. Wall time stays flat until the machine is busy shippin
 | 16 000 | 2.6 s | 122k | 895 ms | 100% |
 | 28 000 | 5.0 s | 112k | 1.0 s | 100% |
 
-100–1 600 is the same shape as the small harness table in the main README (~410 ms, events/s scaling with N). Past ~3 000 the cost is writing and flushing N sockets, not authorizing.
+100–1 600: the wall time stays flat (~410 ms) and events/s scales with N. Past ~3 000 the cost is writing and flushing N sockets, not authorizing.
 
 ### Concurrent users (1 connection each — routed, not fan-out)
 

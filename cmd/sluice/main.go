@@ -119,12 +119,13 @@ func run() error {
 	// ---- startup validation ---------------------------------------------
 	// Two of these checks catch configurations that break the APPLICATION's own
 	// writes, not just replication, so they are fatal rather than advisory.
-	if err := validate(ctx, pool, cfg, log); err != nil {
+	startupWarnings, err := validate(ctx, pool, cfg, log)
+	if err != nil {
 		return err
 	}
 
 	// ---- catalog ---------------------------------------------------------
-	cat := catalog.New(pool)
+	cat := catalog.New(pool, cfg.AllowedRoles...)
 	if err := cat.Refresh(ctx, cfg.Publication); err != nil {
 		return fmt.Errorf("load catalog: %w", err)
 	}
@@ -177,6 +178,7 @@ func run() error {
 		Config: cfg, Logger: log, Pool: pool,
 		Catalog: cat, Authz: az, Oracle: orc, Hub: h,
 		Verify: verifier, Revoker: revoker,
+		StartupWarnings: startupWarnings,
 	})
 
 	rd := reader.New(cfg, pool, log, srv)
@@ -214,28 +216,39 @@ func run() error {
 				log.Warn("catalog refresh failed", "err", err)
 			}
 			srv.RefreshLeases(ctx)
+			srv.RefreshHealth(ctx)
 			verifier.EnsureFresh(ctx)
 			revoker.Sweep()
 		}
 	}()
 
 	// ---- reader ----------------------------------------------------------
+	// One process per slot reads it. Others stand by: they retry the lock and
+	// report not ready (so a load balancer sends them no streams) until the
+	// reader's process goes away and they take over.
 	readerDone := make(chan error, 1)
 	go func() {
-		// A single advisory lock elects one reader per slot. Without it, N
-		// processes would each hold a slot, and every slot independently retains
-		// WAL -- multiplying the disk-exhaustion risk rather than sharing load.
-		if ok, err := acquireLeadership(ctx, pool, cfg.SlotName, log); err != nil {
-			readerDone <- err
-			return
-		} else if !ok {
-			log.Info("another node holds the reader lock; serving streams only")
-			metrics.ReaderIsLeader.Set(0)
-			<-ctx.Done()
-			readerDone <- nil
-			return
+		metrics.ReaderIsLeader.Set(0)
+		for standing := false; ; standing = true {
+			ok, err := acquireLeadership(ctx, pool, cfg.SlotName)
+			if err != nil && ctx.Err() == nil {
+				log.Warn("could not try the reader lock", "err", err)
+			}
+			if ok {
+				break
+			}
+			if !standing {
+				log.Info("another process reads this slot; standing by", "slot", cfg.SlotName)
+			}
+			select {
+			case <-ctx.Done():
+				readerDone <- nil
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
 		metrics.ReaderIsLeader.Set(1)
+		log.Info("holding the reader lock", "slot", cfg.SlotName)
 		readerDone <- rd.Run(ctx)
 	}()
 
@@ -280,14 +293,19 @@ func run() error {
 	return httpSrv.Shutdown(shutdownCtx)
 }
 
-// acquireLeadership takes a session-scoped advisory lock keyed by the slot name.
-func acquireLeadership(ctx context.Context, pool *pgxpool.Pool, slot string, log *slog.Logger) (bool, error) {
+// acquireLeadership tries a session-scoped advisory lock keyed by the slot name.
+//
+// On success the pooled connection holding the lock is deliberately never
+// released: the lock must last for the reader's whole lifetime, and the
+// connection dying is exactly the signal that should free it. It permanently
+// takes one of SLUICE_DB_POOL_MAX_CONNS. The slot itself is the hard guarantee
+// -- PostgreSQL lets only one connection stream it -- and the lock keeps a
+// standby from contending for it.
+func acquireLeadership(ctx context.Context, pool *pgxpool.Pool, slot string) (bool, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return false, err
 	}
-	// Deliberately not released: the lock must be held for the reader's whole
-	// lifetime, and the connection dying is exactly the signal that should free it.
 	var ok bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, "sluice:"+slot).Scan(&ok); err != nil {
 		conn.Release()

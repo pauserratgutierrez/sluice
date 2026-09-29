@@ -8,14 +8,40 @@ func baseValid() *Config {
 		AuthzURL:        "postgres://sluice_authz@db/postgres",
 		JWKSURL:         "http://auth/.well-known/jwks.json",
 		JWTAlg:          "ES256",
-		Streaming:       "off",
 		ProtoVersion:    4,
 		TierC:           "allow",
 		ReplicaIdentity: "warn",
 		DegradedDeletes: "withhold",
 		Heartbeat:       20_000_000_000,
+		PresenceWindow:  30_000_000_000,
 		MessagePrefix:   "sluice:",
 		ShapeOracle:     "rls",
+	}
+}
+
+// A hook namespace must work in rls mode with neither the issuer bearer nor the
+// hook bearer set: the hook bearer is optional and independent of the oracle.
+func TestLoadHookBearerIsOptionalAndSeparate(t *testing.T) {
+	t.Setenv("SLUICE_DB_REPL_URL", "postgres://r@db/postgres?replication=database")
+	t.Setenv("SLUICE_DB_AUTHZ_URL", "postgres://a@db/postgres")
+	t.Setenv("SLUICE_JWKS_URL", "http://auth/.well-known/jwks.json")
+	t.Setenv("SLUICE_CHANNELS", "billing:hook:http://api:8080/authz")
+	t.Setenv("SLUICE_ISSUER_BEARER", "issuer-secret")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HookBearer != "" {
+		t.Fatalf("HookBearer = %q, must not fall back to SLUICE_ISSUER_BEARER", c.HookBearer)
+	}
+
+	t.Setenv("SLUICE_CHANNEL_HOOK_BEARER", "hook-secret")
+	if c, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if c.HookBearer != "hook-secret" {
+		t.Fatalf("HookBearer = %q, want hook-secret", c.HookBearer)
 	}
 }
 

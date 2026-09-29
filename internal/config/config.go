@@ -1,9 +1,6 @@
 // Package config parses Sluice's configuration from the environment.
 //
-// Every default is chosen to be safe rather than fast. Where a default differs
-// from what a naive reading would suggest -- notably STREAMING=off and
-// BINARY=false -- the reason is recorded next to it, because both look like
-// pessimisations and are not.
+// Every default is chosen to be safe rather than fast.
 package config
 
 import (
@@ -17,14 +14,14 @@ import (
 type ChannelMode string
 
 const (
-	// ChannelPublic: any authenticated stream may subscribe and publish.
+	// ChannelPublic: any stream with a valid token may join.
 	ChannelPublic ChannelMode = "public"
-	// ChannelOwner: the channel name must end in the caller's `sub`, e.g.
-	// `notify:7f3a...`. Authorization by naming convention, O(1), no I/O. This
-	// is Centrifugo's `#user_id` idea.
+	// ChannelOwner: the channel name must end in ":" + the caller's `sub`, e.g.
+	// `notify:7f3a...`. Authorization by naming convention, O(1), no I/O.
 	ChannelOwner ChannelMode = "owner"
-	// ChannelHook: delegate to an HTTP endpoint. The escape hatch for arbitrary
-	// business rules, so Sluice never has to learn an application's auth model.
+	// ChannelHook: an HTTP endpoint decides each join. The escape hatch for
+	// arbitrary business rules, so Sluice never has to learn an application's
+	// auth model.
 	ChannelHook ChannelMode = "hook"
 )
 
@@ -51,11 +48,8 @@ type Config struct {
 	SlotName      string
 	Publication   string
 	ProtoVersion  int
-	Streaming     string
-	Binary        bool
 	Messages      bool
 	StatusEvery   time.Duration
-	DispatchQueue int
 	MessagePrefix string
 
 	RingEvents int
@@ -67,7 +61,6 @@ type Config struct {
 	JWTIssuer    string
 	JWTAudience  string
 	JWTLeeway    time.Duration
-	AnonRole     string
 	AllowedRoles []string
 
 	AuthzLease      time.Duration
@@ -86,10 +79,9 @@ type Config struct {
 	IssuerBearer  string
 	IssuerTimeout time.Duration
 
-	SnapshotEnabled  bool
-	SnapshotMaxConc  int
-	SnapshotMaxRows  int
-	SnapshotPageSize int
+	SnapshotEnabled bool
+	SnapshotMaxConc int
+	SnapshotMaxRows int
 
 	Heartbeat          time.Duration
 	StreamQueue        int
@@ -109,11 +101,13 @@ type Config struct {
 	Channels    []Channel
 	HookTTL     time.Duration
 	HookTimeout time.Duration
+	// HookBearer authenticates Sluice to every hook URL. Optional: the header
+	// is only sent when it is set.
+	HookBearer string
 
 	RevocationEnabled bool
 	SessionsTable     string
 	UsersTable        string
-	VerifyOnSubscribe bool
 
 	MetricsEnabled     bool
 	DiagnosticsEnabled bool
@@ -138,36 +132,13 @@ func Load() (*Config, error) {
 		SlotName:    env("SLUICE_SLOT_NAME", "sluice"),
 		Publication: env("SLUICE_PUBLICATION", "sluice"),
 
-		// proto_version 4 declares capability. Verified empirically: the
-		// negotiated version ALONE changes nothing -- requesting 1, 4, or 4 with
-		// streaming=parallel produced byte-identical output (same MD5, same 528
-		// bytes). The OPTIONS determine the message set. Asking for 4 costs
-		// nothing and makes enabling streaming later a flag rather than a
-		// protocol change. It is a per-connection option, not slot state, so it
-		// can be changed at any time by reconnecting.
+		// The negotiated version only declares capability; with streaming off
+		// the options, not the version, decide the message set. 4 needs
+		// PostgreSQL 16 or newer; set 1..3 against an older server.
 		ProtoVersion: envInt("SLUICE_PROTO_VERSION", 4),
-
-		// streaming=off is the important default. With it, EVERYTHING the reader
-		// receives is already committed and durable, so the reader forwards
-		// immediately with zero buffering. With streaming=on you receive
-		// UNCOMMITTED changes and must buffer whole transactions in the Go heap
-		// until Stream Commit -- moving an unbounded, OOM-prone buffer out of
-		// PostgreSQL (where it is disk-backed and observable via
-		// pg_stat_replication_slots) and into the process that holds every
-		// client connection.
-		Streaming: env("SLUICE_STREAMING", "off"),
-
-		// binary=false because, measured, the binary format was LARGER (112 vs
-		// 88 bytes for a representative row) and would require per-type decoders
-		// for numeric's four-word struct, timestamptz as int64 microseconds, the
-		// full array header, and jsonb's version byte -- plus the text path
-		// anyway, since pgoutput falls back to 't' per column for types without
-		// typsend. Sluice emits JSON, and text is closer to JSON than binary is.
-		Binary: envBool("SLUICE_BINARY", false),
 
 		Messages:      envBool("SLUICE_MESSAGES", true),
 		StatusEvery:   envDur("SLUICE_STATUS_INTERVAL", 10*time.Second),
-		DispatchQueue: envInt("SLUICE_DISPATCH_QUEUE", 8192),
 		MessagePrefix: env("SLUICE_MESSAGE_PREFIX", "sluice:"),
 
 		RingEvents: envInt("SLUICE_RING_EVENTS", 4096),
@@ -179,7 +150,6 @@ func Load() (*Config, error) {
 		JWTIssuer:    env("SLUICE_JWT_ISSUER", ""),
 		JWTAudience:  env("SLUICE_JWT_AUDIENCE", "authenticated"),
 		JWTLeeway:    envDur("SLUICE_JWT_LEEWAY", 10*time.Second),
-		AnonRole:     env("SLUICE_ANON_ROLE", "anon"),
 		AllowedRoles: envList("SLUICE_ALLOWED_ROLES", []string{"anon", "authenticated", "service_role"}),
 
 		AuthzLease:     envDur("SLUICE_AUTHZ_LEASE", 60*time.Second),
@@ -201,10 +171,9 @@ func Load() (*Config, error) {
 		ReplicaIdentity: env("SLUICE_REPLICA_IDENTITY", "warn"),
 		DegradedDeletes: env("SLUICE_DEGRADED_DELETES", "withhold"),
 
-		SnapshotEnabled:  envBool("SLUICE_SNAPSHOT_ENABLED", true),
-		SnapshotMaxConc:  envInt("SLUICE_SNAPSHOT_MAX_CONCURRENT", 4),
-		SnapshotMaxRows:  envInt("SLUICE_SNAPSHOT_MAX_ROWS", 50000),
-		SnapshotPageSize: envInt("SLUICE_SNAPSHOT_PAGE_SIZE", 1000),
+		SnapshotEnabled: envBool("SLUICE_SNAPSHOT_ENABLED", true),
+		SnapshotMaxConc: envInt("SLUICE_SNAPSHOT_MAX_CONCURRENT", 4),
+		SnapshotMaxRows: envInt("SLUICE_SNAPSHOT_MAX_ROWS", 50000),
 
 		Heartbeat:          envDur("SLUICE_HEARTBEAT", 20*time.Second),
 		StreamQueue:        envInt("SLUICE_STREAM_QUEUE", 256),
@@ -223,11 +192,11 @@ func Load() (*Config, error) {
 
 		HookTTL:     envDur("SLUICE_CHANNEL_HOOK_TTL", 60*time.Second),
 		HookTimeout: envDur("SLUICE_CHANNEL_HOOK_TIMEOUT", 2*time.Second),
+		HookBearer:  env("SLUICE_CHANNEL_HOOK_BEARER", ""),
 
 		RevocationEnabled: envBool("SLUICE_REVOCATION_ENABLED", false),
 		SessionsTable:     env("SLUICE_REVOCATION_SESSIONS_TABLE", "auth.sessions"),
 		UsersTable:        env("SLUICE_REVOCATION_USERS_TABLE", "auth.users"),
-		VerifyOnSubscribe: envBool("SLUICE_REVOCATION_VERIFY_ON_SUBSCRIBE", true),
 
 		MetricsEnabled:     envBool("SLUICE_METRICS_ENABLED", true),
 		DiagnosticsEnabled: envBool("SLUICE_DIAGNOSTICS_ENABLED", true),
@@ -268,33 +237,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("SLUICE_JWT_ALG must be ES256 or RS256, got %q", c.JWTAlg)
 	}
 
-	switch c.Streaming {
-	case "off", "on", "parallel":
-	default:
-		return fmt.Errorf("SLUICE_STREAMING must be off, on or parallel")
-	}
-	// Mirror PostgreSQL's own gating so a bad combination fails at startup with
-	// a clear message rather than at START_REPLICATION with a server error.
-	minVersion := 1
-	if c.Streaming == "on" {
-		minVersion = 2
-	}
-	if c.Streaming == "parallel" {
-		minVersion = 4
-	}
-	if c.ProtoVersion < minVersion {
-		return fmt.Errorf("SLUICE_PROTO_VERSION=%d does not support streaming=%s, need %d or higher",
-			c.ProtoVersion, c.Streaming, minVersion)
-	}
 	if c.ProtoVersion < 1 || c.ProtoVersion > 4 {
-		return fmt.Errorf("SLUICE_PROTO_VERSION must be 1..4 (PostgreSQL 18 supports at most 4), got %d",
-			c.ProtoVersion)
-	}
-	if c.Binary {
-		// Not fatal, but the decoder only handles the text path today, so be
-		// explicit rather than mysteriously mangling values.
-		return fmt.Errorf("SLUICE_BINARY=true is not supported: the decoder handles the " +
-			"text format only, and binary was measured to be larger for typical rows")
+		return fmt.Errorf("SLUICE_PROTO_VERSION must be 1..4, got %d", c.ProtoVersion)
 	}
 
 	switch c.TierC {
@@ -311,6 +255,9 @@ func (c *Config) validate() error {
 	case "withhold", "deliver":
 	default:
 		return fmt.Errorf("SLUICE_DEGRADED_DELETES must be withhold or deliver")
+	}
+	if c.PresenceWindow <= 0 {
+		return fmt.Errorf("SLUICE_PRESENCE_WINDOW must be positive")
 	}
 	if c.Heartbeat < 5*time.Second {
 		return fmt.Errorf("SLUICE_HEARTBEAT below 5s is counterproductive: frequent " +

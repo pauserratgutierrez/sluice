@@ -18,9 +18,8 @@ node_modules/
 dist/
 **/.DS_Store
 
-# Docs and design notes (not compiled)
+# Docs (not compiled)
 *.md
-design_doc.md
 
 # Compose harness and sibling services (not part of the sluice binary)
 deploy/
