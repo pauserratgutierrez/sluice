@@ -369,6 +369,38 @@ test('a subscription registered after the stream request was sent is subscribed 
   client.close()
 })
 
+test('a failed subscribe leaves nothing registered, so the same label can be retried', async () => {
+  const calls: string[] = []
+  let failNext = true
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (input, init) => {
+      const path = String(input).replace('https://example.test/sluice/v1', '')
+      const body = JSON.parse(String(init?.body))
+      if (path === '/stream') {
+        const results = body.subscriptions.map((s: { sub: string }) => ({ sub: s.sub, ok: true }))
+        return sse(openStream('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: results }) + '\n\n'))
+      }
+      calls.push(`${path} ${(body.subscriptions?.[0]?.sub ?? body.subs?.[0]) as string}`)
+      if (path === '/subscribe' && failNext) {
+        failNext = false
+        throw new TypeError('network down')
+      }
+      if (path === '/subscribe') return new Response(JSON.stringify({ results: [{ sub: body.subscriptions[0].sub, ok: true }] }))
+      return new Response(JSON.stringify({ removed: 0 }))
+    },
+  })
+
+  await client.from('documents').as('a').on('*', () => {}).subscribe()
+  await assert.rejects(() => client.from('metrics').as('b').on('*', () => {}).subscribe(), /network down/)
+  const retry = await client.from('metrics').as('b').on('*', () => {}).subscribe()
+
+  assert.equal(retry.ok, true)
+  assert.deepEqual(calls, ['/subscribe b', '/unsubscribe b', '/subscribe b'])
+  client.close()
+})
+
 test('resume_too_old forgets the position instead of resending it', async () => {
   const resumes: Record<string, string>[] = []
   const change = { sub: 's1', op: 'INSERT', schema: 'public', table: 'documents', commit_lsn: '0/10', seq: 1, record: { id: 1 } }

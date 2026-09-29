@@ -32,7 +32,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-force-exit --experimental-strip-types test/*.test.ts",
-    "typecheck:test": "tsc -p tsconfig.test.json",
+    "typecheck:test": "tsc -p test/tsconfig.json",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

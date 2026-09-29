@@ -143,10 +143,21 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       }
     }
 
-    const body = await this.post('/subscribe', {
-      stream_id: this.streamId,
-      subscriptions: [reg.spec],
-    })
+    let body: Record<string, unknown>
+    try {
+      body = await this.post('/subscribe', {
+        stream_id: this.streamId,
+        subscriptions: [reg.spec],
+      })
+    } catch (err) {
+      // A rejected subscribe leaves nothing registered, so retrying with the
+      // same label works. The server may still have processed the request (a
+      // lost response looks like a network error), so it is also asked to
+      // drop the label -- and that finishes before rejecting, so it cannot
+      // race a retry.
+      await this.unregister(reg.spec.sub)
+      throw err
+    }
     const result = (body.results as SubscriptionResult[] | undefined)?.[0] ?? {
       sub: reg.spec.sub,
       ok: false,

@@ -172,7 +172,7 @@ import { SluiceError } from '@pauserratgutierrez/sluice-js'
 })
 ```
 
-Subscription errors go to that subscription's `onError`; stream errors go to the client's `onError`.
+Subscription errors go to that subscription's `onError`; stream errors go to the client's `onError`. If `subscribe()` itself rejects (a network error, `429 rate_limited`, …), nothing stays registered, so calling it again with the same label is safe.
 
 | Code | Meaning |
 | --- | --- |
