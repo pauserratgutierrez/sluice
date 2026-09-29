@@ -259,11 +259,13 @@ test('routes change events to the right subscription and applies handlers by op'
   const client = createClient<Database>('https://example.test/sluice/v1', {
     accessToken: 'tok',
     pauseWhenHidden: false,
+    // Held open: a stream that ends reconnects and would replay the change.
     fetch: async () =>
-      new Response(
-        'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n' +
-          'event: change\ndata: ' + JSON.stringify(change) + '\n\n',
-        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      sse(
+        openStream(
+          'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n' +
+            'event: change\ndata: ' + JSON.stringify(change) + '\n\n',
+        ),
       ),
   })
 
