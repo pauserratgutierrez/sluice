@@ -120,18 +120,8 @@ func TestProjectionIsExactlyTheSubscriptionColumns(t *testing.T) {
 	if got[0].Record["title"] != "renamed" {
 		t.Errorf("record = %v", got[0].Record)
 	}
-}
-
-// Numbers are emitted with PostgreSQL's exact digits.
-func TestNumericKeepsItsDigits(t *testing.T) {
-	b, err := json.Marshal(map[string]any{"v": jsonValue("numeric(20,2)", "12345678901234567.89")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != `{"v":12345678901234567.89}` {
-		t.Errorf("encoded %s, want the digits unchanged", b)
-	}
-	if v := jsonValue("numeric", "NaN"); v != "NaN" {
-		t.Errorf("NaN = %#v, want the string", v)
+	// Values are encoded by column type, as to_jsonb would: id is an int8.
+	if b, _ := json.Marshal(got[0].Record["id"]); string(b) != "7" {
+		t.Errorf("id encoded as %s, want the number 7", b)
 	}
 }

@@ -249,6 +249,36 @@ GRANT SELECT ON public.articles TO authenticated;
 GRANT ALL    ON public.articles TO service_role;
 
 -- ===========================================================================
+-- Wire encoding: one column per kind of value Sluice encodes. cmd/smoke checks
+-- every change event and snapshot row of this table against to_jsonb of the
+-- same row. No RLS, so the check is about encoding only.
+-- ===========================================================================
+DROP TABLE IF EXISTS public.wire_types CASCADE;
+DROP DOMAIN IF EXISTS public.wire_posint CASCADE;
+DROP TYPE IF EXISTS public.wire_mood CASCADE;
+DROP TYPE IF EXISTS public.wire_pair CASCADE;
+CREATE DOMAIN public.wire_posint AS int CHECK (VALUE > 0);
+CREATE TYPE public.wire_mood AS ENUM ('ok', 'bad');
+CREATE TYPE public.wire_pair AS (n int, label text, at timestamptz);
+CREATE TABLE public.wire_types (
+  id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id uuid NOT NULL,
+  b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8, f8_nan float8,
+  n numeric, n_nan numeric,
+  t text, vc varchar(10), c char(3), u uuid, o oid,
+  j json, jb jsonb,
+  d date, ts timestamp, tstz timestamptz, tm time, tmtz timetz, iv interval,
+  bin bytea, m money, ip inet, pt point,
+  mood public.wire_mood, pos public.wire_posint, pair public.wire_pair,
+  t_arr text[], i_arr int4[], i_arr2 int4[], b_arr bool[], tstz_arr timestamptz[],
+  jb_arr jsonb[], n_arr numeric[], pos_arr public.wire_posint[], pair_arr public.wire_pair[],
+  box_arr box[], bounded int4[]
+);
+CREATE INDEX wire_types_owner_id ON public.wire_types (owner_id);
+GRANT SELECT ON public.wire_types TO authenticated;
+GRANT ALL    ON public.wire_types TO service_role;
+
+-- ===========================================================================
 -- Publication membership. Explicit opt-in, no row filters, no column lists.
 -- ===========================================================================
 DO $$
@@ -256,7 +286,8 @@ DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
     'public.documents', 'public.posts', 'public.invoices',
-    'public.memberships', 'public.metrics', 'public.articles'
+    'public.memberships', 'public.metrics', 'public.articles',
+    'public.wire_types'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_publication_tables

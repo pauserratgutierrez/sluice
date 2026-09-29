@@ -89,7 +89,7 @@ sluice.from('documents')
 
 **`withTransitions()`**: an UPDATE that moves a row out of the shape arrives as a `DELETE` with `transition: 'leave'`, and one that moves it in as an `INSERT` with `transition: 'enter'`. Both need the table's replica identity to carry the filter columns; the server warns (`replica_identity_insufficient`) when it does not. Without transitions, a row that stops matching simply stops producing events.
 
-**`withInitialSnapshot()`** makes the server read the current rows itself and then continue live, with no gap between the two. Rows arrive as `INSERT` with `snapshot: true`, followed by `onSnapshotEnd({ rows, truncated })` (`truncated` when more rows matched than the server's cap). Duplicates around the boundary are possible and intended — upsert by primary key. Snapshot rows use PostgreSQL's JSON encoding (ISO 8601 timestamps, JSON arrays) while live changes use its text output, so parse timestamps with a parser that accepts both.
+**`withInitialSnapshot()`** makes the server read the current rows itself and then continue live, with no gap between the two. Rows arrive as `INSERT` with `snapshot: true`, followed by `onSnapshotEnd({ rows, truncated })` (`truncated` when more rows matched than the server's cap). Duplicates around the boundary are possible and intended — upsert by primary key. Snapshot rows and live changes use the same value encoding, the one PostgREST returns (ISO 8601 timestamps, JSON arrays), so they match the generated `Database` types.
 
 `ops('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')` restricts operations; the default is the first three.
 

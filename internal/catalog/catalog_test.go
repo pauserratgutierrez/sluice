@@ -3,6 +3,7 @@ package catalog
 import (
 	"testing"
 
+	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
 )
 
@@ -202,6 +203,37 @@ func TestPredicateAppliesPoliciesThroughMembership(t *testing.T) {
 	if authzFingerprint(rels, nil, nil) ==
 		authzFingerprint(rels, nil, map[string]map[string]bool{"premium": {"authenticated": true}}) {
 		t.Error("a membership change did not move the fingerprint")
+	}
+}
+
+// A domain encodes as its base type, and arrays and composites are built from
+// their element and attribute types, however deeply nested.
+func TestEncodeTypesResolvesDomainsArraysAndComposites(t *testing.T) {
+	const (
+		int4, timestamptz, tstzArr = 23, 1184, 1185
+		posint, posintArr          = 90001, 90002
+		pair, pairArr              = 90003, 90004
+	)
+	types := encodeTypes(map[uint32]typeRow{
+		posint:    {typtype: 'd', category: 'N', delim: ',', base: int4},
+		posintArr: {typtype: 'b', category: 'A', delim: ',', elem: posint},
+		pair:      {typtype: 'c', category: 'C', delim: ',', fieldNames: []string{"n", "at"}, fieldTypes: []uint32{posint, timestamptz}},
+		pairArr:   {typtype: 'b', category: 'A', delim: ',', elem: pair},
+		tstzArr:   {typtype: 'b', category: 'A', delim: ',', elem: timestamptz},
+	})
+	if types[posint].Kind != encode.Number {
+		t.Error("a domain over int4 must encode as a number")
+	}
+	if a := types[posintArr]; a.Kind != encode.Array || a.Elem.Kind != encode.Number {
+		t.Errorf("posint[] = %+v", a)
+	}
+	c := types[pairArr].Elem
+	if c.Kind != encode.Composite || len(c.Fields) != 2 || c.Fields[0].Type.Kind != encode.Number ||
+		c.Fields[1].Type.Kind != encode.TimestampTZ {
+		t.Errorf("pair = %+v", c)
+	}
+	if a := types[tstzArr]; a.Elem.Kind != encode.TimestampTZ || a.Delim != ',' {
+		t.Errorf("timestamptz[] = %+v", a)
 	}
 }
 

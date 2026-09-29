@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 
@@ -42,6 +43,31 @@ func countAll(ctx context.Context, table string) (int, error) {
 	var n int
 	err := pool.QueryRow(ctx, "select count(*) from "+table).Scan(&n)
 	return n, err
+}
+
+// insertReturningID runs an INSERT ... RETURNING id as a superuser.
+func insertReturningID(ctx context.Context, sql string) (int64, error) {
+	if err := execViaPgx(ctx, "select 1"); err != nil {
+		return 0, err
+	}
+	var id int64
+	err := pool.QueryRow(ctx, sql).Scan(&id)
+	return id, err
+}
+
+// toJSONB returns PostgreSQL's own JSON encoding of one row, in UTC.
+func toJSONB(ctx context.Context, table string, id int64) ([]byte, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL TimeZone = 'UTC'`); err != nil {
+		return nil, err
+	}
+	var raw []byte
+	err = tx.QueryRow(ctx, fmt.Sprintf(`SELECT to_jsonb(r)::text FROM %s r WHERE id = $1`, table), id).Scan(&raw)
+	return raw, err
 }
 
 // queryOne runs a single-value query as a superuser.

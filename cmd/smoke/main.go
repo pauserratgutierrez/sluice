@@ -317,6 +317,8 @@ func main() {
 		"a resumed stream replays the missed changes with their original content",
 		fmt.Sprintf("live=%v replayed=%v", live, replayed))
 
+	phaseWireEncoding(ctx, tok, userID)
+
 	// ---- deeper phases ----------------------------------------------------
 	phaseDifferential(ctx)
 

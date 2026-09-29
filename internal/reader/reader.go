@@ -145,8 +145,19 @@ func (r *Reader) EnsureSlot(ctx context.Context) (created bool, err error) {
 	return true, nil
 }
 
+// connect opens the replication connection with the output settings the wire
+// encoder expects: pgoutput prints values with the session's output functions,
+// so the date style, interval style and time zone are pinned here rather than
+// inherited from whatever the server or role is configured with.
 func (r *Reader) connect(ctx context.Context) (*pgconn.PgConn, error) {
-	conn, err := pgconn.Connect(ctx, r.cfg.ReplURL)
+	cfg, err := pgconn.ParseConfig(r.cfg.ReplURL)
+	if err != nil {
+		return nil, fmt.Errorf("reader: parse SLUICE_DB_REPL_URL: %w", err)
+	}
+	cfg.RuntimeParams["DateStyle"] = "ISO"
+	cfg.RuntimeParams["IntervalStyle"] = "postgres"
+	cfg.RuntimeParams["TimeZone"] = "UTC"
+	conn, err := pgconn.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("reader: connect replication: %w", err)
 	}

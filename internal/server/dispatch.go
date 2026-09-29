@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
+	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
@@ -255,9 +256,9 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 		Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
 	})
 
-	// Built once per change and shared by every subscriber: the JSON encoding it
-	// memoises is only computed if some subscription actually needs it.
-	tuples := newTuples(rel, m)
+	// Built once per change and shared by every subscriber: the encodings it
+	// memoises are only computed if some subscription actually needs them.
+	tuples := s.newTuples(rel, m)
 
 	for _, sub := range candidates {
 		if !opWanted(sub.Ops, m.Type) && !(sub.Transitions && m.Type == pgoutput.MsgUpdate) {
@@ -268,13 +269,25 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	return nil
 }
 
-// tuplePair carries the authorization view of a change: the new tuple for
-// INSERT/UPDATE, the old one for DELETE and for shape-exit detection.
-type tuplePair struct{ New, Old *authz.Tuple }
+// tuplePair is one change as every subscriber sees it: the tuples the
+// authorizer reads (the new one for INSERT/UPDATE, the old one for DELETE and
+// shape-exit detection), and each tuple's column values encoded for the wire.
+// The encoding is done once, on first use, and shared by every subscriber's
+// projection. A tuplePair is used by one goroutine at a time.
+type tuplePair struct {
+	New, Old *authz.Tuple
 
-func newTuples(rel *pgoutput.Relation, m *pgoutput.Message) tuplePair {
+	rel              *pgoutput.Relation
+	types            map[uint32]*encode.Type
+	newVals, oldVals []any
+}
+
+func (s *Server) newTuples(rel *pgoutput.Relation, m *pgoutput.Message) *tuplePair {
 	pk := primaryKeyOf(rel, m)
-	var p tuplePair
+	p := &tuplePair{rel: rel}
+	if s.cat != nil {
+		p.types = s.cat.Types()
+	}
 	if m.New != nil {
 		p.New = &authz.Tuple{Op: m.Type, PK: pk, Rel: rel, Row: m.New}
 	}
@@ -284,13 +297,54 @@ func newTuples(rel *pgoutput.Relation, m *pgoutput.Message) tuplePair {
 	return p
 }
 
+// values returns a tuple's encoded column values, by column position.
+func (p *tuplePair) values(t *pgoutput.Tuple, cache *[]any) []any {
+	if *cache == nil && t != nil {
+		*cache = encodeTuple(p.rel, t, p.types)
+	}
+	return *cache
+}
+
+func (p *tuplePair) newValues() []any {
+	if p.New == nil {
+		return nil
+	}
+	return p.values(p.New.Row, &p.newVals)
+}
+
+func (p *tuplePair) oldValues() []any {
+	if p.Old == nil {
+		return nil
+	}
+	return p.values(p.Old.Row, &p.oldVals)
+}
+
+// encodeTuple encodes every text column of a tuple as to_jsonb would.
+func encodeTuple(rel *pgoutput.Relation, t *pgoutput.Tuple, types map[uint32]*encode.Type) []any {
+	out := make([]any, len(t.Columns))
+	for i, c := range t.Columns {
+		if c.Kind != pgoutput.ColText || i >= len(rel.Columns) {
+			continue
+		}
+		out[i] = typeOf(types, rel.Columns[i].TypeOID).Value(string(c.Data))
+	}
+	return out
+}
+
+func typeOf(types map[uint32]*encode.Type, oid uint32) *encode.Type {
+	if t := types[oid]; t != nil {
+		return t
+	}
+	return encode.Builtin(oid)
+}
+
 // deliver evaluates one subscription against one change and emits at most one event.
 func (s *Server) deliver(
 	sub *registry.Subscription,
 	m *pgoutput.Message,
 	rel *pgoutput.Relation,
 	newRow, oldRow tupleRow,
-	tuples tuplePair,
+	tuples *tuplePair,
 	commitLSN uint64,
 	commitTime time.Time,
 	op string,
@@ -425,8 +479,8 @@ func (s *Server) deliver(
 		degraded = "delete_authz_unavailable"
 	}
 
-	rec, unchangedNew := project(rel, m.New, sub.Columns)
-	oldRec, _ := project(rel, m.Old, sub.Columns)
+	rec, unchangedNew, newSize := project(rel, m.New, tuples.newValues(), sub.Columns)
+	oldRec, _, oldSize := project(rel, m.Old, tuples.oldValues(), sub.Columns)
 	for _, c := range unchangedNew {
 		metrics.ToastUnchanged.WithLabelValues(rel.Namespace, rel.Name, c).Inc()
 	}
@@ -434,7 +488,7 @@ func (s *Server) deliver(
 	// One enormous row must not be able to evict a stream's whole queue. Trim to
 	// the key columns so the client still learns which row changed and can
 	// refetch it, and say so rather than delivering a silently partial record.
-	if n := s.cfg.MaxChangeBytes; n > 0 && approxSize(rec)+approxSize(oldRec) > n {
+	if n := s.cfg.MaxChangeBytes; n > 0 && newSize+oldSize > n {
 		rec = keyOnly(rec, sub.Relation.KeyColumns)
 		oldRec = keyOnly(oldRec, sub.Relation.KeyColumns)
 		unchangedNew = nil
@@ -542,13 +596,14 @@ func (s *Server) closeStreamsForUser(userID string) {
 // of the projection when the caller may read them (see the oracles); nothing
 // outside it is ever emitted, because the projection is what column grants and
 // an issuer allowlist were intersected into.
-func project(rel *pgoutput.Relation, t *pgoutput.Tuple, columns []string) (map[string]any, []string) {
+//
+// vals are the tuple's encoded values by column position. size approximates
+// the record's encoded size from the text it came from, without a marshal.
+func project(rel *pgoutput.Relation, t *pgoutput.Tuple, vals []any, columns []string) (rec map[string]any, unchanged []string, size int) {
 	if t == nil {
-		return nil, nil
+		return nil, nil, 0
 	}
-	out := make(map[string]any, len(columns))
-	var unchanged []string
-
+	rec = make(map[string]any, len(columns))
 	for i, col := range t.Columns {
 		if i >= len(rel.Columns) {
 			break
@@ -557,37 +612,17 @@ func project(rel *pgoutput.Relation, t *pgoutput.Tuple, columns []string) (map[s
 		if !slices.Contains(columns, meta.Name) {
 			continue
 		}
+		size += len(meta.Name) + len(col.Data) + 4
 		switch col.Kind {
-		case pgoutput.ColNull:
-			out[meta.Name] = nil
 		case pgoutput.ColUnchanged:
 			unchanged = append(unchanged, meta.Name)
 		case pgoutput.ColText:
-			out[meta.Name] = jsonValue(meta.TypeName, string(col.Data))
+			rec[meta.Name] = vals[i]
 		default:
-			out[meta.Name] = nil
+			rec[meta.Name] = nil
 		}
 	}
-	return out, unchanged
-}
-
-// approxSize estimates the encoded size of a projected row without paying for a
-// marshal on the per-change path. Only strings and raw JSON can be large enough
-// to matter, so everything else is charged a flat few bytes.
-func approxSize(rec map[string]any) int {
-	n := 0
-	for k, v := range rec {
-		n += len(k) + 4
-		switch t := v.(type) {
-		case string:
-			n += len(t)
-		case json.RawMessage:
-			n += len(t)
-		default:
-			n += 8
-		}
-	}
-	return n
+	return rec, unchanged, size
 }
 
 // keyOnly reduces a projected row to the columns that identify it.
@@ -602,31 +637,6 @@ func keyOnly(rec map[string]any, keys []string) map[string]any {
 		}
 	}
 	return out
-}
-
-// jsonValue converts a PostgreSQL text datum into a JSON-native value where that
-// is lossless, and leaves it as a string otherwise. Numbers are emitted as the
-// exact digits PostgreSQL produced, never round-tripped through float64, so a
-// numeric(20,2) keeps every digit; NaN and Infinity, which JSON cannot
-// represent, stay strings.
-func jsonValue(typeName, s string) any {
-	v := expr.ParseText(typeName, s)
-	switch v.Kind {
-	case expr.KindBool:
-		return v.Bool
-	case expr.KindInt, expr.KindFloat:
-		if json.Valid([]byte(s)) {
-			return json.Number(s)
-		}
-		return s
-	case expr.KindJSON:
-		if json.Valid([]byte(v.Str)) {
-			return json.RawMessage(v.Str)
-		}
-		return v.Str
-	default:
-		return v.Str
-	}
 }
 
 func primaryKeyOf(rel *pgoutput.Relation, m *pgoutput.Message) map[string]expr.Value {

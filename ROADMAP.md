@@ -14,7 +14,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - **Table-owner RLS bypass is not modeled.** An owner's subscription is judged by the policies (fail-closed).
 - **Tier B compares in Go.** Text comparisons use byte order rather than the column's collation, and `numeric` comparisons use float64. The PostgreSQL cross-check on the first decisions per subscription is the safeguard.
 - **Session revocation only knows what it saw.** Sessions deleted before the process started are not known, and a revoked session is remembered for two hours.
-- **Snapshot rows and live changes encode some types differently.** Snapshots use `to_jsonb` (ISO 8601 timestamps, JSON arrays); live changes use PostgreSQL's text output (`2026-09-29 20:24:42+00`, `{a,b}`), which does not match the generated `Database` types for arrays.
+- **The value encoding follows `to_jsonb` with three exceptions.** A `json` column is embedded as stored, not normalized the way `jsonb` would be. A float may arrive in exponent form (`1e+30`) where `to_jsonb` writes every digit. A type that `to_jsonb` converts through a cast to `json` (for example `hstore`) arrives as its text output.
 - **Snapshots are one query.** At most `SLUICE_SNAPSHOT_MAX_ROWS` rows, with `truncated` set when more matched; there is no paging.
 - **Snapshots for `BYPASSRLS` roles** need `sluice_authz` to be granted that role.
 - **Publication column lists are not validated.**
@@ -44,7 +44,6 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 
 ### Delivery
 
-- One value encoding for snapshots and live changes, matching `to_jsonb` and PostgREST: ISO 8601 timestamps and JSON arrays in live changes too (a wire change for existing clients).
 - Paged snapshots for large shapes.
 - A durable or shared resume buffer, so a restart or takeover does not force a resnapshot.
 - A subscribe-time `auth.sessions` lookup, to refuse tokens whose session was deleted before the process started.

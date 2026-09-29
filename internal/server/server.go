@@ -754,7 +754,7 @@ func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 		m := messageFromRing(e)
 		s.deliver(sub, m, e.Relation,
 			tupleRow{rel: e.Relation, t: e.New}, tupleRow{rel: e.Relation, t: e.Old},
-			newTuples(e.Relation, m),
+			s.newTuples(e.Relation, m),
 			e.LSN, e.CommitTime, opName(e.Op), false)
 	}
 	return true

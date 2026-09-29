@@ -200,7 +200,17 @@ The old tuple of an `UPDATE`/`DELETE` carries only the replica identity columns 
 
 ### Values
 
-`record` and `old` hold the projected columns. In live changes: booleans as JSON booleans, integers, floats and `numeric` as JSON numbers with PostgreSQL's exact digits (`NaN`/`Infinity` as strings), `json`/`jsonb` embedded, everything else as PostgreSQL's text output (`2026-09-29 20:24:42.39+00`, `{a,b}`, …). Snapshot rows are encoded by `to_jsonb`, so timestamps are ISO 8601 (`2026-09-29T20:24:42.39+00:00`) and arrays are JSON arrays; numbers keep their exact digits there too. An unchanged TOASTed column is not sent: it is listed in `unchanged` and absent from `record`, and the client keeps its previous value. When `record` + `old` exceed `SLUICE_MAX_CHANGE_BYTES`, both are trimmed to the key columns and the event carries `"degraded": "change_too_large"`.
+`record` and `old` hold the projected columns, encoded as `to_jsonb` encodes them (which is what PostgREST returns), identically in snapshot rows and live changes:
+
+- booleans as JSON booleans; integers, floats and `numeric` as JSON numbers with PostgreSQL's exact digits (`NaN` and `Infinity` as strings);
+- `json` and `jsonb` embedded;
+- `timestamp` and `timestamptz` in ISO 8601, `timestamptz` in UTC (`2026-09-29T20:24:42.39+00:00`);
+- arrays as JSON arrays (lower bounds dropped), composite types as objects, domains as their base type;
+- everything else (`date`, `time`, `interval`, `uuid`, `bytea`, `money`, enums, …) as PostgreSQL's text output.
+
+Sluice sets `DateStyle` and `IntervalStyle` on its own sessions, so the database's settings don't change the encoding. The few cases where it departs from `to_jsonb` are listed in [ROADMAP.md](ROADMAP.md#known-limitations).
+
+An unchanged TOASTed column is not sent: it is listed in `unchanged` and absent from `record`, and the client keeps its previous value. When `record` + `old` exceed `SLUICE_MAX_CHANGE_BYTES`, both are trimmed to the key columns and the event carries `"degraded": "change_too_large"`.
 
 ### Initial snapshots
 
@@ -208,7 +218,7 @@ With `initial: "snapshot"`, Sluice reads the rows itself in the same projection 
 
 1. The subscription is registered, so every change dispatched from then on reaches it live.
 2. The replay floor is the reader's confirmed LSN, taken before the snapshot query: everything dispatched up to it is in the snapshot.
-3. One read-only query (under the caller's role and claims in RLS mode, so RLS applies) returns at most `SLUICE_SNAPSHOT_MAX_ROWS` rows, ordered by the key. Rows arrive as `change` events with `op: "INSERT"`, `snapshot: true` and `commit_lsn` = the floor, then `snapshot_end` (with `truncated: true` if more rows matched). See [Values](#values) for how their encoding differs from live changes.
+3. One read-only query (under the caller's role and claims in RLS mode, so RLS applies) returns at most `SLUICE_SNAPSHOT_MAX_ROWS` rows, ordered by the key. Rows arrive as `change` events with `op: "INSERT"`, `snapshot: true` and `commit_lsn` = the floor, then `snapshot_end` (with `truncated: true` if more rows matched). They are encoded exactly like live changes (see [Values](#values)).
 4. Buffered changes from the floor on are replayed, so a live change delivered before an older snapshot row arrives again after it.
 
 Duplicates are possible; clients upsert by primary key. At most `SLUICE_SNAPSHOT_MAX_CONCURRENT` snapshots run at once. A failure sends `snapshot_failed` (retryable).
@@ -537,7 +547,7 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
 
 | Tool | What it checks |
 | --- | --- |
-| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, evaluator vs PostgreSQL, security negatives, a small fan-out |
+| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, value encoding vs `to_jsonb`, evaluator vs PostgreSQL, security negatives, a small fan-out |
 | `cmd/smoke-issuer` | the issuer process: grants, narrowing, hold cut, `/token` refresh (run after `cmd/smoke`) |
 | `cmd/audit` | a broad policy spectrum, DML and WAL edge cases, revocation, `/diagnostics`; needs `SERVICE_ROLE_KEY` and writes a JSON report to `/out` |
 | `cmd/load` | a fan-out soak on the harness (`LOAD_SCENARIO`, `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`) |

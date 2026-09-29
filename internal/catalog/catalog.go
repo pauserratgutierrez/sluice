@@ -20,6 +20,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
 )
 
@@ -64,6 +65,7 @@ type Relation struct {
 type Column struct {
 	Name     string
 	TypeName string
+	TypeOID  uint32
 	AttNum   int16
 	NotNull  bool
 }
@@ -195,6 +197,7 @@ type Cache struct {
 	byName   map[string]*Relation
 	bypass   map[string]bool
 	memberOf map[string]map[string]bool
+	types    map[uint32]*encode.Type
 	loaded   time.Time
 
 	// authzFP fingerprints everything an authorization decision reads, and
@@ -299,6 +302,10 @@ SELECT c.oid::oid,
          FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
        ), '{}')::text[] AS col_types,
        COALESCE((
+         SELECT array_agg(a.atttypid ORDER BY a.attnum)
+         FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+       ), '{}')::oid[] AS col_type_oids,
+       COALESCE((
          SELECT array_agg(a.attnum ORDER BY a.attnum)
          FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
        ), '{}')::smallint[] AS col_nums,
@@ -321,6 +328,121 @@ FROM pg_publication_tables pt
 JOIN pg_namespace n ON n.nspname = pt.schemaname
 JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
 WHERE pt.pubname = $1`
+
+// typeQuery loads every type a published column uses, and everything those
+// types are built from: a domain's base type, an array's element type, a
+// composite's attribute types. encodeTypes resolves them.
+const typeQuery = `
+WITH RECURSIVE walk(oid) AS (
+  SELECT DISTINCT a.atttypid
+    FROM pg_publication_tables pt
+    JOIN pg_namespace n ON n.nspname = pt.schemaname
+    JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   WHERE pt.pubname = $1
+  UNION
+  SELECT next.oid
+    FROM walk w
+    JOIN pg_type t ON t.oid = w.oid
+    CROSS JOIN LATERAL (
+      SELECT t.typbasetype AS oid WHERE t.typtype = 'd'
+      UNION ALL
+      SELECT t.typelem WHERE t.typcategory = 'A' AND t.typelem <> 0
+      UNION ALL
+      SELECT a.atttypid FROM pg_attribute a
+       WHERE t.typtype = 'c' AND a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+    ) next
+)
+SELECT t.oid, t.typtype, t.typcategory, t.typdelim, t.typbasetype, t.typelem,
+       COALESCE((SELECT array_agg(a.attname ORDER BY a.attnum) FROM pg_attribute a
+                  WHERE t.typtype = 'c' AND a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped),
+                '{}')::text[],
+       COALESCE((SELECT array_agg(a.atttypid ORDER BY a.attnum) FROM pg_attribute a
+                  WHERE t.typtype = 'c' AND a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped),
+                '{}')::oid[]
+  FROM walk w JOIN pg_type t ON t.oid = w.oid`
+
+type typeRow struct {
+	typtype, category, delim byte
+	base, elem               uint32
+	fieldNames               []string
+	fieldTypes               []uint32
+}
+
+// encodeTypes resolves each loaded type to how to_jsonb encodes it: a domain
+// as its base type, an array by its element type, a composite by its
+// attributes, and a base type by its OID.
+func encodeTypes(rows map[uint32]typeRow) map[uint32]*encode.Type {
+	out := make(map[uint32]*encode.Type, len(rows))
+	var resolve func(oid uint32, depth int) *encode.Type
+	resolve = func(oid uint32, depth int) *encode.Type {
+		if t, ok := out[oid]; ok {
+			return t
+		}
+		r, ok := rows[oid]
+		if !ok || depth > 32 {
+			return encode.Builtin(oid)
+		}
+		var t *encode.Type
+		switch {
+		case r.typtype == 'd':
+			t = resolve(r.base, depth+1)
+		case r.category == 'A' && r.elem != 0:
+			delim := rows[r.elem].delim
+			if delim == 0 {
+				delim = ','
+			}
+			t = &encode.Type{Kind: encode.Array, Elem: resolve(r.elem, depth+1), Delim: delim}
+		case r.typtype == 'c':
+			t = &encode.Type{Kind: encode.Composite}
+			for i, name := range r.fieldNames {
+				if i < len(r.fieldTypes) {
+					t.Fields = append(t.Fields, encode.Field{Name: name, Type: resolve(r.fieldTypes[i], depth+1)})
+				}
+			}
+		default:
+			t = encode.Builtin(oid)
+		}
+		out[oid] = t
+		return t
+	}
+	for oid := range rows {
+		resolve(oid, 0)
+	}
+	return out
+}
+
+func (c *Cache) loadTypes(ctx context.Context, publication string) (map[uint32]*encode.Type, error) {
+	rows, err := c.pool.Query(ctx, typeQuery, publication)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: query column types: %w", err)
+	}
+	defer rows.Close()
+	loaded := map[uint32]typeRow{}
+	for rows.Next() {
+		var oid uint32
+		var r typeRow
+		if err := rows.Scan(&oid, &r.typtype, &r.category, &r.delim, &r.base, &r.elem,
+			&r.fieldNames, &r.fieldTypes); err != nil {
+			return nil, fmt.Errorf("catalog: scan column type: %w", err)
+		}
+		loaded[oid] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: iterate column types: %w", err)
+	}
+	return encodeTypes(loaded), nil
+}
+
+// Types maps a column type OID to its wire encoding. The map is replaced, not
+// modified, on every refresh, so callers may keep and read it without a lock.
+// A type missing from it (one created since the last refresh) is encoded by
+// encode.Builtin.
+func (c *Cache) Types() map[uint32]*encode.Type {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.types
+}
 
 // memberQuery lists, for each accepted JWT role, the roles whose privileges it
 // has. pg_has_role(..., 'USAGE') is has_privs_of_role, the same test PostgreSQL
@@ -360,6 +482,10 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 	if err != nil {
 		return err
 	}
+	types, err := c.loadTypes(ctx, publication)
+	if err != nil {
+		return err
+	}
 
 	rows, err := c.pool.Query(ctx, relationQuery, publication)
 	if err != nil {
@@ -378,12 +504,13 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 			keyCols   []string
 			colNames  []string
 			colTypes  []string
+			colOIDs   []uint32
 			colNums   []int16
 			colNotNul []bool
 			indexed   []string
 		)
 		if err := rows.Scan(&r.OID, &r.Schema, &r.Name, &r.RLSEnabled, &r.ReplicaIdentity,
-			&riCols, &r.ReplicaIdentityOK, &keyCols, &colNames, &colTypes, &colNums, &colNotNul,
+			&riCols, &r.ReplicaIdentityOK, &keyCols, &colNames, &colTypes, &colOIDs, &colNums, &colNotNul,
 			&indexed, &r.HasToastableColumn); err != nil {
 			return fmt.Errorf("catalog: scan relation: %w", err)
 		}
@@ -397,6 +524,9 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 			col := Column{Name: colNames[i]}
 			if i < len(colTypes) {
 				col.TypeName = colTypes[i]
+			}
+			if i < len(colOIDs) {
+				col.TypeOID = colOIDs[i]
 			}
 			if i < len(colNums) {
 				col.AttNum = colNums[i]
@@ -460,7 +590,7 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 		c.authzFP = fp
 		c.authzVer++
 	}
-	c.byOID, c.byName, c.bypass, c.memberOf, c.loaded = byOID, byName, bypass, memberOf, time.Now()
+	c.byOID, c.byName, c.bypass, c.memberOf, c.types, c.loaded = byOID, byName, bypass, memberOf, types, time.Now()
 	c.mu.Unlock()
 	return nil
 }

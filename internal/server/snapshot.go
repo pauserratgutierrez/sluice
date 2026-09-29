@@ -1,9 +1,7 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -12,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
+	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
@@ -93,18 +92,22 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 // any query. Issuer mode selects as the pool role (BYPASSRLS or RLS off) using
 // the effective filter; zero rows is success.
 //
-// Rows are encoded by to_jsonb, so their values follow PostgreSQL's JSON
-// conversion (ISO 8601 timestamps, JSON arrays), and numbers are decoded
-// without passing through float64.
+// Columns are read in text format in DateStyle ISO and encoded by the same
+// code as change events, so a snapshot row and a change for the same row are
+// encoded identically: as to_jsonb would.
 func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (rows []map[string]any, truncated bool, err error) {
 	rel := sub.Relation
 
 	// The impersonation runs as its own statement with its own parameters, so the
 	// filter can number from $1 without colliding.
 	where, args := sub.Filter.SQL(1)
+	types := s.cat.Types()
 	cols := make([]string, 0, len(sub.Columns))
+	enc := make([]*encode.Type, 0, len(sub.Columns))
 	for _, c := range sub.Columns {
 		cols = append(cols, catalog.QuoteIdent(c))
+		col, _ := rel.Column(c)
+		enc = append(enc, typeOf(types, col.TypeOID))
 	}
 
 	// Order by the key so LIMIT is deterministic, using only key columns the
@@ -121,19 +124,22 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 
 	// One row past the cap tells a full result from a truncated one.
 	limit := s.cfg.SnapshotMaxRows
-	sql := fmt.Sprintf(`SELECT to_jsonb(t) FROM (SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d) t`,
+	sql := fmt.Sprintf(`SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d`,
 		strings.Join(cols, ", "), catalog.QuoteQualified(rel.Schema, rel.Name), where,
 		strings.Join(order, ", "), limit+1)
 
 	// A single statement, so it sees one consistent state. READ ONLY so an
 	// accidental write is impossible even under a misbehaving policy; the
-	// transaction is what scopes the impersonation.
+	// transaction is what scopes the impersonation and the output settings.
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx, textOutputSettings); err != nil {
+		return nil, false, err
+	}
 	if s.impersonateSnapshots() {
 		id := streamOf(sub).Identity()
 		if _, err := tx.Exec(ctx,
@@ -143,7 +149,10 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 		}
 	}
 
-	qrows, err := tx.Query(ctx, sql, args...)
+	// Text result format returns each value as its type's output function
+	// prints it, which is exactly what pgoutput sends. A ::text cast is not
+	// equivalent (bool, char(n) and inet differ).
+	qrows, err := tx.Query(ctx, sql, append([]any{pgx.QueryResultFormats{pgx.TextFormatCode}}, args...)...)
 	if err != nil {
 		return nil, false, fmt.Errorf("snapshot query: %w", err)
 	}
@@ -155,17 +164,19 @@ func (s *Server) readSnapshot(ctx context.Context, sub *registry.Subscription) (
 			truncated = true
 			break
 		}
-		var raw []byte
-		if err := qrows.Scan(&raw); err != nil {
-			return nil, false, err
-		}
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.UseNumber()
-		var m map[string]any
-		if err := dec.Decode(&m); err != nil {
-			return nil, false, err
+		m := make(map[string]any, len(cols))
+		for i, raw := range qrows.RawValues() {
+			if raw == nil {
+				m[sub.Columns[i]] = nil
+			} else {
+				m[sub.Columns[i]] = enc[i].Value(string(raw))
+			}
 		}
 		rows = append(rows, m)
 	}
 	return rows, truncated, qrows.Err()
 }
+
+// textOutputSettings pins, for one transaction, the settings the encoder's
+// input depends on. The replication connection sets the same ones at startup.
+const textOutputSettings = `SELECT set_config('DateStyle', 'ISO', true), set_config('IntervalStyle', 'postgres', true)`
