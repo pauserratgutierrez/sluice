@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pauserratgutierrez/sluice/internal/encode"
@@ -412,8 +413,8 @@ func encodeTypes(rows map[uint32]typeRow) map[uint32]*encode.Type {
 	return out
 }
 
-func (c *Cache) loadTypes(ctx context.Context, publication string) (map[uint32]*encode.Type, error) {
-	rows, err := c.pool.Query(ctx, typeQuery, publication)
+func loadTypes(ctx context.Context, q querier, publication string) (map[uint32]*encode.Type, error) {
+	rows, err := q.Query(ctx, typeQuery, publication)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: query column types: %w", err)
 	}
@@ -472,22 +473,39 @@ FROM pg_policy p
 WHERE p.polcmd IN ('r','*') AND p.polqual IS NOT NULL
   AND p.polrelid = ANY($1::oid[])`
 
+// querier is what the catalog loaders need from a connection or transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // Refresh reloads every published relation.
 func (c *Cache) Refresh(ctx context.Context, publication string) error {
-	bypass, err := c.loadBypassRoles(ctx)
+	// JIT is off for these queries: they read a few catalog rows, but the
+	// recursive type walk is estimated far above jit_above_cost, and compiling
+	// it takes hundreds of milliseconds for a query that runs in a few.
+	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return fmt.Errorf("catalog: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL jit = off`); err != nil {
+		return fmt.Errorf("catalog: disable jit: %w", err)
+	}
+
+	bypass, err := c.loadBypassRoles(ctx, tx)
 	if err != nil {
 		return err
 	}
-	memberOf, err := c.loadMemberships(ctx)
+	memberOf, err := c.loadMemberships(ctx, tx)
 	if err != nil {
 		return err
 	}
-	types, err := c.loadTypes(ctx, publication)
+	types, err := loadTypes(ctx, tx, publication)
 	if err != nil {
 		return err
 	}
 
-	rows, err := c.pool.Query(ctx, relationQuery, publication)
+	rows, err := tx.Query(ctx, relationQuery, publication)
 	if err != nil {
 		return fmt.Errorf("catalog: query relations: %w", err)
 	}
@@ -546,7 +564,7 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 	}
 
 	if len(oids) > 0 {
-		prows, err := c.pool.Query(ctx, policyQuery, oids)
+		prows, err := tx.Query(ctx, policyQuery, oids)
 		if err != nil {
 			return fmt.Errorf("catalog: query policies: %w", err)
 		}
@@ -699,12 +717,12 @@ func authzFingerprint(byOID map[uint32]*Relation, bypass map[string]bool, member
 	return out
 }
 
-func (c *Cache) loadMemberships(ctx context.Context) (map[string]map[string]bool, error) {
+func (c *Cache) loadMemberships(ctx context.Context, q querier) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	if len(c.roles) == 0 {
 		return out, nil
 	}
-	rows, err := c.pool.Query(ctx, memberQuery, c.roles)
+	rows, err := q.Query(ctx, memberQuery, c.roles)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: query role memberships: %w", err)
 	}
@@ -733,8 +751,8 @@ func (c *Cache) MemberOf(role string) map[string]bool {
 	return c.memberOf[role]
 }
 
-func (c *Cache) loadBypassRoles(ctx context.Context) (map[string]bool, error) {
-	rows, err := c.pool.Query(ctx, bypassQuery)
+func (c *Cache) loadBypassRoles(ctx context.Context, q querier) (map[string]bool, error) {
+	rows, err := q.Query(ctx, bypassQuery)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: query bypassrls roles: %w", err)
 	}
