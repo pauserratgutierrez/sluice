@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -83,6 +84,7 @@ func run() error {
 	}
 	log := newLogger(cfg)
 	log.Info("starting", "version", version, "node_id", cfg.NodeID)
+	applyMemoryLimit(log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -155,6 +157,7 @@ func run() error {
 		TierC:           cfg.TierC,
 		MaxProbesPerSec: cfg.TierCMaxProbes,
 		VerifySamples:   cfg.TierBVerify,
+		ProbeTimeout:    cfg.TierCTimeout,
 	})
 	// A compiled predicate disagreeing with PostgreSQL is the most serious thing
 	// that can go wrong in Sluice, so it is logged at ERROR and counted, not
@@ -227,14 +230,25 @@ func run() error {
 	// report not ready (so a load balancer sends them no streams) until the
 	// reader's process goes away and they take over.
 	readerDone := make(chan error, 1)
+	// The pool waits on Close for every connection it lent out, and the lock's
+	// is never given back while the process runs; without this release, a
+	// shutdown blocked there until the process was killed. Closing the pool
+	// then closes the connection, which releases the lock.
+	var lockConn atomic.Pointer[pgxpool.Conn]
+	defer func() {
+		if c := lockConn.Load(); c != nil {
+			c.Release()
+		}
+	}()
 	go func() {
 		metrics.ReaderIsLeader.Set(0)
 		for standing := false; ; standing = true {
-			ok, err := acquireLeadership(ctx, pool, cfg.SlotName)
+			conn, err := acquireLeadership(ctx, pool, cfg.SlotName)
 			if err != nil && ctx.Err() == nil {
 				log.Warn("could not try the reader lock", "err", err)
 			}
-			if ok {
+			if conn != nil {
+				lockConn.Store(conn)
 				break
 			}
 			if !standing {
@@ -259,8 +273,14 @@ func run() error {
 		// No write timeout: SSE streams are long-lived by definition, and each
 		// write is bounded individually with SetWriteDeadline instead.
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       0,
+		// Applies only between requests on a kept-alive connection, never to a
+		// stream in progress. Longer than a reverse proxy's own idle timeout
+		// (Caddy's and nginx's are shorter), so the proxy closes first and
+		// never reuses a connection Sluice is closing.
+		IdleTimeout: 5 * time.Minute,
 	}
+	// Shutdown waits for handlers to return; Drain is what ends the streams.
+	httpSrv.RegisterOnShutdown(srv.Drain)
 	httpDone := make(chan error, 1)
 	go func() {
 		log.Info("listening", "addr", cfg.ListenAddr, "prefix", cfg.PathPrefix)
@@ -293,28 +313,30 @@ func run() error {
 	return httpSrv.Shutdown(shutdownCtx)
 }
 
-// acquireLeadership tries a session-scoped advisory lock keyed by the slot name.
+// acquireLeadership tries a session-scoped advisory lock keyed by the slot name,
+// and returns the connection holding it, or nil when another process holds it.
 //
-// On success the pooled connection holding the lock is deliberately never
-// released: the lock must last for the reader's whole lifetime, and the
-// connection dying is exactly the signal that should free it. It permanently
-// takes one of SLUICE_DB_POOL_MAX_CONNS. The slot itself is the hard guarantee
-// -- PostgreSQL lets only one connection stream it -- and the lock keeps a
-// standby from contending for it.
-func acquireLeadership(ctx context.Context, pool *pgxpool.Pool, slot string) (bool, error) {
+// The caller keeps that connection for the reader's whole lifetime and
+// releases it only as the pool closes: the lock must last as long as the
+// reader, and the connection dying is exactly the signal that should free it.
+// It permanently takes one of SLUICE_DB_POOL_MAX_CONNS. The slot itself is the
+// hard guarantee -- PostgreSQL lets only one connection stream it -- and the
+// lock keeps a standby from contending for it.
+func acquireLeadership(ctx context.Context, pool *pgxpool.Pool, slot string) (*pgxpool.Conn, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	var ok bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, "sluice:"+slot).Scan(&ok); err != nil {
 		conn.Release()
-		return false, err
+		return nil, err
 	}
 	if !ok {
 		conn.Release()
+		return nil, nil
 	}
-	return ok, nil
+	return conn, nil
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {

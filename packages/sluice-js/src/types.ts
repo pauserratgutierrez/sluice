@@ -91,6 +91,8 @@ export interface SluiceErrorPayload {
   message: string
   retryable?: boolean
   action?: string
+  /** How long to wait before reconnecting, e.g. after `server_shutdown`. */
+  retry_after_ms?: number
 }
 
 export interface SubscriptionResult {
@@ -210,6 +212,8 @@ export class SluiceError extends Error {
   readonly retryable: boolean
   readonly action?: string
   readonly sub?: string
+  /** How long the server asked the client to wait before reconnecting. */
+  readonly retryAfterMs?: number
 
   constructor(payload: SluiceErrorPayload) {
     super(payload.message)
@@ -218,5 +222,6 @@ export class SluiceError extends Error {
     this.retryable = payload.retryable ?? false
     this.action = payload.action
     this.sub = payload.sub
+    this.retryAfterMs = payload.retry_after_ms
   }
 }

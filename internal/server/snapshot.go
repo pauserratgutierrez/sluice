@@ -44,9 +44,11 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	}
 	rel := sub.Relation
 
+	// The semaphore bounds database work only. It is released before the rows
+	// are queued, which waits on the client, so a slow reader cannot hold up
+	// everyone else's snapshot.
 	select {
 	case s.snapSem <- struct{}{}:
-		defer func() { <-s.snapSem }()
 	case <-ctx.Done():
 		return
 	}
@@ -58,6 +60,7 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 
 	start := time.Now()
 	rows, truncated, err := s.readSnapshot(ctx, sub)
+	<-s.snapSem
 	if err != nil {
 		hub.SendError(st, event.Error{Sub: sub.Label, Code: "snapshot_failed",
 			Message: err.Error(), Retryable: true})
@@ -66,17 +69,23 @@ func (s *Server) snapshot(ctx context.Context, sub *registry.Subscription) {
 	metrics.SnapshotSeconds.WithLabelValues(rel.Schema, rel.Name).Observe(time.Since(start).Seconds())
 	metrics.SnapshotRows.WithLabelValues(rel.Schema, rel.Name).Add(float64(len(rows)))
 
+	// A snapshot can be far larger than a stream's queue, and is read faster
+	// than any client drains it, so it waits for room rather than overflowing.
 	for _, r := range rows {
-		st.Send(event.Event{Kind: event.KindChange, Data: event.Change{
+		if !st.SendBackfill(ctx, event.Event{Kind: event.KindChange, Data: event.Change{
 			Sub: sub.Label, Op: "INSERT", Schema: rel.Schema, Table: rel.Name,
 			CommitLSN: reader.FormatLSN(floor), Seq: sub.NextSeq(),
-			Record: r, Snapshot: true,
-		}})
+			Record: event.NewRow(r), Snapshot: true,
+		}}) {
+			return
+		}
 	}
 
-	st.Send(event.Event{Kind: event.KindSnapshotEnd, Data: event.SnapshotEnd{
+	if !st.SendBackfill(ctx, event.Event{Kind: event.KindSnapshotEnd, Data: event.SnapshotEnd{
 		Sub: sub.Label, Rows: len(rows), FloorLSN: reader.FormatLSN(floor), Truncated: truncated,
-	}})
+	}}) {
+		return
+	}
 
 	// Changes after the floor may already have been delivered live before the
 	// rows above, which could be older; replaying them puts the newest version

@@ -4,32 +4,35 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 	"github.com/pauserratgutierrez/sluice/internal/registry"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
-// walDocs decodes a Relation message for docsRel() the way the reader does, with
-// id as the replica identity key.
-func walDocs(t *testing.T) *pgoutput.Relation {
+type walColumn struct {
+	key  byte
+	name string
+	oid  uint32
+}
+
+// walRelation decodes a Relation message the way the reader does.
+func walRelation(t *testing.T, oid uint32, schema, name string, cols ...walColumn) *pgoutput.Relation {
 	t.Helper()
 	var b bytes.Buffer
 	b.WriteByte(pgoutput.MsgRelation)
-	_ = binary.Write(&b, binary.BigEndian, uint32(100))
-	b.WriteString("public\x00documents\x00")
+	_ = binary.Write(&b, binary.BigEndian, oid)
+	b.WriteString(schema + "\x00" + name + "\x00")
 	b.WriteByte('d')
-	_ = binary.Write(&b, binary.BigEndian, uint16(3))
-	for _, c := range []struct {
-		key  byte
-		name string
-		oid  uint32
-	}{{1, "id", 20}, {0, "project_id", 25}, {0, "title", 25}} {
+	_ = binary.Write(&b, binary.BigEndian, uint16(len(cols)))
+	for _, c := range cols {
 		b.WriteByte(c.key)
 		b.WriteString(c.name + "\x00")
 		_ = binary.Write(&b, binary.BigEndian, c.oid)
@@ -42,6 +45,14 @@ func walDocs(t *testing.T) *pgoutput.Relation {
 	return m.Relation
 }
 
+// walDocs decodes a Relation message for docsRel(), with id as the replica
+// identity key.
+func walDocs(t *testing.T) *pgoutput.Relation {
+	t.Helper()
+	return walRelation(t, 100, "public", "documents",
+		walColumn{1, "id", 20}, walColumn{0, "project_id", 25}, walColumn{0, "title", 25})
+}
+
 func row(vals ...string) *pgoutput.Tuple {
 	t := &pgoutput.Tuple{}
 	for _, v := range vals {
@@ -50,18 +61,14 @@ func row(vals ...string) *pgoutput.Tuple {
 	return t
 }
 
-func changesOf(st interface{ Events() <-chan event.Event }) []event.Change {
+func changesOf(st *hub.Stream) []event.Change {
 	var out []event.Change
-	for {
-		select {
-		case ev := <-st.Events():
-			if c, ok := ev.Data.(event.Change); ok {
-				out = append(out, c)
-			}
-		default:
-			return out
+	for _, ev := range st.Take(nil) {
+		if c, ok := ev.Data.(event.Change); ok {
+			out = append(out, c)
 		}
 	}
+	return out
 }
 
 func deliverUpdate(t *testing.T, transitions bool, columns []string) []event.Change {
@@ -114,14 +121,65 @@ func TestProjectionIsExactlyTheSubscriptionColumns(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d events", len(got))
 	}
-	if _, ok := got[0].Record["project_id"]; ok {
-		t.Errorf("record = %v, carries a column outside the projection", got[0].Record)
+	rec := got[0].Record.Values
+	if _, ok := rec["project_id"]; ok {
+		t.Errorf("record = %v, carries a column outside the projection", rec)
 	}
-	if got[0].Record["title"] != "renamed" {
-		t.Errorf("record = %v", got[0].Record)
+	if rec["title"] != "renamed" {
+		t.Errorf("record = %v", rec)
 	}
 	// Values are encoded by column type, as to_jsonb would: id is an int8.
-	if b, _ := json.Marshal(got[0].Record["id"]); string(b) != "7" {
+	if b, _ := json.Marshal(rec["id"]); string(b) != "7" {
 		t.Errorf("id encoded as %s, want the number 7", b)
+	}
+}
+
+// Subscriptions that project the same columns share one record, so a change
+// is encoded once per projection rather than once per subscriber; a different
+// projection gets its own.
+func TestProjectionIsSharedAcrossSubscribers(t *testing.T) {
+	s := testServer(t, stubOracle{name: oracle.NameRLS})
+	rel := docsRel()
+	f, err := shape.Parse("project_id=eq.42", rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops, _ := shape.ParseOps(nil)
+	var streams []*hub.Stream
+	for i, cols := range [][]string{{"id", "title"}, {"id", "title"}, {"id"}} {
+		st := s.hub.Open(fmt.Sprintf("n1.%d", i), authz.Identity{Sub: "u1", Role: "authenticated"})
+		streams = append(streams, st)
+		if !s.reg.Add(&registry.Subscription{
+			Label: "docs", Sink: st, Relation: rel, Ops: ops, Filter: f, Columns: cols,
+			Decision:   authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}),
+			RoutingKey: f.RoutingKey(rel),
+		}) {
+			t.Fatal("add")
+		}
+	}
+	m := &pgoutput.Message{Type: pgoutput.MsgInsert, RelationOID: 100, New: row("7", "42", "hello")}
+	if err := s.OnChange(m, walDocs(t), 0x10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	var recs []*event.Row
+	for _, st := range streams {
+		got := changesOf(st)
+		if len(got) != 1 {
+			t.Fatalf("got %d events, want 1", len(got))
+		}
+		recs = append(recs, got[0].Record)
+	}
+	if recs[0] != recs[1] {
+		t.Error("two subscriptions with the same projection got separate records")
+	}
+	if recs[0] == recs[2] {
+		t.Fatal("a narrower projection shared the wider record")
+	}
+	if b, _ := json.Marshal(recs[2]); string(b) != `{"id":7}` {
+		t.Errorf("narrow record encoded as %s", b)
+	}
+	if b, _ := json.Marshal(recs[0]); string(b) != `{"id":7,"title":"hello"}` {
+		t.Errorf("shared record encoded as %s", b)
 	}
 }

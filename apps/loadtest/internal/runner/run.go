@@ -67,7 +67,7 @@ func Main() error {
 		signer:   signer,
 		pool:     pool,
 		http:     newHTTPClient(),
-		scenario: selectScenario(cfg.Scenario, cfg.Channel),
+		scenario: selectScenario(cfg.Scenario, cfg.Channel, cfg.IdleShapes),
 	}
 
 	rep := Report{
@@ -189,7 +189,7 @@ func (a *app) runAxis(ctx context.Context, log *slog.Logger, axis string, cfg Co
 	return maxN, steps, err
 }
 
-func selectScenario(name, channel string) scenario {
+func selectScenario(name, channel string, idleShapes int) scenario {
 	if channel == "" {
 		channel = "room:load"
 	}
@@ -259,6 +259,22 @@ func selectScenario(name, channel string) scenario {
 				return `{"subscriptions":[` + roomP + `]}`
 			},
 		}
+	case "idle":
+		// A product's typical stream: a few shapes and a channel, mostly quiet.
+		return scenario{
+			Name:       "idle",
+			Kind:       kindNotes,
+			Plane:      planeIdle,
+			Channel:    channel,
+			ExpectTier: "A",
+			SubscribeJSON: func(u User) string {
+				subs := make([]string, 0, idleShapes+1)
+				for i := range idleShapes {
+					subs = append(subs, fmt.Sprintf(`{"sub":"n%d","shape":{"schema":"public","table":"notes","filter":"owner_id=eq.%s"}}`, i, u.ID))
+				}
+				return `{"subscriptions":[` + strings.Join(append(subs, room), ",") + `]}`
+			},
+		}
 	case "mixed":
 		return scenario{
 			Name:       "mixed",
@@ -291,7 +307,7 @@ func selectScenario(name, channel string) scenario {
 
 func (a *app) warmup() (users, conns, changes int) {
 	switch a.scenario.Plane {
-	case planePresence, planeKick:
+	case planePresence, planeKick, planeIdle:
 		return 10, 1, 5
 	case planeBroadcast, planeMixed:
 		return 8, 1, 5
@@ -308,7 +324,7 @@ func axesFor(cfg Config) []string {
 		return []string{"conns"}
 	}
 	switch cfg.Scenario {
-	case "presence", "kick":
+	case "presence", "kick", "idle":
 		return []string{"users"}
 	default:
 		return []string{"users", "conns"}
@@ -327,6 +343,10 @@ func printStep(log *slog.Logger, st Step) {
 		"db_bcast", st.DBBroadcasts,
 		"presence", st.PresenceReady,
 		"kicked", st.Kicked,
+		"kib_per_stream", fmt.Sprintf("%.1f", st.KiBPerStream),
+		"live_peak_mib", fmt.Sprintf("%.0f", st.LivePeakMiB),
+		"rss_peak_mib", fmt.Sprintf("%.0f", st.RSSPeakMiB),
+		"cpu_s", fmt.Sprintf("%.2f", st.CPUSeconds),
 		"tier", st.ObservedTier,
 		"oracle", st.ObservedOracle,
 		"reason", st.FailReason,

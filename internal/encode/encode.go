@@ -129,15 +129,25 @@ var tzLayouts = []string{
 	"2006-01-02 15:04:05-07:00:00",
 }
 
+// ParseTimestampTZ parses a timestamptz in PostgreSQL's ISO text output, such
+// as `2026-09-29 22:24:42.39+02`. It reports false for `infinity`, BC dates and
+// years past 9999, which time.Time cannot hold in that form.
+func ParseTimestampTZ(s string) (time.Time, bool) {
+	for _, layout := range tzLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // isoTimestampTZ turns `2026-09-29 22:24:42.39+02` into
 // `2026-09-29T20:24:42.39+00:00`: the same instant in UTC, whatever time zone
 // the session printed it in. Values Go cannot represent (BC, years past 9999)
 // keep their offset and only gain the `T`.
 func isoTimestampTZ(s string) string {
-	for _, layout := range tzLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC().Format("2006-01-02T15:04:05.999999-07:00")
-		}
+	if t, ok := ParseTimestampTZ(s); ok {
+		return t.UTC().Format("2006-01-02T15:04:05.999999-07:00")
 	}
 	out := isoTimestamp(s)
 	// PostgreSQL omits the minutes of a whole-hour offset; to_jsonb does not.

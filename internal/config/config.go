@@ -67,6 +67,7 @@ type Config struct {
 	CatalogRefresh  time.Duration
 	TierC           string // allow | deny
 	TierCMaxProbes  int
+	TierCTimeout    time.Duration
 	TierBVerify     int // cross-checks per Tier B subscription; 0 disables
 	UnindexedMax    int
 	ReplicaIdentity string // warn | strict
@@ -86,6 +87,7 @@ type Config struct {
 	Heartbeat          time.Duration
 	StreamQueue        int
 	WriteTimeout       time.Duration
+	ReconnectSpread    time.Duration
 	MaxStreams         int
 	MaxSubsPerStream   int
 	MaxShapesPerStream int
@@ -160,6 +162,7 @@ func Load() (*Config, error) {
 		IssuerTimeout:  envDur("SLUICE_ISSUER_TIMEOUT", 2*time.Second),
 		TierC:          env("SLUICE_TIER_C", "allow"),
 		TierCMaxProbes: envInt("SLUICE_TIER_C_MAX_PROBES_PER_SECOND", 2000),
+		TierCTimeout:   envDur("SLUICE_TIER_C_TIMEOUT", time.Second),
 		// Tier B reimplements PostgreSQL's evaluation semantics in Go, so the
 		// first few decisions on each subscription are cross-checked against
 		// PostgreSQL evaluating the same predicate on the same tuple. A
@@ -178,6 +181,7 @@ func Load() (*Config, error) {
 		Heartbeat:          envDur("SLUICE_HEARTBEAT", 20*time.Second),
 		StreamQueue:        envInt("SLUICE_STREAM_QUEUE", 256),
 		WriteTimeout:       envDur("SLUICE_WRITE_TIMEOUT", 10*time.Second),
+		ReconnectSpread:    envDur("SLUICE_RECONNECT_SPREAD", 10*time.Second),
 		MaxStreams:         envInt("SLUICE_MAX_STREAMS", 50000),
 		MaxSubsPerStream:   envInt("SLUICE_MAX_SUBS_PER_STREAM", 100),
 		MaxShapesPerStream: envInt("SLUICE_MAX_SHAPES_PER_STREAM", 20),
@@ -246,6 +250,9 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("SLUICE_TIER_C must be allow or deny")
 	}
+	if c.TierCTimeout <= 0 {
+		return fmt.Errorf("SLUICE_TIER_C_TIMEOUT must be positive")
+	}
 	switch c.ReplicaIdentity {
 	case "warn", "strict":
 	default:
@@ -258,6 +265,9 @@ func (c *Config) validate() error {
 	}
 	if c.PresenceWindow <= 0 {
 		return fmt.Errorf("SLUICE_PRESENCE_WINDOW must be positive")
+	}
+	if c.ReconnectSpread < 0 {
+		return fmt.Errorf("SLUICE_RECONNECT_SPREAD must not be negative")
 	}
 	if c.Heartbeat < 5*time.Second {
 		return fmt.Errorf("SLUICE_HEARTBEAT below 5s is counterproductive: frequent " +

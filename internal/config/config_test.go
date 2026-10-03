@@ -10,6 +10,7 @@ func baseValid() *Config {
 		JWTAlg:          "ES256",
 		ProtoVersion:    4,
 		TierC:           "allow",
+		TierCTimeout:    1_000_000_000,
 		ReplicaIdentity: "warn",
 		DegradedDeletes: "withhold",
 		Heartbeat:       20_000_000_000,

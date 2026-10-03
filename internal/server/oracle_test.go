@@ -153,13 +153,12 @@ func TestPublicationDropRemovesShapeAndHold(t *testing.T) {
 	if s.holds.Count() != 0 {
 		t.Fatal("hold watch on an unpublished table must drop")
 	}
-	select {
-	case ev := <-st.Events():
-		errp, ok := ev.Data.(event.Error)
+	if evs := events(st); len(evs) > 0 {
+		errp, ok := evs[0].Data.(event.Error)
 		if !ok || errp.Code != "relation_unpublished" {
-			t.Fatalf("event = %+v, want relation_unpublished", ev.Data)
+			t.Fatalf("event = %+v, want relation_unpublished", evs[0].Data)
 		}
-	default:
+	} else {
 		t.Fatal("expected relation_unpublished on the still-open stream")
 	}
 	if _, ok := s.hub.Get(st.StreamID()); !ok {
@@ -214,16 +213,15 @@ func TestHoldReplicaIdentityWeakenedCutsShape(t *testing.T) {
 	if s.holds.Count() != 0 {
 		t.Fatal("hold watch must drop with the shape")
 	}
-	select {
-	case ev := <-st.Events():
-		errp, ok := ev.Data.(event.Error)
+	if evs := events(st); len(evs) > 0 {
+		errp, ok := evs[0].Data.(event.Error)
 		if !ok || errp.Code != "shape_not_authorized" {
-			t.Fatalf("event = %+v, want shape_not_authorized", ev.Data)
+			t.Fatalf("event = %+v, want shape_not_authorized", evs[0].Data)
 		}
 		if !strings.Contains(errp.Message, "REPLICA IDENTITY") {
 			t.Fatalf("message must be the join RI remedy, got %q", errp.Message)
 		}
-	default:
+	} else {
 		t.Fatal("expected shape_not_authorized on the still-open stream")
 	}
 	if _, ok := s.hub.Get(st.StreamID()); !ok {
@@ -252,10 +250,8 @@ func TestHoldReplicaIdentityStillCoveringKeepsShape(t *testing.T) {
 	if len(watches) != 1 || len(watches[0].Holds) != 1 || watches[0].Holds[0].Rel != fresh {
 		t.Fatal("hold Rel must swap to the catalog pointer so diagnostics is not stale")
 	}
-	select {
-	case ev := <-st.Events():
-		t.Fatalf("covering RI must not cut, got %+v", ev.Data)
-	default:
+	if evs := events(st); len(evs) > 0 {
+		t.Fatalf("covering RI must not cut, got %+v", evs[0].Data)
 	}
 	if _, ok := s.hub.Get(st.StreamID()); !ok {
 		t.Fatal("stream must stay open")

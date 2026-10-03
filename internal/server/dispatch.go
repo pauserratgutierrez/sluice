@@ -269,18 +269,44 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	return nil
 }
 
+// sendChange queues a change. A live change never waits: the reader serves
+// every stream, so one slow client must not hold it. A backfilled one -- a
+// replay off the replication path -- waits for room instead of overflowing.
+func (s *Server) sendChange(st *hub.Stream, ev event.Event, backfill bool) {
+	if backfill {
+		st.SendBackfill(s.ctx, ev)
+		return
+	}
+	st.Send(ev)
+}
+
 // tuplePair is one change as every subscriber sees it: the tuples the
 // authorizer reads (the new one for INSERT/UPDATE, the old one for DELETE and
 // shape-exit detection), and each tuple's column values encoded for the wire.
 // The encoding is done once, on first use, and shared by every subscriber's
-// projection. A tuplePair is used by one goroutine at a time.
+// projection; so is each distinct projection. A tuplePair is used by one
+// goroutine at a time.
 type tuplePair struct {
 	New, Old *authz.Tuple
 
 	rel              *pgoutput.Relation
 	types            map[uint32]*encode.Type
 	newVals, oldVals []any
+	newProj, oldProj []projection
 }
+
+// projection is one tuple projected onto one column list.
+type projection struct {
+	columns   []string
+	rec       *event.Row
+	unchanged []string
+	size      int
+}
+
+// maxProjections bounds how many distinct column lists a change memoises.
+// Subscriptions to a table almost always project one of a few lists; past the
+// bound, projections are built per subscription.
+const maxProjections = 8
 
 func (s *Server) newTuples(rel *pgoutput.Relation, m *pgoutput.Message) *tuplePair {
 	pk := primaryKeyOf(rel, m)
@@ -319,6 +345,34 @@ func (p *tuplePair) oldValues() []any {
 	return p.values(p.Old.Row, &p.oldVals)
 }
 
+func (p *tuplePair) newProjection(columns []string) projection {
+	if p.New == nil {
+		return projection{}
+	}
+	return p.projection(p.New.Row, p.newValues(), columns, &p.newProj)
+}
+
+func (p *tuplePair) oldProjection(columns []string) projection {
+	if p.Old == nil {
+		return projection{}
+	}
+	return p.projection(p.Old.Row, p.oldValues(), columns, &p.oldProj)
+}
+
+func (p *tuplePair) projection(t *pgoutput.Tuple, vals []any, columns []string, memo *[]projection) projection {
+	for _, pr := range *memo {
+		if slices.Equal(pr.columns, columns) {
+			return pr
+		}
+	}
+	rec, unchanged, size := project(p.rel, t, vals, columns)
+	pr := projection{columns: columns, rec: event.NewRow(rec), unchanged: unchanged, size: size}
+	if len(*memo) < maxProjections {
+		*memo = append(*memo, pr)
+	}
+	return pr
+}
+
 // encodeTuple encodes every text column of a tuple as to_jsonb would.
 func encodeTuple(rel *pgoutput.Relation, t *pgoutput.Tuple, types map[uint32]*encode.Type) []any {
 	out := make([]any, len(t.Columns))
@@ -338,7 +392,8 @@ func typeOf(types map[uint32]*encode.Type, oid uint32) *encode.Type {
 	return encode.Builtin(oid)
 }
 
-// deliver evaluates one subscription against one change and emits at most one event.
+// deliver evaluates one subscription against one change and emits at most one
+// event. backfill is set for replays from the resume buffer; see sendChange.
 func (s *Server) deliver(
 	sub *registry.Subscription,
 	m *pgoutput.Message,
@@ -348,7 +403,7 @@ func (s *Server) deliver(
 	commitLSN uint64,
 	commitTime time.Time,
 	op string,
-	snapshot bool,
+	backfill bool,
 ) {
 	st := streamOf(sub)
 	if st == nil {
@@ -479,8 +534,8 @@ func (s *Server) deliver(
 		degraded = "delete_authz_unavailable"
 	}
 
-	rec, unchangedNew, newSize := project(rel, m.New, tuples.newValues(), sub.Columns)
-	oldRec, _, oldSize := project(rel, m.Old, tuples.oldValues(), sub.Columns)
+	newProj, oldProj := tuples.newProjection(sub.Columns), tuples.oldProjection(sub.Columns)
+	rec, oldRec, unchangedNew := newProj.rec, oldProj.rec, newProj.unchanged
 	for _, c := range unchangedNew {
 		metrics.ToastUnchanged.WithLabelValues(rel.Namespace, rel.Name, c).Inc()
 	}
@@ -488,7 +543,7 @@ func (s *Server) deliver(
 	// One enormous row must not be able to evict a stream's whole queue. Trim to
 	// the key columns so the client still learns which row changed and can
 	// refetch it, and say so rather than delivering a silently partial record.
-	if n := s.cfg.MaxChangeBytes; n > 0 && newSize+oldSize > n {
+	if n := s.cfg.MaxChangeBytes; n > 0 && newProj.size+oldProj.size > n {
 		rec = keyOnly(rec, sub.Relation.KeyColumns)
 		oldRec = keyOnly(oldRec, sub.Relation.KeyColumns)
 		unchangedNew = nil
@@ -508,17 +563,16 @@ func (s *Server) deliver(
 		Unchanged:  unchangedNew,
 		Transition: transition,
 		Degraded:   degraded,
-		Snapshot:   snapshot,
 	}
 	if !commitTime.IsZero() {
 		ch.CommitTime = commitTime.UTC().Format(time.RFC3339Nano)
 	}
 
-	st.Send(event.Event{
+	s.sendChange(st, event.Event{
 		Kind: event.KindChange,
 		ID:   ch.CommitLSN + ":" + strconv.Itoa(ch.Seq),
 		Data: ch,
-	})
+	}, backfill)
 }
 
 func (s *Server) noteUnknown(rel *pgoutput.Relation, op string) {
@@ -549,14 +603,50 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 			return
 		}
 		row := tupleRow{rel: rel, t: m.New}
-		banned, ok := row.Column("banned_until")
-		if !ok || banned.IsNull() {
+		idv, ok := row.Column("id")
+		if !ok || idv.IsNull() {
 			return
 		}
-		if idv, ok := row.Column("id"); ok {
-			s.revoker.BanUser(idv.String())
-			s.closeStreamsForUser(idv.String())
+		banned, ok := row.Column("banned_until")
+		if !ok {
+			return
 		}
+		until, active := banExpiry(banned, time.Now())
+		if !active {
+			s.revoker.UnbanUser(idv.String())
+			return
+		}
+		s.revoker.BanUser(idv.String(), until)
+		s.closeStreamsForUser(idv.String())
+	}
+}
+
+// banExpiry reads auth.users.banned_until and reports whether the ban is in
+// force, and until when.
+//
+// A ban whose time has passed is no ban. The auth service leaves the column set
+// when a timed ban runs out, so the next unrelated UPDATE of that user (a
+// sign-in sets last_sign_in_at) must not close their streams. A value that
+// cannot be read as a time is treated as a ban in force, the direction that
+// cannot leak.
+func banExpiry(v expr.Value, now time.Time) (time.Time, bool) {
+	// The revoker caps every ban at its TTL, so "forever" only has to be later
+	// than that.
+	const forever = 100 * 365 * 24 * time.Hour
+	if v.IsNull() {
+		return time.Time{}, false
+	}
+	switch s := v.String(); s {
+	case "infinity":
+		return now.Add(forever), true
+	case "-infinity":
+		return time.Time{}, false
+	default:
+		until, ok := encode.ParseTimestampTZ(s)
+		if !ok {
+			return now.Add(forever), true
+		}
+		return until, until.After(now)
 	}
 }
 
@@ -626,17 +716,17 @@ func project(rel *pgoutput.Relation, t *pgoutput.Tuple, vals []any, columns []st
 }
 
 // keyOnly reduces a projected row to the columns that identify it.
-func keyOnly(rec map[string]any, keys []string) map[string]any {
+func keyOnly(rec *event.Row, keys []string) *event.Row {
 	if rec == nil {
 		return nil
 	}
 	out := make(map[string]any, len(keys))
 	for _, k := range keys {
-		if v, ok := rec[k]; ok {
+		if v, ok := rec.Values[k]; ok {
 			out[k] = v
 		}
 	}
-	return out
+	return event.NewRow(out)
 }
 
 func primaryKeyOf(rel *pgoutput.Relation, m *pgoutput.Message) map[string]expr.Value {

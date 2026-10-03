@@ -79,7 +79,7 @@ func NewIssuerWith(o IssuerOptions) (*Issuer, error) {
 	}
 	var client *http.Client
 	if o.Client == nil {
-		client = &http.Client{Timeout: timeout, CheckRedirect: errNoIssuerRedirect}
+		client = &http.Client{Timeout: timeout, CheckRedirect: errNoIssuerRedirect, Transport: issuerTransport()}
 	} else {
 		c := *o.Client
 		c.CheckRedirect = errNoIssuerRedirect
@@ -92,6 +92,15 @@ func NewIssuerWith(o IssuerOptions) (*Issuer, error) {
 		lookup:  o.Lookup,
 		columns: o.Columns,
 	}, nil
+}
+
+// issuerTransport keeps enough idle connections to the issuer for a reconnect
+// wave, where every stream resubscribes at once. The default transport keeps
+// two per host, so the rest of a burst each opened a connection and closed it.
+func issuerTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = 64
+	return t
 }
 
 // errNoIssuerRedirect stops the client from following a 302 (or any redirect).

@@ -4,7 +4,8 @@
 //
 // Relation metadata is cached and refreshed on SLUICE_CATALOG_REFRESH and after
 // a schema change arrives on the replication stream; column privileges are
-// checked with a query at subscribe time. None of it is on the per-change path.
+// queried at subscribe time and kept until the next refresh. None of it is on
+// the per-change path.
 package catalog
 
 import (
@@ -205,6 +206,12 @@ type Cache struct {
 	// authzVer counts the times it changed. See AuthzVersion.
 	authzFP  [32]byte
 	authzVer uint64
+
+	// privileges caches column privilege answers until the next Refresh, which
+	// bumps privGen. See columnPrivileges.
+	privMu     sync.Mutex
+	privileges map[privilegeKey]bool
+	privGen    uint64
 }
 
 // New creates an empty cache. roles are the JWT roles whose memberships
@@ -610,7 +617,15 @@ func (c *Cache) Refresh(ctx context.Context, publication string) error {
 	}
 	c.byOID, c.byName, c.bypass, c.memberOf, c.types, c.loaded = byOID, byName, bypass, memberOf, types, time.Now()
 	c.mu.Unlock()
+	c.forgetPrivileges()
 	return nil
+}
+
+func (c *Cache) forgetPrivileges() {
+	c.privMu.Lock()
+	c.privileges = nil
+	c.privGen++
+	c.privMu.Unlock()
 }
 
 // sortPolicies puts the policies in a canonical order, because neither the
@@ -792,53 +807,89 @@ func (c *Cache) BypassesRLS(role string) bool {
 // Column-level grants are checked separately from RLS and always: a column the
 // role cannot select is never emitted, in any tier.
 func (c *Cache) HasColumnPrivilege(ctx context.Context, role string, rel *Relation, columns []string) (map[string]bool, error) {
-	out := make(map[string]bool, len(columns))
-	if len(columns) == 0 {
-		return out, nil
-	}
-	rows, err := c.pool.Query(ctx,
-		`SELECT col, has_column_privilege($1::regrole, $2::regclass, col, 'SELECT')
-		   FROM unnest($3::text[]) AS col`,
-		role, QuoteQualified(rel.Schema, rel.Name), columns)
-	if err != nil {
-		return nil, fmt.Errorf("catalog: has_column_privilege: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var col string
-		var ok bool
-		if err := rows.Scan(&col, &ok); err != nil {
-			return nil, err
-		}
-		out[col] = ok
-	}
-	return out, rows.Err()
+	return c.columnPrivileges(ctx, role, rel, columns, func(ctx context.Context, missing []string) (pgx.Rows, error) {
+		return c.pool.Query(ctx,
+			`SELECT col, has_column_privilege($1::regrole, $2::regclass, col, 'SELECT')
+			   FROM unnest($3::text[]) AS col`,
+			role, QuoteQualified(rel.Schema, rel.Name), missing)
+	})
 }
 
 // HasColumnPrivilegeCurrent is HasColumnPrivilege for the pool's current role.
 // Issuer snapshots and projections use physical SELECT, not the JWT role's ACL.
 func (c *Cache) HasColumnPrivilegeCurrent(ctx context.Context, rel *Relation, columns []string) (map[string]bool, error) {
+	return c.columnPrivileges(ctx, "", rel, columns, func(ctx context.Context, missing []string) (pgx.Rows, error) {
+		return c.pool.Query(ctx,
+			`SELECT col, has_column_privilege($1::regclass, col, 'SELECT')
+			   FROM unnest($2::text[]) AS col`,
+			QuoteQualified(rel.Schema, rel.Name), missing)
+	})
+}
+
+// privilegeKey names one cached answer. An empty role is the pool's own.
+type privilegeKey struct {
+	role   string
+	oid    uint32
+	column string
+}
+
+// columnPrivileges answers from the cache and queries only the columns it does
+// not hold. Answers are kept until the next Refresh, so a GRANT or REVOKE
+// reaches new subscriptions within SLUICE_CATALOG_REFRESH, and a reconnect wave
+// costs one query per relation and role instead of one per subscription.
+func (c *Cache) columnPrivileges(
+	ctx context.Context, role string, rel *Relation, columns []string,
+	query func(ctx context.Context, missing []string) (pgx.Rows, error),
+) (map[string]bool, error) {
 	out := make(map[string]bool, len(columns))
-	if len(columns) == 0 {
+	var missing []string
+	c.privMu.Lock()
+	gen := c.privGen
+	for _, col := range columns {
+		if ok, hit := c.privileges[privilegeKey{role, rel.OID, col}]; hit {
+			out[col] = ok
+		} else {
+			missing = append(missing, col)
+		}
+	}
+	c.privMu.Unlock()
+	if len(missing) == 0 {
 		return out, nil
 	}
-	rows, err := c.pool.Query(ctx,
-		`SELECT col, has_column_privilege($1::regclass, col, 'SELECT')
-		   FROM unnest($2::text[]) AS col`,
-		QuoteQualified(rel.Schema, rel.Name), columns)
+
+	rows, err := query(ctx, missing)
 	if err != nil {
-		return nil, fmt.Errorf("catalog: has_column_privilege (current): %w", err)
+		return nil, fmt.Errorf("catalog: has_column_privilege: %w", err)
 	}
 	defer rows.Close()
+	got := make(map[string]bool, len(missing))
 	for rows.Next() {
 		var col string
 		var ok bool
 		if err := rows.Scan(&col, &ok); err != nil {
 			return nil, err
 		}
-		out[col] = ok
+		got[col] = ok
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	c.privMu.Lock()
+	// An answer read before a refresh cleared the cache may predate a GRANT or
+	// REVOKE the refresh saw, so it is used but not kept.
+	keep := gen == c.privGen
+	if keep && c.privileges == nil {
+		c.privileges = map[privilegeKey]bool{}
+	}
+	for _, col := range missing {
+		out[col] = got[col]
+		if keep {
+			c.privileges[privilegeKey{role, rel.OID, col}] = got[col]
+		}
+	}
+	c.privMu.Unlock()
+	return out, nil
 }
 
 // LoadedAt reports when the cache was last refreshed.

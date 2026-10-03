@@ -9,8 +9,8 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - **One process serves every stream.** A second process on the same slot only stands by. There is no bus to share fan-out across processes, so capacity is one process's, and a takeover or restart reconnects every client.
 - **Resume does not survive a Sluice restart.** The resume buffer is in memory, so after a restart every client resnapshots.
 - **Revocation of a policy is bounded, not instant.** Policy, RLS, role and membership changes reach open streams on the next `SLUICE_CATALOG_REFRESH` tick; PostgreSQL emits no notification for them.
-- **Column grants are not re-checked.** `REVOKE SELECT (column)` does not reach open streams; privileges are checked at subscribe time only.
-- **Tier C reads live tables.** A policy with a subquery is evaluated against the database's current state, not the state at commit time, and the probe runs on the replication path.
+- **Column grants are not re-checked.** `REVOKE SELECT (column)` does not reach open streams; privileges are checked at subscribe time only, against answers cached until the next catalog refresh.
+- **Tier C reads live tables.** A policy with a subquery is evaluated against the database's current state, not the state at commit time, and the probe runs on the replication path (bounded by `SLUICE_TIER_C_TIMEOUT`).
 - **Table-owner RLS bypass is not modeled.** An owner's subscription is judged by the policies (fail-closed).
 - **Tier B compares in Go.** Text comparisons use byte order rather than the column's collation, and `numeric` comparisons use float64. The PostgreSQL cross-check on the first decisions per subscription is the safeguard.
 - **Session revocation only knows what it saw.** Sessions deleted before the process started are not known, and a revoked session is remembered for two hours.
@@ -40,7 +40,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - Batch hook re-checks: one endpoint call for several channels whose verdicts expire on the same tick (needs a multi-channel hook request).
 - Per-namespace hook secrets, or signed hook requests (HMAC over the body with a timestamp) instead of a static bearer.
 - Cap the `ttl` a hook may return.
-- Move Tier C probes off the replication path, so one slow policy does not delay every subscriber.
+- Move Tier C probes off the replication path, so one slow policy does not delay every subscriber. Today each probe is bounded by `SLUICE_TIER_C_TIMEOUT`, which caps the delay but does not remove it.
 
 ### Delivery
 

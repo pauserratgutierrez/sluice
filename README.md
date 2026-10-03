@@ -108,11 +108,11 @@ Policy text is parsed with [`pgplex/pgparser`](https://github.com/pgplex/pgparse
 | **B** | The predicate is compilable but reads other columns. It is evaluated in process against the WAL tuple, `DELETE` included (against the old tuple). The first `SLUICE_TIER_B_VERIFY` decisions per subscription made on a complete tuple are also asked of PostgreSQL (`jsonb_populate_record` under the caller's role); any disagreement demotes the subscription to Tier C for good, logs at `ERROR` and increments `sluice_authz_downgrades_total`. | in-process evaluation |
 | **C** | The predicate has a subquery, a function outside the whitelist, or anything else not compilable. | one query per subscriber per change |
 
-Tier C evaluates the policy under the caller's role and claims against the WAL tuple rebuilt with `jsonb_populate_record` when the tuple carries every column (a new tuple unless it has unchanged TOASTed columns; an old tuple only with `REPLICA IDENTITY FULL`). Otherwise an `INSERT`/`UPDATE` is checked by probing the live row by primary key, and a `DELETE` cannot be decided. Probes run on the replication path, so they slow every subscriber. They are capped globally by `SLUICE_TIER_C_MAX_PROBES_PER_SECOND`; over the cap the change is withheld from Tier C subscribers, never delivered unauthorized. `SLUICE_TIER_C=deny` refuses such subscriptions with `policy_requires_impersonation`. Tier C reads live tables, so a policy reading another table can see a different state than the one at commit time.
+Tier C evaluates the policy under the caller's role and claims against the WAL tuple rebuilt with `jsonb_populate_record` when the tuple carries every column (a new tuple unless it has unchanged TOASTed columns; an old tuple only with `REPLICA IDENTITY FULL`). Otherwise an `INSERT`/`UPDATE` is checked by probing the live row by primary key, and a `DELETE` cannot be decided. Probes run on the replication path, so they slow every subscriber. They are capped globally by `SLUICE_TIER_C_MAX_PROBES_PER_SECOND`; over the cap the change is withheld from Tier C subscribers, never delivered unauthorized. Each probe (and each Tier B cross-check) is bounded by `SLUICE_TIER_C_TIMEOUT`, and a probe that runs out of time withholds the change the same way. `SLUICE_TIER_C=deny` refuses such subscriptions with `policy_requires_impersonation`. Tier C reads live tables, so a policy reading another table can see a different state than the one at commit time.
 
 **Undecidable changes are withheld.** When the filter or the policy needs a value the WAL did not carry — an unchanged TOASTed column, or a column outside a narrow replica identity on `DELETE` — the change is not delivered and `sluice_authz_unknown_total` counts it. With `SLUICE_DEGRADED_DELETES=deliver`, such a `DELETE` is delivered with `"degraded": "delete_authz_unavailable"`.
 
-**Revocation.** Every `SLUICE_CATALOG_REFRESH` tick reloads the catalog. When anything a decision reads changed — policies, RLS flags, roles with `BYPASSRLS`, role memberships — every RLS subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`. Time-dependent predicates (`now()`) and Tier C decisions are also re-resolved when their `SLUICE_AUTHZ_LEASE` has expired, checked on the same tick; `POST /token` re-resolves every subscription of the stream. So a policy change reaches open streams within one tick, not instantly. Hook channel joins are re-checked the same way when their verdict expires (see [Channels](#channels-broadcast-and-presence)). `REVOKE SELECT (column)` does not reach open streams: column grants are checked only at subscribe time.
+**Revocation.** Every `SLUICE_CATALOG_REFRESH` tick reloads the catalog. When anything a decision reads changed — policies, RLS flags, roles with `BYPASSRLS`, role memberships — every RLS subscription is re-resolved and the ones that lost access are dropped with `shape_not_authorized`. Time-dependent predicates (`now()`) and Tier C decisions are also re-resolved when their `SLUICE_AUTHZ_LEASE` has expired, checked on the same tick; `POST /token` re-resolves every subscription of the stream. So a policy change reaches open streams within one tick, not instantly. Hook channel joins are re-checked the same way when their verdict expires (see [Channels](#channels-broadcast-and-presence)). `REVOKE SELECT (column)` does not reach open streams: column grants are checked only at subscribe time, against answers kept until the next `SLUICE_CATALOG_REFRESH` tick.
 
 **Columns.** The projection is the requested columns (all columns when none are requested) plus the table's key columns (primary key, or the replica identity index), intersected with the caller's `SELECT` privileges. Denied columns are reported with `columns_not_granted`; nothing outside the projection is ever emitted.
 
@@ -257,7 +257,7 @@ Accept: text/event-stream
   "resume": { "public.documents": "0/1A2B3C4" } }
 ```
 
-The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON) or `503 too_many_streams` (`SLUICE_MAX_STREAMS`). Closing the response is how a client leaves: everything the stream held, presence included, is released.
+The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`) or `503 server_shutdown` (the process is stopping). Closing the response is how a client leaves: everything the stream held, presence included, is released.
 
 Control requests name the stream with `stream_id` in the body, the `Sluice-Stream-Id` header, or both; if both are present and differ the request is rejected (`400 stream_id_mismatch`). The token must name the same `sub` and `role` as the stream (`403 forbidden`); stream ids are not secrets. A stream id from another process is `404 unknown_stream`.
 
@@ -296,7 +296,7 @@ A subscription result has `sub`, `ok`, and then either an `error` (`{code, messa
 
 **`warning`** — `{ "sub"?, "code", "message", "effect"?, "remedy"? }`.
 
-**`error`** — `{ "sub"?, "code", "message", "retryable", "action"? }`. With `sub` it ends that subscription (or reports a retryable problem with it) and the stream continues; without `sub` the stream is closing.
+**`error`** — `{ "sub"?, "code", "message", "retryable", "action"?, "retry_after_ms"? }`. With `sub` it ends that subscription (or reports a retryable problem with it) and the stream continues; without `sub` the stream is closing. `retry_after_ms` is how long to wait before reconnecting.
 
 | Code | Where | Meaning |
 | --- | --- | --- |
@@ -312,6 +312,7 @@ A subscription result has `sub`, `ok`, and then either an `error` (`{code, messa
 | `resume_too_old` | subscribe, after a snapshot | the position is no longer buffered; `action: "resnapshot"` |
 | `invalid_resume`, `snapshot_failed`, `internal` | subscribe | as named |
 | `stream_lagging` | stream | the client did not keep up; `action: "resnapshot"` |
+| `server_shutdown` | stream | the process is stopping; reconnect after `retry_after_ms` (spread over `SLUICE_RECONNECT_SPREAD`), with resume |
 | `token_expired`, `session_revoked`, `user_banned` | stream | the identity behind the stream is gone |
 
 Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insufficient`, `replica_identity_full_with_toast`, `replica_identity_broken`, `snapshot_disabled`, `schema_changed`.
@@ -375,7 +376,7 @@ Optional (`SLUICE_REVOCATION_ENABLED`), for GoTrue-style auth schemas. Add the t
 ALTER PUBLICATION sluice ADD TABLE auth.sessions, auth.users;
 ```
 
-A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `session_id` claim) closes every stream holding that session with `session_revoked`. An `UPDATE` on `SLUICE_REVOCATION_USERS_TABLE` that leaves `banned_until` non-null closes the user's streams with `user_banned`. Revoked sessions and users are remembered for two hours: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
+A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `session_id` claim) closes every stream holding that session with `session_revoked`. An `UPDATE` on `SLUICE_REVOCATION_USERS_TABLE` that leaves `banned_until` in the future closes the user's streams with `user_banned`; a `banned_until` already past, as GoTrue leaves it when a timed ban runs out, is not a ban, and an `UPDATE` that clears it or moves it into the past lifts the ban. Revoked sessions are remembered for two hours, and bans until `banned_until` or for two hours, whichever is sooner: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
 
 Streams are also closed with `token_expired` at the first heartbeat after the token's `exp`.
 
@@ -383,12 +384,16 @@ Streams are also closed with `token_expired` at the first heartbeat after the to
 
 - **At least once.** PostgreSQL may re-send transactions after a restart, resumes replay whole transactions, and snapshots overlap the live stream. Clients upsert by primary key.
 - **Order.** Changes reach a stream in commit order; the queue is never reordered.
-- **Per-stream queue** (`SLUICE_STREAM_QUEUE` events). When it is full, a `change` or `snapshot_end` closes the stream with `stream_lagging` (the client resumes or resnapshots); any other event is dropped and counted in `sluice_stream_dropped_events_total`. Each write is bounded by `SLUICE_WRITE_TIMEOUT`; a stream that cannot be written is closed.
+- **Per-stream queue** (up to `SLUICE_STREAM_QUEUE` events; it grows as events arrive, so an idle stream holds none). When it is full, a live `change` closes the stream with `stream_lagging` (the client resumes or resnapshots); any other event is dropped and counted in `sluice_stream_dropped_events_total`. Snapshot rows, `snapshot_end` and resume replays are read faster than any client drains them, so instead of overflowing they wait while the queue is half full, leaving the other half to live events. Everything queued is written together and flushed once. Each write is bounded by `SLUICE_WRITE_TIMEOUT`; a stream that cannot be written is closed.
 - **Replication backpressure.** The reader dispatches every change before it acknowledges the transaction, and acknowledges only committed, dispatched positions (every `SLUICE_STATUS_INTERVAL` and when the server asks). Between transactions it acknowledges the server's WAL end, so a quiet publication does not hold WAL back. A slow dispatch — Tier C probes, Tier B cross-checks, a full queue closing streams — delays the slot, and PostgreSQL retains WAL up to `max_slot_wal_keep_size`.
 
 ## Operating it
 
-**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded and this process is streaming from the slot; its body reports `catalog_loaded`, `replicating`, `streams` and `confirmed_lsn`.
+**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded, this process is streaming from the slot and it is not shutting down; its body reports `catalog_loaded`, `replicating`, `streams`, `confirmed_lsn`, and `draining` once shutdown has begun.
+
+**Shutdown.** On `SIGTERM` or `SIGINT` Sluice stops accepting connections, refuses new streams with `503 server_shutdown`, and ends every open stream with a `server_shutdown` error whose `retry_after_ms` is spread over `SLUICE_RECONNECT_SPREAD`, so clients come back over that window rather than all at once. Requests in flight get up to `SLUICE_SHUTDOWN_GRACE`, after which the process exits; without any it exits at once. Give the container a stop timeout above that grace.
+
+**Memory.** Unless `GOMEMLIMIT` is set, Sluice sets the Go heap's soft limit to 90% of the container's cgroup memory limit at startup, so garbage is collected before the container is OOM-killed.
 
 **One reader per slot.** At startup a process takes a session advisory lock keyed by the slot name (on a pool connection it keeps for its lifetime). A second process with the same slot stands by: it retries every 5 seconds, reports `503` on `/readyz`, and starts replicating when the lock is released. The slot itself allows only one streaming connection. The standby does not share the load; a takeover is a reconnect of every client.
 
@@ -481,7 +486,8 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `SLUICE_LOG_FORMAT` | `json` | or `text` |
 | `SLUICE_NODE_ID` | hostname | prefixes stream ids |
-| `SLUICE_SHUTDOWN_GRACE` | `15s` | |
+| `SLUICE_SHUTDOWN_GRACE` | `15s` | for requests in flight; streams end at once |
+| `SLUICE_RECONNECT_SPREAD` | `10s` | window the `retry_after_ms` of `server_shutdown` is drawn from; `0` sends none |
 | `SLUICE_DB_REPL_URL` | required | must include `replication=database` |
 | `SLUICE_DB_AUTHZ_URL` | required | must not |
 | `SLUICE_DB_POOL_MAX_CONNS` / `_MIN_CONNS` | `8` / `2` | the reading process keeps one for its lock |
@@ -506,6 +512,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_CATALOG_REFRESH` | `30s` | catalog, lease, JWKS and health tick |
 | `SLUICE_TIER_C` | `allow` | or `deny` |
 | `SLUICE_TIER_C_MAX_PROBES_PER_SECOND` | `2000` | per process |
+| `SLUICE_TIER_C_TIMEOUT` | `1s` | per Tier C probe and Tier B cross-check |
 | `SLUICE_TIER_B_VERIFY` | `5` | cross-checks per Tier B subscription; 0 disables |
 | `SLUICE_UNINDEXED_SHAPES_MAX` | `200` | per process |
 | `SLUICE_REPLICA_IDENTITY` | `warn` | or `strict` |
@@ -513,8 +520,8 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_SNAPSHOT_ENABLED` | `true` | |
 | `SLUICE_SNAPSHOT_MAX_CONCURRENT` / `_MAX_ROWS` | `4` / `50000` | |
 | `SLUICE_HEARTBEAT` | `20s` | at least 5 s |
-| `SLUICE_STREAM_QUEUE` | `256` | events per stream |
-| `SLUICE_WRITE_TIMEOUT` | `10s` | per event |
+| `SLUICE_STREAM_QUEUE` | `256` | most events queued per stream |
+| `SLUICE_WRITE_TIMEOUT` | `10s` | per write |
 | `SLUICE_MAX_STREAMS` | `50000` | per process |
 | `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
 | `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |

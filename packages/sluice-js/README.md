@@ -149,7 +149,9 @@ const sluice = createClient<Database>(url, {
 })
 ```
 
-**Reconnection is automatic.** The client remembers the last commit LSN it saw per table and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). If the server no longer has that position (it restarted, or you were away too long), the shape gets `resume_too_old` with `action: 'resnapshot'` and the client forgets the stale position: discard what you hold for that shape and subscribe again, for example with `withInitialSnapshot()`.
+**Reconnection is automatic.** The client remembers the last commit LSN it saw per table and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). If the server no longer has that position (it restarted, or you were away too long), the shape gets `resume_too_old` with `action: 'resnapshot'` and the client forgets the stale position: discard what you hold for that shape and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, instead of its own backoff, before reconnecting.
+
+**Subscriptions made together are sent together.** `subscribe()` calls in the same tick (a page mounting several live views) go out in one request, which counts once against the server's subscribe rate.
 
 **Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
 
@@ -186,6 +188,7 @@ Subscription errors go to that subscription's `onError`; stream errors go to the
 | `resume_too_old` | the resume position is gone; resnapshot |
 | `snapshot_failed` | the initial snapshot failed (retryable) |
 | `stream_lagging` | the client did not keep up; the stream reconnects with a resume |
+| `server_shutdown` | the server is restarting; the stream reconnects after `retryAfterMs`, with a resume |
 | `token_expired` | the token expired; the stream closed |
 | `session_revoked`, `user_banned` | the identity was revoked; the stream closed |
 | `http_401`, `http_403` | the stream request was refused; the client stops retrying |

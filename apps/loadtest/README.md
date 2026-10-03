@@ -2,7 +2,7 @@
 
 An independent Docker app that load-tests a **published** Sluice image. It is not the `deploy/` harness and it does not import Sluice's Go module. It speaks the public protocol the way a product would: mint JWTs, `POST /stream`, insert rows, count SSE events, and (for signalling) `POST /publish`, `POST /presence`, and `pg_logical_emit_message`.
 
-Pinned target: [`ghcr.io/pauserratgutierrez/sluice:0.1.4`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (label `org.opencontainers.image.version=0.1.4`, healthcheck `/sluice -healthcheck`).
+Default target: [`ghcr.io/pauserratgutierrez/sluice:0.3.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (healthcheck `/sluice -healthcheck`). `SLUICE_IMAGE` points it at another tag, and `make local P=<profile>` builds the working tree and runs a profile against that.
 
 ## What it measures
 
@@ -16,10 +16,33 @@ Pinned target: [`ghcr.io/pauserratgutierrez/sluice:0.1.4`](https://github.com/pa
 | `presence` | signalling | ladder on **users** only | Do `track()` diffs converge, and do disconnects produce leaves? (Presence keys are the JWT subject, so extra connections of the same user overwrite.) |
 | `mixed` | tier A + room | ladder; INSERT then publish on the same stream | Do changes and broadcasts share a stream without starving each other? |
 | `kick` | issuer hold | ladder on **users**; one INSERT then `DELETE` the hold | Does a membership delete cut the shape with `shape_not_authorized` while the stream stays up? |
+| `idle` | tier A + room | ladder 1000 → 20000 on **users**; streams with `LOAD_IDLE_SHAPES` shapes and a channel, held open `LOAD_IDLE_HOLD` with no traffic | What does an open, quiet stream cost in memory, goroutines and CPU? Most of a product's streams look like this. |
+
+Every step also reports **Sluice's own resource use**, from the Go and process metrics on its `/metrics`, sampled every `LOAD_SAMPLE_EVERY`: memory per stream (growth of heap in use plus goroutine stacks from the step's start to every stream open, before any traffic), goroutines per stream, peak live memory and RSS, CPU seconds and CPU per 1000 delivered events, and the longest recent GC pause. They are in the JSON and in a second table of the Markdown report.
 
 A step **passes** when ≥95% of streams open, ≥90% of expected events (or presence members / kicks) arrive, and Sluice is not mass-closing streams as `stream_lagging`. The runner sizes the hunt ceiling from the container cgroup (CPU / memory) and caps at 40 000 streams so a laptop Docker VM is not frozen. Memory limits on the compose services are the other guardrail.
 
 Results are written to `results/` (`*.json` and `*.md`). That directory is gitignored except for `.gitkeep`.
+
+## Resources: 0.3.0 against the next release (this machine, 2026-10-03)
+
+Same machine and runner, one profile at a time, fresh database each run. Memory per stream is measured from the fresh process (see [What it measures](#what-it-measures)).
+
+| Run | 0.3.0 | Next release |
+| --- | ---: | ---: |
+| `idle`, 1 shape + channel: memory per stream | 52 KiB | 37–41 KiB |
+| `idle`, 20 000 streams: peak RSS | 980 MiB | 783 MiB |
+| `idle`, 20 000 streams: CPU over the step | 14.1 s | 11.5 s |
+| `idle`, longest GC pause | 26 ms | 2.6 ms |
+| `idle`, 5 shapes + channel, 512 MB container: memory per stream | 66 KiB | 48 KiB |
+| … streams that fit without swap or GC pressure | about 6 000 | about 8 000 |
+| … opening 8 000 streams | 3.1 s (swapping) | 0.74 s |
+| `issuer`, 8 000 users: opening every stream | 1.12 s | 0.87 s |
+| `issuer`, 8 000 users: CPU per 1000 events | 150 ms | 135 ms |
+| `rls-a` fan-out to 16 000 connections, mean of 6: events/s | 152k | 157k |
+| … CPU per 1000 events | 83 ms | 77 ms |
+
+Fan-out throughput at 16 000 connections varies by ±20% between runs on this VM; the two are equal within that noise. Past about 10 000 streams in 512 MB the next release reaches its `GOMEMLIMIT` and spends CPU on collection instead of being OOM-killed, so a stream cap below that is the brake to set.
 
 ## Results (0.1.4, this machine)
 
@@ -81,9 +104,10 @@ docker compose --profile broadcast up --build --abort-on-container-exit --exit-c
 docker compose --profile presence  up --build --abort-on-container-exit --exit-code-from runner-presence
 docker compose --profile mixed     up --build --abort-on-container-exit --exit-code-from runner-mixed
 docker compose --profile kick      up --build --abort-on-container-exit --exit-code-from runner-kick
+docker compose --profile idle      up --build --abort-on-container-exit --exit-code-from runner-idle
 ```
 
-Or `make rls-a` / `make broadcast` / … 
+Or `make rls-a` / `make broadcast` / … To measure the working tree rather than a published image, `make local P=idle` builds it as `sluice:local` and runs the profile against it.
 
 Run **one profile at a time**. Each profile starts Postgres, a JWKS server, the matching Sluice process, and one runner. The issuer and kick profiles also start the shape-issuer.
 
@@ -98,7 +122,7 @@ make nuke
 ## Stack
 
 ```
-runner  ──POST /stream──►  sluice:0.1.4  ──logical slot──►  postgres 18.4
+runner  ──POST /stream──►  sluice  ──logical slot──►  postgres 18.4
    │                         ▲
    │                         └── GET JWKS ──  jwks (public ES256)
    └── INSERT / emit_message ────────────────┘
@@ -131,7 +155,12 @@ The schema is a small SaaS, not a copy of `deploy/db/fixtures.sql`:
 | `LOAD_DELIVERY_MIN` | `0.90` | pass bar for events / presence / kicks |
 | `LOAD_CHANNEL` | `room:load` | signalling channel (`room` must be in `SLUICE_CHANNELS`) |
 | `LOAD_PRESENCE_WAIT` | `8s` | how long to wait for coalesced presence diffs |
-| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.1.4` | override the target |
+| `LOAD_IDLE_HOLD` | `60s` | how long `idle` holds its streams open |
+| `LOAD_IDLE_SHAPES` | `5` | shapes per `idle` stream, besides its channel |
+| `LOAD_SAMPLE_EVERY` | `1s` | resource sampling interval |
+| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.3.0` | override the target |
+| `SLUICE_PULL_POLICY` | `always` | `never` for a locally built image |
+| `SLUICE_MEM_LIMIT` | `6g` | the Sluice container's memory limit; set a production value to see how many streams fit |
 
 Pass them in `.env` or on the compose command:
 

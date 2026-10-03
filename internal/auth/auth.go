@@ -325,7 +325,7 @@ func Expiry(id authz.Identity) time.Time {
 type Revoker struct {
 	mu       sync.RWMutex
 	sessions map[string]time.Time // revoked session_id -> when
-	users    map[string]time.Time // banned user_id -> when
+	users    map[string]time.Time // banned user_id -> until when the ban is enforced
 	ttl      time.Duration
 }
 
@@ -353,13 +353,25 @@ func (r *Revoker) RevokeSession(id string) {
 	r.mu.Unlock()
 }
 
-// BanUser records that a user was banned.
-func (r *Revoker) BanUser(id string) {
+// BanUser records that a user is banned until `until`. The ban is enforced for
+// at most the TTL: the auth service issues no token to a banned user, so past
+// that every token that could still carry them has expired.
+func (r *Revoker) BanUser(id string, until time.Time) {
 	if id == "" {
 		return
 	}
+	if limit := time.Now().Add(r.ttl); until.After(limit) {
+		until = limit
+	}
 	r.mu.Lock()
-	r.users[strings.ToLower(id)] = time.Now()
+	r.users[strings.ToLower(id)] = until
+	r.mu.Unlock()
+}
+
+// UnbanUser forgets a user's ban, because it was lifted or has run out.
+func (r *Revoker) UnbanUser(id string) {
+	r.mu.Lock()
+	delete(r.users, strings.ToLower(id))
 	r.mu.Unlock()
 }
 
@@ -373,16 +385,18 @@ func (r *Revoker) Revoked(id authz.Identity) bool {
 		}
 	}
 	if id.Sub != "" {
-		if _, ok := r.users[id.Sub]; ok {
+		if until, ok := r.users[strings.ToLower(id.Sub)]; ok && time.Now().Before(until) {
 			return true
 		}
 	}
 	return false
 }
 
-// Sweep drops entries older than the TTL so the maps do not grow without bound.
+// Sweep drops revoked sessions older than the TTL and bans that have run out,
+// so the maps do not grow without bound.
 func (r *Revoker) Sweep() {
-	cutoff := time.Now().Add(-r.ttl)
+	now := time.Now()
+	cutoff := now.Add(-r.ttl)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, t := range r.sessions {
@@ -390,8 +404,8 @@ func (r *Revoker) Sweep() {
 			delete(r.sessions, k)
 		}
 	}
-	for k, t := range r.users {
-		if t.Before(cutoff) {
+	for k, until := range r.users {
+		if !now.Before(until) {
 			delete(r.users, k)
 		}
 	}

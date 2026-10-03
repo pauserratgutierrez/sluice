@@ -100,7 +100,7 @@ func newHookCache(ttl, timeout time.Duration, bearer string) *hookCache {
 		ttl:     ttl,
 		timeout: timeout,
 		bearer:  bearer,
-		client:  &http.Client{Timeout: timeout, CheckRedirect: noHookRedirect},
+		client:  &http.Client{Timeout: timeout, CheckRedirect: noHookRedirect, Transport: hookTransport()},
 		now:     time.Now,
 		m:       map[string]hookVerdict{},
 	}
@@ -118,6 +118,15 @@ func hookJitter(ttl time.Duration) time.Duration {
 		return ttl
 	}
 	return ttl - rand.N(ttl/5)
+}
+
+// hookTransport keeps enough idle connections to a hook for the joins of a
+// reconnect wave and for a round of re-checks. The default transport keeps two
+// per host, so the rest of a burst each opened a connection and closed it.
+func hookTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = 64
+	return t
 }
 
 // noHookRedirect stops the client from following a redirect. Following would

@@ -44,6 +44,7 @@ const (
 	planePresence
 	planeMixed
 	planeKick
+	planeIdle
 )
 
 type scenario struct {
@@ -90,8 +91,21 @@ type Step struct {
 	PresenceReady  int     `json:"presence_converged,omitempty"`
 	PresenceLeave  int     `json:"presence_after_leave,omitempty"`
 	Kicked         int64   `json:"kicked,omitempty"`
-	Pass           bool    `json:"pass"`
-	FailReason     string  `json:"fail_reason,omitempty"`
+
+	// Sluice's own resource use; see fillResources.
+	LiveBaselineMiB     float64 `json:"live_baseline_mib,omitempty"`
+	LiveOpenMiB         float64 `json:"live_open_mib,omitempty"`
+	LivePeakMiB         float64 `json:"live_peak_mib,omitempty"`
+	RSSPeakMiB          float64 `json:"rss_peak_mib,omitempty"`
+	KiBPerStream        float64 `json:"kib_per_stream,omitempty"`
+	GoroutinesPeak      float64 `json:"goroutines_peak,omitempty"`
+	GoroutinesPerStream float64 `json:"goroutines_per_stream,omitempty"`
+	CPUSeconds          float64 `json:"cpu_seconds,omitempty"`
+	CPUMsPer1kEvents    float64 `json:"cpu_ms_per_1k_events,omitempty"`
+	GCPauseMax          string  `json:"gc_pause_max,omitempty"`
+
+	Pass       bool   `json:"pass"`
+	FailReason string `json:"fail_reason,omitempty"`
 }
 
 type live struct {
@@ -108,6 +122,8 @@ type app struct {
 	pool     *pgxpool.Pool
 	http     *http.Client
 	scenario scenario
+	// base is Sluice's metrics before the first step, on a fresh process.
+	base map[string]float64
 }
 
 func mintUsers(signer *authn.Signer, n int, ttl time.Duration) ([]User, error) {
@@ -206,6 +222,13 @@ func (a *app) runStep(ctx context.Context, name string, users []User, connsPerUs
 	}
 
 	before, _ := fetchMetrics(ctx, a.http, a.cfg.MetricsURL)
+	if a.base == nil {
+		a.base = before
+	}
+	usage := &resources{}
+	usage.observe(before)
+	stopSampling := a.sampleResources(ctx, usage)
+	defer stopSampling()
 
 	var (
 		mu          sync.Mutex
@@ -330,6 +353,9 @@ func (a *app) runStep(ctx context.Context, name string, users []User, connsPerUs
 		}
 	}
 	openWG.Wait()
+	// What the open streams cost before any traffic: the per-stream figure.
+	openedMetrics, _ := fetchMetrics(ctx, a.http, a.cfg.MetricsURL)
+	usage.observe(openedMetrics)
 	st.OpenElapsed = time.Since(openStart).Round(time.Millisecond).String()
 	st.Opened = int(opened.Load())
 	st.FailedOpen = int(failed.Load())
@@ -396,9 +422,16 @@ func (a *app) runStep(ctx context.Context, name string, users []User, connsPerUs
 		a.driveMixed(ctx, drv)
 	case planeKick:
 		a.driveKick(ctx, drv)
+	case planeIdle:
+		a.driveIdle(ctx, drv)
 	default:
 		a.driveChange(ctx, drv)
 	}
+
+	stopSampling()
+	endMetrics, _ := fetchMetrics(ctx, a.http, a.cfg.MetricsURL)
+	usage.observe(endMetrics)
+	fillResources(&st, usage, a.base, before, openedMetrics, endMetrics)
 
 	cleanup()
 

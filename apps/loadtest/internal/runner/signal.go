@@ -38,6 +38,29 @@ func (a *app) driveChange(ctx context.Context, d drive) {
 	finishFanout(d)
 }
 
+// driveIdle holds the streams open with no traffic but heartbeats, which is how
+// most of a product's streams spend their time, while the resources are sampled.
+// It fails when streams were closed along the way.
+func (a *app) driveIdle(ctx context.Context, d drive) {
+	hold := a.cfg.IdleHold
+	if d.st.Name == "warmup" {
+		hold = min(hold, 5*time.Second)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(hold):
+	}
+	finishFanout(d)
+	m, err := fetchMetrics(ctx, a.http, a.cfg.MetricsURL)
+	if err != nil {
+		d.st.FailReason = "metrics: " + err.Error()
+		return
+	}
+	if open := m["sluice_streams"]; open < float64(d.st.Opened)*a.cfg.OpenMin {
+		d.st.FailReason = fmt.Sprintf("%.0f of %d streams still open after %s idle", open, d.st.Opened, hold)
+	}
+}
+
 func (a *app) driveBroadcast(ctx context.Context, d drive) {
 	ch := a.channel()
 	n, errs := a.publishAll(ctx, d, ch, "client")

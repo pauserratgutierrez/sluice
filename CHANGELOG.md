@@ -2,6 +2,38 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## Unreleased
+
+### Fixed
+
+- A ban that had run out still banned. GoTrue leaves `banned_until` set when a timed ban ends, and any later `UPDATE` of that user (a sign-in sets `last_sign_in_at`) closed their streams with `user_banned` and refused their tokens for two hours. A ban is now in force only while `banned_until` is in the future, is enforced until then (at most two hours), and an `UPDATE` that clears it lifts it.
+- A snapshot or resume larger than the stream queue closed the stream with `stream_lagging`: its rows were queued faster than any client reads them. Snapshot rows, `snapshot_end` and replays now wait for room, filling at most half the queue so live changes keep the other half.
+- Sluice never exited on `SIGTERM`: closing the database pool waited forever for the connection holding the reader lock, so every stop ended in a `SIGKILL`. It now exits in well under a second.
+- Shutdown left every stream open until `SLUICE_SHUTDOWN_GRACE` ran out, so a container stop with a shorter timeout killed the process with no event sent. Streams now end at once with `server_shutdown` (see Added), and `/readyz` reports `503` while draining.
+- A resume replay that outlived its subscription kept delivering to it; it now stops, and follows a `/token` rebind of filter and columns.
+
+### Changed
+
+- The stream queue grows as events arrive, up to `SLUICE_STREAM_QUEUE`, so an idle stream holds no buffer (it reserved about 12 KiB before). Everything queued is written together and flushed once, instead of one write and flush per event.
+- A change is projected and encoded to JSON once per distinct column list, and shared by every subscriber with that projection, instead of once per subscriber.
+- Shapes in one `/stream` or `/subscribe` request are resolved concurrently (up to four at once) and installed in request order, with the same limits.
+- Column privileges are cached until the next `SLUICE_CATALOG_REFRESH` tick, so a reconnect wave costs one query per table and role instead of one per shape. A `GRANT` or `REVOKE` reaches new subscriptions within one tick.
+- The issuer and hook HTTP clients keep up to 64 idle connections per host (Go's default is 2).
+- A Tier C probe takes two round trips instead of four, and every probe and Tier B cross-check is bounded by `SLUICE_TIER_C_TIMEOUT`; one that runs out of time withholds the change.
+- Unless `GOMEMLIMIT` is set, the Go heap's soft limit is 90% of the container's cgroup memory limit.
+- Keep-alive connections idle between requests are closed after five minutes.
+- SDK: `subscribe()` calls made in the same tick are sent in one `/subscribe`.
+
+### Added
+
+- `server_shutdown` stream error, with `retry_after_ms` drawn from `SLUICE_RECONNECT_SPREAD` (default `10s`) so clients reconnect spread out. `POST /stream` answers `503 server_shutdown` while shutting down.
+- `SLUICE_TIER_C_TIMEOUT` (default `1s`).
+- SDK: a stream-scoped error's `retry_after_ms` sets the delay before the next reconnect, and is exposed as `SluiceError.retryAfterMs`.
+
+### For clients
+
+- `error` events may carry `retry_after_ms`. The SDK honors it; other clients should wait that long before reconnecting.
+
 ## 0.3.0
 
 Hook channel joins are now leases on their verdict.

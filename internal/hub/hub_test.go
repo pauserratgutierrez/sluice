@@ -15,15 +15,7 @@ import (
 func newHub(queue int) *Hub { return New(queue, 8, time.Minute, 10*time.Millisecond) }
 
 func drain(s *Stream) []event.Event {
-	var out []event.Event
-	for {
-		select {
-		case e := <-s.Events():
-			out = append(out, e)
-		default:
-			return out
-		}
-	}
+	return s.Take(nil)
 }
 
 // The overflow policy differs by kind on purpose, and each choice is a
@@ -79,6 +71,90 @@ func TestBackpressurePolicyPerKind(t *testing.T) {
 			t.Errorf("stream closed on a dropped presence event: %q", s.CloseCode())
 		}
 	})
+}
+
+func TestQueueHoldsNothingUntilUsed(t *testing.T) {
+	h := newHub(256)
+	s := h.Open("s", authz.Identity{})
+	if s.queue != nil {
+		t.Fatal("an idle stream must not hold a queue buffer")
+	}
+	for i := 0; i < 3; i++ {
+		s.Send(event.Event{Kind: event.KindChange, Data: i})
+	}
+	select {
+	case <-s.Ready():
+	default:
+		t.Fatal("queuing an event must signal Ready")
+	}
+	got := s.Take(nil)
+	if len(got) != 3 || got[0].Data != 0 || got[2].Data != 2 {
+		t.Fatalf("Take = %v, want the three events in order", got)
+	}
+	if s.queue != nil {
+		t.Fatal("a drained stream given no spare must hold no buffer")
+	}
+}
+
+// Backfill waits for room instead of closing the stream, and leaves half the
+// queue to live changes, which never wait.
+func TestBackfillWaitsForRoom(t *testing.T) {
+	h := newHub(4)
+	s := h.Open("s", authz.Identity{})
+	ctx := t.Context()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 10; i++ {
+			if !s.SendBackfill(ctx, event.Event{Kind: event.KindChange, Data: i}) {
+				t.Errorf("backfill %d refused", i)
+				return
+			}
+		}
+	}()
+
+	var got []event.Event
+	for len(got) < 10 {
+		<-s.Ready()
+		batch := s.Take(nil)
+		if len(batch) > 2 {
+			t.Fatalf("backfill queued %d events, past half of the queue", len(batch))
+		}
+		got = append(got, batch...)
+	}
+	<-done
+	for i, e := range got {
+		if e.Data != i {
+			t.Fatalf("event %d = %v, backfill reordered the queue", i, e.Data)
+		}
+	}
+
+	s.Send(event.Event{Kind: event.KindChange})
+	s.Send(event.Event{Kind: event.KindChange})
+	if !s.Send(event.Event{Kind: event.KindChange}) || s.CloseCode() != "" {
+		t.Fatal("live changes must still fit while backfill holds half the queue")
+	}
+}
+
+func TestBackfillStopsWithTheStream(t *testing.T) {
+	h := newHub(2)
+	s := h.Open("s", authz.Identity{})
+	if !s.SendBackfill(t.Context(), event.Event{Kind: event.KindChange}) {
+		t.Fatal("the first backfill must fit")
+	}
+	result := make(chan bool)
+	go func() { result <- s.SendBackfill(t.Context(), event.Event{Kind: event.KindChange}) }()
+	time.Sleep(20 * time.Millisecond)
+	s.CloseWith("client_closed")
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("backfill into a closed stream reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backfill kept waiting after the stream closed")
+	}
 }
 
 // A join that races a disconnect must not put a closed stream back into a
@@ -211,11 +287,13 @@ func TestPresenceStateAndDiff(t *testing.T) {
 	var sawDiff bool
 	for !sawDiff {
 		select {
-		case e := <-s.Events():
-			if e.Kind == event.KindPresence {
-				p := e.Data.(event.Presence)
-				if p.Type == "diff" && len(p.Joins) == 1 {
-					sawDiff = true
+		case <-s.Ready():
+			for _, e := range s.Take(nil) {
+				if e.Kind == event.KindPresence {
+					p := e.Data.(event.Presence)
+					if p.Type == "diff" && len(p.Joins) == 1 {
+						sawDiff = true
+					}
 				}
 			}
 		case <-deadline:
@@ -361,7 +439,8 @@ func TestConcurrentStreamsAndBroadcast(t *testing.T) {
 				select {
 				case <-s.Done():
 					return
-				case <-s.Events():
+				case <-s.Ready():
+					s.Take(nil)
 				case <-time.After(300 * time.Millisecond):
 					return
 				}

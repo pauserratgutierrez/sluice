@@ -66,6 +66,17 @@ func markdown(r Report) string {
 			s.Name, s.Users, s.ConnsPerUser, s.Opened, s.Streams, s.DeliveryPct, s.EventsPerSec, s.LatencyP95, s.Pass)
 	}
 	b.WriteByte('\n')
+
+	fmt.Fprintf(&b, "## Sluice resources\n\n")
+	fmt.Fprintf(&b, "Live memory is Go heap in use plus goroutine stacks; per stream is its growth from the fresh process to every stream of the step open, before any traffic. Peaks are sampled every second.\n\n")
+	fmt.Fprintf(&b, "| Step | Opened | KiB/stream | Goroutines/stream | Live MiB (open) | Live MiB (peak) | RSS MiB (peak) | CPU s | CPU ms / 1k events | GC pause max |\n")
+	fmt.Fprintf(&b, "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	for _, s := range r.Steps {
+		fmt.Fprintf(&b, "| %s | %d | %.1f | %.1f | %.0f | %.0f | %.0f | %.2f | %.1f | %s |\n",
+			s.Name, s.Opened, s.KiBPerStream, s.GoroutinesPerStream, s.LiveOpenMiB, s.LivePeakMiB,
+			s.RSSPeakMiB, s.CPUSeconds, s.CPUMsPer1kEvents, s.GCPauseMax)
+	}
+	b.WriteByte('\n')
 	return b.String()
 }
 

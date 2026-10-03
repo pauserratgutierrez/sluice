@@ -401,6 +401,62 @@ test('a failed subscribe leaves nothing registered, so the same label can be ret
   client.close()
 })
 
+test('subscriptions made in the same tick are sent in one /subscribe', async () => {
+  const subscribes: string[][] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (input, init) => {
+      const body = JSON.parse(String(init?.body))
+      if (String(input).endsWith('/subscribe')) {
+        const subs = body.subscriptions.map((s: { sub: string }) => s.sub)
+        subscribes.push(subs)
+        // Results may come back in any order; each is matched by its label.
+        const results = [...subs].reverse().map((sub: string) => ({ sub, ok: sub !== 'c' }))
+        return new Response(JSON.stringify({ results }))
+      }
+      const results = body.subscriptions.map((s: { sub: string }) => ({ sub: s.sub, ok: true }))
+      return sse(openStream('event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: results }) + '\n\n'))
+    },
+  })
+
+  await client.from('documents').as('first').on('*', () => {}).subscribe()
+  const [a, b, c] = await Promise.all([
+    client.from('documents').as('a').on('*', () => {}).subscribe(),
+    client.from('metrics').as('b').on('*', () => {}).subscribe(),
+    client.from('metrics').as('c').on('*', () => {}).onError(() => {}).subscribe(),
+  ])
+
+  assert.deepEqual(subscribes, [['a', 'b', 'c']])
+  assert.equal(a.sub, 'a')
+  assert.ok(a.ok && b.ok)
+  assert.equal(c.ok, false)
+  client.close()
+})
+
+test('a shutdown error sets the delay before the reconnect', async () => {
+  const opened: number[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    onError: () => {},
+    fetch: async () => {
+      opened.push(Date.now())
+      const ready = 'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'
+      if (opened.length === 1) {
+        return sse(ready + 'event: error\ndata: {"code":"server_shutdown","message":"bye","retryable":true,"retry_after_ms":120}\n\n')
+      }
+      return sse(openStream(ready))
+    },
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 250))
+  assert.equal(opened.length, 2)
+  assert.ok(opened[1]! - opened[0]! >= 110, `reconnected after ${opened[1]! - opened[0]!} ms, want the 120 ms the server asked for`)
+  client.close()
+})
+
 test('resume_too_old forgets the position instead of resending it', async () => {
   const resumes: Record<string, string>[] = []
   const change = { sub: 's1', op: 'INSERT', schema: 'public', table: 'documents', commit_lsn: '0/10', seq: 1, record: { id: 1 } }

@@ -89,15 +89,7 @@ func joinChat(t *testing.T, s *Server, id authz.Identity) (*hub.Stream, subResul
 
 // events drains what a stream has been sent so far.
 func events(st *hub.Stream) []event.Event {
-	var out []event.Event
-	for {
-		select {
-		case ev := <-st.Events():
-			out = append(out, ev)
-		default:
-			return out
-		}
-	}
+	return st.Take(nil)
 }
 
 func receivesTyping(s *Server, from, to *hub.Stream) bool {

@@ -30,6 +30,12 @@ interface Registration {
   onResult(result: SubscriptionResult): void
 }
 
+interface PendingSubscribe {
+  reg: Registration
+  resolve(result: SubscriptionResult): void
+  reject(err: unknown): void
+}
+
 /**
  * A Sluice connection.
  *
@@ -61,6 +67,10 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   private waiters: Array<() => void> = []
   /** Token passed to setAuth, used instead of options.accessToken from then on. */
   private tokenOverride: string | null = null
+  /** Subscriptions made in the same tick, sent together in one /subscribe. */
+  private pending: PendingSubscribe[] = []
+  /** The delay the server asked for before the next reconnect. */
+  private retryAfter: number | null = null
   private visibilityHandler: (() => void) | null = null
 
   constructor(url: string, options: ClientOptions) {
@@ -143,37 +153,64 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       }
     }
 
+    // Subscriptions made together -- a page mounting several live views -- go
+    // out in one request, which the server resolves concurrently and counts
+    // once against its subscribe rate.
+    return new Promise<SubscriptionResult>((resolve, reject) => {
+      if (this.pending.length === 0) queueMicrotask(() => void this.flushPending())
+      this.pending.push({ reg, resolve, reject })
+    })
+  }
+
+  private async flushPending(): Promise<void> {
+    const batch = this.pending
+    this.pending = []
+    const subs = batch.map((p) => p.reg.spec.sub)
+
     let body: Record<string, unknown>
     try {
+      if (!this.streamId) {
+        throw new SluiceError({ code: 'not_connected', message: 'the stream closed before the subscribe was sent', retryable: true })
+      }
       body = await this.post('/subscribe', {
         stream_id: this.streamId,
-        subscriptions: [reg.spec],
+        subscriptions: batch.map((p) => p.reg.spec),
       })
     } catch (err) {
       // A rejected subscribe leaves nothing registered, so retrying with the
       // same label works. The server may still have processed the request (a
       // lost response looks like a network error), so it is also asked to
-      // drop the label -- and that finishes before rejecting, so it cannot
+      // drop the labels -- and that finishes before rejecting, so it cannot
       // race a retry.
-      await this.unregister(reg.spec.sub)
-      throw err
+      await this.unregisterAll(subs)
+      for (const p of batch) p.reject(err)
+      return
     }
-    const result = (body.results as SubscriptionResult[] | undefined)?.[0] ?? {
-      sub: reg.spec.sub,
-      ok: false,
-      error: { code: 'bad_response', message: 'the server returned no result for this subscription' },
+    const results = new Map((body.results as SubscriptionResult[] | undefined)?.map((r) => [r.sub, r]))
+    for (const p of batch) {
+      const result = results.get(p.reg.spec.sub) ?? {
+        sub: p.reg.spec.sub,
+        ok: false,
+        error: { code: 'bad_response', message: 'the server returned no result for this subscription' },
+      }
+      this.handleResult(result)
+      p.resolve(result)
     }
-    this.handleResult(result)
-    return result
   }
 
   /** @internal */
   async unregister(sub: string): Promise<void> {
-    this.registrations.delete(sub)
-    this.readyResults.delete(sub)
+    await this.unregisterAll([sub])
+  }
+
+  private async unregisterAll(subs: string[]): Promise<void> {
+    for (const sub of subs) {
+      this.registrations.delete(sub)
+      this.readyResults.delete(sub)
+    }
     if (!this.streamId) return
     try {
-      await this.post('/unsubscribe', { stream_id: this.streamId, subs: [sub] })
+      await this.post('/unsubscribe', { stream_id: this.streamId, subs })
     } catch {
       // A failed unsubscribe is harmless: the server drops everything when the
       // stream closes, and the stream is closed below if nothing is left.
@@ -377,8 +414,11 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const wait = schedule[Math.min(this.attempt, schedule.length - 1)] ?? 1000
         this.attempt++
         // Full jitter: a server restart must not bring every client back at the
-        // same instant.
-        await sleep(Math.random() * wait)
+        // same instant. A server that is shutting down spreads its clients
+        // itself, over a wider window, and says when to come back.
+        const delay = this.retryAfter ?? Math.random() * wait
+        this.retryAfter = null
+        await sleep(delay)
       }
     } finally {
       this.running = false
@@ -461,6 +501,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
           // A stream-scoped error is followed by the server closing the
           // stream. The loop reconnects, and the server refuses the reconnect
           // (401) if the identity is no longer valid.
+          if (typeof e.retry_after_ms === 'number' && e.retry_after_ms >= 0) this.retryAfter = e.retry_after_ms
           this.options.onError?.(err)
         }
         return

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/pauserratgutierrez/sluice/internal/auth"
 	"github.com/pauserratgutierrez/sluice/internal/authz"
@@ -70,6 +72,8 @@ type Server struct {
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
+	// draining is set once shutdown begins; see Drain.
+	draining atomic.Bool
 	// authzVer is the catalog.AuthzVersion the live decisions were resolved
 	// against. See RefreshLeases.
 	authzVer atomic.Uint64
@@ -233,6 +237,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
+	if s.draining.Load() {
+		writeErr(w, http.StatusServiceUnavailable, "server_shutdown",
+			"this node is shutting down; reconnect to another or retry shortly")
+		return
+	}
 	if s.hub.Count() >= s.cfg.MaxStreams {
 		writeErr(w, http.StatusServiceUnavailable, "too_many_streams",
 			"this node is at its configured stream limit")
@@ -254,6 +263,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	streamID := fmt.Sprintf("%s.%d-%d", s.cfg.NodeID, time.Now().UnixNano(), s.streamSeq.Add(1))
 
 	st := s.hub.Open(streamID, id)
+	if s.draining.Load() {
+		// Drain may have listed the open streams before this one was added.
+		st.CloseWith("server_shutdown")
+	}
 	metrics.Streams.Set(float64(s.hub.Count()))
 	defer func() {
 		s.holds.RemoveStream(streamID)
@@ -290,7 +303,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if s.reader != nil {
 		ready["wal_lsn"] = reader.FormatLSN(s.reader.ConfirmedLSN())
 	}
-	s.writeEvent(w, rc, event.Event{Kind: event.KindReady, Data: ready})
+	_ = s.writeEvents(w, rc, []event.Event{{Kind: event.KindReady, Data: ready}})
 
 	// One shared wheel instead of a timer per connection. The callback only
 	// enqueues; all writing stays on this goroutine, which is what keeps the
@@ -298,40 +311,78 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	cancelTick := s.wheel.Add(func() { s.tick(st) })
 	defer cancelTick()
 
+	// Everything queued is written together and flushed once, so a burst costs
+	// a stream one flush rather than one per event.
+	var batch []event.Event
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case ev := <-st.Events():
-			if err := s.writeEvent(w, rc, ev); err != nil {
+		case <-st.Ready():
+			batch = st.Take(batch)
+			if err := s.writeEvents(w, rc, batch); err != nil {
 				st.CloseWith("write_failed")
 				return
 			}
+			batch = recycleBatch(batch)
 		case <-st.Done():
-			// Drain what is already queued so a final error event reaches the
-			// client before the connection goes away.
-			for {
-				select {
-				case ev := <-st.Events():
-					if s.writeEvent(w, rc, ev) != nil {
-						return
-					}
-					continue
-				default:
-				}
-				break
+			// Write what is already queued so a final error event reaches the
+			// client before the connection goes away, then the reason the
+			// server ended the stream when it could not be queued.
+			batch = st.Take(batch)
+			if ev, ok := s.closingError(st.CloseCode()); ok {
+				batch = append(batch, event.Event{Kind: event.KindError, Data: ev})
 			}
-			// A lagging stream is closed because its queue was full, so the
-			// error could not be queued; it is written here instead.
-			if st.CloseCode() == "stream_lagging" {
-				_ = s.writeEvent(w, rc, event.Event{Kind: event.KindError, Data: event.Error{
-					Code:      "stream_lagging",
-					Message:   "the client did not keep up with the change stream",
-					Retryable: true, Action: "resnapshot",
-				}})
-			}
+			_ = s.writeEvents(w, rc, batch)
 			return
 		}
+	}
+}
+
+// recycleBatch empties a written batch for reuse, unless a burst grew it past
+// what is worth keeping for the life of the stream.
+func recycleBatch(batch []event.Event) []event.Event {
+	clear(batch)
+	if cap(batch) > 64 {
+		return nil
+	}
+	return batch[:0]
+}
+
+// closingError is the error a stream gets last when the server ended it for a
+// reason it could not queue: the queue was full, or the process is stopping.
+func (s *Server) closingError(code string) (event.Error, bool) {
+	switch code {
+	case "stream_lagging":
+		return event.Error{
+			Code:      "stream_lagging",
+			Message:   "the client did not keep up with the change stream",
+			Retryable: true, Action: "resnapshot",
+		}, true
+	case "server_shutdown":
+		e := event.Error{
+			Code:      "server_shutdown",
+			Message:   "the server is shutting down",
+			Retryable: true,
+		}
+		if spread := s.cfg.ReconnectSpread; spread > 0 {
+			e.RetryAfterMs = rand.N(spread).Milliseconds()
+		}
+		return e, true
+	}
+	return event.Error{}, false
+}
+
+// Drain ends every open stream with server_shutdown and refuses new ones.
+//
+// http.Server.Shutdown waits for handlers to return, and an SSE handler only
+// returns when its stream ends. Without this a shutdown always ran out its
+// grace period and the process was killed with every stream still open, so no
+// client learned why or when to come back.
+func (s *Server) Drain() {
+	s.draining.Store(true)
+	for _, st := range s.hub.Streams() {
+		st.CloseWith("server_shutdown")
 	}
 }
 
@@ -353,18 +404,32 @@ func (s *Server) tick(st *hub.Stream) {
 	st.Send(event.Event{Kind: event.KindHeartbeat})
 }
 
-func (s *Server) writeEvent(w http.ResponseWriter, rc *http.ResponseController, ev event.Event) error {
-	// Bounding each write is what stops a slow consumer from pinning a goroutine
-	// forever, without needing a watchdog per connection.
-	_ = rc.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+// writeEvents writes a batch of events and flushes once. The ResponseWriter
+// buffers what is written to it, so frames go straight in and reach the socket
+// as that buffer fills, and the flush sends the rest.
+func (s *Server) writeEvents(w http.ResponseWriter, rc *http.ResponseController, evs []event.Event) error {
+	if len(evs) == 0 {
+		return nil
+	}
+	for _, ev := range evs {
+		// Bounding each write is what stops a slow consumer from pinning a
+		// goroutine forever, without needing a watchdog per connection. The
+		// flush runs under the last frame's deadline.
+		_ = rc.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+		if err := writeFrame(w, ev); err != nil {
+			return err
+		}
+	}
+	return rc.Flush()
+}
 
+// writeFrame writes one event in SSE framing.
+func writeFrame(w io.Writer, ev event.Event) error {
 	// A bare comment, exactly as the WHATWG spec recommends for keeping proxies
 	// from dropping an idle stream.
 	if ev.Kind == event.KindHeartbeat {
-		if _, err := w.Write([]byte(": hb\n\n")); err != nil {
-			return err
-		}
-		return rc.Flush()
+		_, err := io.WriteString(w, ": hb\n\n")
+		return err
 	}
 
 	body, err := json.Marshal(ev.Data)
@@ -385,11 +450,8 @@ func (s *Server) writeEvent(w http.ResponseWriter, rc *http.ResponseController, 
 	// The blank line is what dispatches the event; an event without it is
 	// discarded by the client.
 	frame = append(frame, "\n\n"...)
-
-	if _, err := w.Write(frame); err != nil {
-		return err
-	}
-	return rc.Flush()
+	_, err = w.Write(frame)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -469,8 +531,10 @@ func (s *Server) applySubscriptions(
 	out := make([]subResult, 0, len(specs))
 	shapes := len(s.reg.StreamSubscriptions(st.StreamID()))
 	existing := shapes + len(st.Channels())
+	prepared := s.prepareShapes(ctx, id, specs,
+		min(s.cfg.MaxShapesPerStream-shapes, s.cfg.MaxSubsPerStream-existing))
 
-	for _, spec := range specs {
+	for i, spec := range specs {
 		if spec.Sub == "" {
 			out = append(out, subResult{OK: false, Error: &event.Error{
 				Code: "invalid_subscription", Message: "each subscription needs a `sub` label"}})
@@ -493,7 +557,11 @@ func (s *Server) applySubscriptions(
 						"this stream is at its limit of %d shape subscriptions", s.cfg.MaxShapesPerStream)}})
 				continue
 			}
-			res := s.subscribeShape(ctx, st, id, spec, resume)
+			prep, ok := prepared[i]
+			if !ok {
+				prep = s.prepareShape(ctx, id, spec)
+			}
+			res := s.subscribeShape(ctx, st, id, spec, prep, resume)
 			out = append(out, res)
 			if res.OK {
 				existing++
@@ -513,48 +581,90 @@ func (s *Server) applySubscriptions(
 	return out
 }
 
-func (s *Server) subscribeShape(
-	ctx context.Context,
-	st *hub.Stream,
-	id authz.Identity,
-	spec subSpec,
-	resume map[string]string,
-) subResult {
+// resolveConcurrency bounds how many shapes of one request are resolved at once.
+const resolveConcurrency = 4
 
-	res := subResult{Sub: spec.Sub}
+// prepareShapes resolves, concurrently, the first `room` shapes of a request:
+// as many as the stream's limits could admit. Resolving is the slow part of a
+// subscribe -- an issuer round trip, or catalog work and probes in RLS mode --
+// and touches nothing of the stream's, so a stream reopened after a restart
+// waits for its slowest shape rather than for all of them in turn. Admission,
+// limits and installation stay in request order in applySubscriptions, which
+// resolves any later shape itself if an earlier one fails and leaves room.
+func (s *Server) prepareShapes(ctx context.Context, id authz.Identity, specs []subSpec, room int) map[int]preparedShape {
+	var idx []int
+	for i, spec := range specs {
+		if len(idx) >= room {
+			break
+		}
+		if spec.Sub != "" && spec.Shape != nil {
+			idx = append(idx, i)
+		}
+	}
+	if len(idx) < 2 {
+		return nil
+	}
+	out := make([]preparedShape, len(idx))
+	var g errgroup.Group
+	g.SetLimit(resolveConcurrency)
+	for j, i := range idx {
+		g.Go(func() error {
+			out[j] = s.prepareShape(ctx, id, specs[i])
+			return nil
+		})
+	}
+	_ = g.Wait()
+	m := make(map[int]preparedShape, len(idx))
+	for j, i := range idx {
+		m[i] = out[j]
+	}
+	return m
+}
+
+// preparedShape is a shape request validated and resolved by the oracle, not
+// yet installed. A failure is carried in res.
+type preparedShape struct {
+	res   subResult
+	rel   *catalog.Relation
+	ops   shape.Ops
+	grant *oracle.Grant
+}
+
+func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSpec) preparedShape {
+	p := preparedShape{res: subResult{Sub: spec.Sub}}
 	sp := spec.Shape
 
 	schema := cmp.Or(sp.Schema, "public")
 	rel, ok := s.cat.Lookup(schema, sp.Table)
 	if !ok {
-		res.Error = &event.Error{Code: "relation_not_published", Message: fmt.Sprintf(
+		p.res.Error = &event.Error{Code: "relation_not_published", Message: fmt.Sprintf(
 			"%s.%s is not in publication %q; add it with: ALTER PUBLICATION %s ADD TABLE %s.%s",
 			schema, sp.Table, s.cfg.Publication, s.cfg.Publication, schema, sp.Table)}
-		return res
+		return p
 	}
 
 	ops, err := shape.ParseOps(sp.Ops)
 	if err != nil {
-		res.Error = &event.Error{Code: "invalid_ops", Message: err.Error()}
-		return res
+		p.res.Error = &event.Error{Code: "invalid_ops", Message: err.Error()}
+		return p
 	}
 
 	filter, err := shape.Parse(sp.Filter, rel)
 	if err != nil {
-		res.Error = &event.Error{Code: "invalid_filter", Message: err.Error()}
-		return res
+		p.res.Error = &event.Error{Code: "invalid_filter", Message: err.Error()}
+		return p
 	}
 	for _, c := range sp.Columns {
 		if _, ok := rel.Column(c); !ok {
-			res.Error = &event.Error{Code: "invalid_columns", Message: fmt.Sprintf(
+			p.res.Error = &event.Error{Code: "invalid_columns", Message: fmt.Sprintf(
 				"column %q does not exist on %s", c, rel.FullName())}
-			return res
+			return p
 		}
 	}
 
 	if s.oracle == nil {
-		res.Error = &event.Error{Code: "internal", Message: "shape oracle is not configured"}
-		return res
+		p.res.Error = &event.Error{Code: "internal", Message: "shape oracle is not configured"}
+		return p
 	}
 
 	start := time.Now()
@@ -567,17 +677,36 @@ func (s *Server) subscribeShape(
 		Ops:      sp.Ops,
 	})
 	if err != nil {
-		s.mapOracleErr(&res, err)
-		return res
+		s.mapOracleErr(&p.res, err)
+		return p
 	}
-	decision := grant.Decision
-	filter = grant.Filter
-	tierLabel := s.tierLabel(decision)
+	tierLabel := s.tierLabel(grant.Decision)
 	metrics.AuthzResolveSeconds.WithLabelValues(tierLabel).Observe(time.Since(start).Seconds())
 	metrics.AuthzResolutions.WithLabelValues(tierLabel, "granted").Inc()
-	if decision != nil && decision.Tier == authz.TierC && s.oracle.Name() == oracle.NameRLS {
-		metrics.AuthzCompileFailures.WithLabelValues(rel.Schema, rel.Name, truncate(decision.Reason, 60)).Inc()
+	if d := grant.Decision; d != nil && d.Tier == authz.TierC && s.oracle.Name() == oracle.NameRLS {
+		metrics.AuthzCompileFailures.WithLabelValues(rel.Schema, rel.Name, truncate(d.Reason, 60)).Inc()
 	}
+	p.rel, p.ops, p.grant = rel, ops, grant
+	return p
+}
+
+func (s *Server) subscribeShape(
+	ctx context.Context,
+	st *hub.Stream,
+	id authz.Identity,
+	spec subSpec,
+	prep preparedShape,
+	resume map[string]string,
+) subResult {
+
+	res := prep.res
+	if res.Error != nil {
+		return res
+	}
+	sp := spec.Shape
+	rel, ops, grant := prep.rel, prep.ops, prep.grant
+	decision := grant.Decision
+	filter := grant.Filter
 
 	sub := &registry.Subscription{
 		Label:       spec.Sub,
@@ -724,13 +853,14 @@ func (s *Server) subscribeShape(
 	// because only the client knows to discard the state it holds.
 	if lsnStr := resume[rel.FullName()]; lsnStr != "" {
 		from, err := reader.ParseLSN(lsnStr)
-		switch {
-		case err != nil:
+		if err != nil {
 			hub.SendError(st, event.Error{Sub: sub.Label, Code: "invalid_resume",
 				Message: "resume LSN could not be parsed"})
-		case !s.replayFrom(sub, from):
-			hub.SendError(st, errResumeTooOld(sub.Label))
+			return res
 		}
+		// Off the request: a replay waits for the writer to make room, and on a
+		// stream being opened the writer only starts after the ready event.
+		go s.resume(sub, from)
 		return res
 	}
 	if wantSnapshot {
@@ -745,6 +875,14 @@ func errResumeTooOld(label string) event.Error {
 		Retryable: true, Action: "resnapshot"}
 }
 
+// resume replays a reconnecting subscription from the position its client last
+// saw, or tells it the buffer no longer reaches that far.
+func (s *Server) resume(sub *registry.Subscription, from uint64) {
+	if !s.replayFrom(sub, from) {
+		hub.SendError(streamOf(sub), errResumeTooOld(sub.Label))
+	}
+}
+
 // replayFrom re-delivers buffered changes at or after `from`, re-filtered and
 // re-authorized: replay is never trusted to have been authorized on its first
 // pass. It returns false, delivering nothing, when the buffer cannot cover it.
@@ -754,11 +892,17 @@ func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 		return false
 	}
 	for _, e := range entries {
+		// A replay can outlast the subscription, or a /token can rebind it to a
+		// new filter and columns while it runs; follow what is registered now.
+		cur := s.reg.Get(sub.Sink.StreamID(), sub.Label)
+		if cur == nil {
+			return true
+		}
 		m := messageFromRing(e)
-		s.deliver(sub, m, e.Relation,
+		s.deliver(cur, m, e.Relation,
 			tupleRow{rel: e.Relation, t: e.New}, tupleRow{rel: e.Relation, t: e.Old},
 			s.newTuples(e.Relation, m),
-			e.LSN, e.CommitTime, opName(e.Op), false)
+			e.LSN, e.CommitTime, opName(e.Op), true)
 	}
 	return true
 }
@@ -1007,11 +1151,15 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	catalogLoaded := !s.cat.LoadedAt().IsZero()
 	replicating := s.reader != nil && s.reader.Streaming()
+	draining := s.draining.Load()
 	code := http.StatusOK
-	if !catalogLoaded || !replicating {
+	if !catalogLoaded || !replicating || draining {
 		code = http.StatusServiceUnavailable
 	}
 	body := map[string]any{"catalog_loaded": catalogLoaded, "replicating": replicating, "streams": s.hub.Count()}
+	if draining {
+		body["draining"] = true
+	}
 	if s.reader != nil {
 		body["confirmed_lsn"] = reader.FormatLSN(s.reader.ConfirmedLSN())
 	}

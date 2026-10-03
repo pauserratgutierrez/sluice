@@ -7,9 +7,15 @@
 // broadcast, presence, warnings -- is best-effort and the new event is dropped.
 // Nothing already queued is ever displaced, because that would reorder the
 // stream.
+//
+// Snapshot rows and resume replays are the exception to closing: they are
+// produced off the replication path, as fast as memory allows, so they wait for
+// room instead (SendBackfill). They only ever fill half the queue, leaving the
+// rest to live events, which never wait.
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
@@ -25,7 +31,16 @@ type Stream struct {
 	id       string
 	identity atomic.Pointer[authz.Identity]
 
-	queue chan event.Event
+	// The queue grows as events arrive, up to limit, so an idle stream holds no
+	// buffer. A preallocated channel of the same capacity cost every stream
+	// about 12 KiB whether or not anything was ever sent to it.
+	qmu   sync.Mutex
+	queue []event.Event
+	limit int
+	// ready is signalled when an event is queued; room when the writer takes
+	// the queue. Both hold at most one pending signal.
+	ready chan struct{}
+	room  chan struct{}
 	done  chan struct{}
 
 	closeOnce sync.Once
@@ -67,17 +82,10 @@ func (s *Stream) SetIdentity(id authz.Identity) { s.identity.Store(&id) }
 // Send enqueues an event. Returns false when the event was dropped or the stream
 // is closed.
 func (s *Stream) Send(ev event.Event) bool {
-	select {
-	case <-s.done:
-		return false
-	default:
+	queued, closed := s.push(ev, s.limit)
+	if queued || closed {
+		return queued
 	}
-	select {
-	case s.queue <- ev:
-		return true
-	default:
-	}
-
 	metrics.StreamDropped.WithLabelValues(string(ev.Kind)).Inc()
 	if ev.Kind == event.KindChange || ev.Kind == event.KindSnapshotEnd {
 		s.CloseWith("stream_lagging")
@@ -85,8 +93,65 @@ func (s *Stream) Send(ev event.Event) bool {
 	return false
 }
 
-// Events is the channel the SSE writer reads.
-func (s *Stream) Events() <-chan event.Event { return s.queue }
+// SendBackfill enqueues a snapshot row or a replayed change, waiting while the
+// queue is half full rather than closing the stream. Returns false when the
+// stream or ctx ended first.
+func (s *Stream) SendBackfill(ctx context.Context, ev event.Event) bool {
+	for {
+		queued, closed := s.push(ev, max(1, s.limit/2))
+		if queued || closed {
+			return queued
+		}
+		select {
+		case <-s.room:
+		case <-s.done:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// push appends ev while the queue holds fewer than capacity events.
+func (s *Stream) push(ev event.Event, capacity int) (queued, closed bool) {
+	select {
+	case <-s.done:
+		return false, true
+	default:
+	}
+	s.qmu.Lock()
+	if len(s.queue) >= capacity {
+		s.qmu.Unlock()
+		return false, false
+	}
+	s.queue = append(s.queue, ev)
+	s.qmu.Unlock()
+	select {
+	case s.ready <- struct{}{}:
+	default:
+	}
+	return true, false
+}
+
+// Ready is signalled when events are waiting to be taken.
+func (s *Stream) Ready() <-chan struct{} { return s.ready }
+
+// Take removes every queued event, oldest first, and gives the stream spare to
+// queue into next. Passing back the slice an earlier Take returned, once its
+// events are written, keeps the stream to two buffers.
+func (s *Stream) Take(spare []event.Event) []event.Event {
+	s.qmu.Lock()
+	q := s.queue
+	s.queue = spare[:0]
+	s.qmu.Unlock()
+	if len(q) > 0 {
+		select {
+		case s.room <- struct{}{}:
+		default:
+		}
+	}
+	return q
+}
 
 // Done closes when the stream is finished.
 func (s *Stream) Done() <-chan struct{} { return s.done }
@@ -195,7 +260,9 @@ func (h *Hub) Presence() *Presence { return h.presence }
 func (h *Hub) Open(id string, identity authz.Identity) *Stream {
 	s := &Stream{
 		id:       id,
-		queue:    make(chan event.Event, h.queueSize),
+		limit:    max(1, h.queueSize),
+		ready:    make(chan struct{}, 1),
+		room:     make(chan struct{}, 1),
 		done:     make(chan struct{}),
 		created:  time.Now(),
 		channels: map[string]channelJoin{},

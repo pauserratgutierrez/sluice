@@ -11,6 +11,11 @@
 #   docker compose --profile presence  up --build --abort-on-container-exit --exit-code-from runner-presence
 #   docker compose --profile mixed     up --build --abort-on-container-exit --exit-code-from runner-mixed
 #   docker compose --profile kick      up --build --abort-on-container-exit --exit-code-from runner-kick
+#   docker compose --profile idle      up --build --abort-on-container-exit --exit-code-from runner-idle
+#
+# To test the working tree instead of a published image, build it and point the
+# stack at it: docker build -t sluice:local ../.. && SLUICE_IMAGE=sluice:local
+# SLUICE_PULL_POLICY=never docker compose --profile ... (or `make local`).
 
 name: sluice-loadtest
 
@@ -33,7 +38,7 @@ x-runner-env: &runner-env
   LOAD_RESULTS: /results
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
   SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
-  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.1.4}
+  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.3.0}
   LOAD_DB_URL: postgres://postgres:${POSTGRES_PASSWORD:-loadtest-pg}@db:5432/postgres
   ISSUER_URL: http://issuer:8080
   LOAD_AXIS: ${LOAD_AXIS:-all}
@@ -88,12 +93,13 @@ x-runner-issuer: &runner-issuer
   networks: [loadtest]
 
 x-sluice: &sluice
-  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.1.4}
-  pull_policy: always
+  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.3.0}
+  pull_policy: ${SLUICE_PULL_POLICY:-always}
   restart: unless-stopped
   logging: *default-logging
   init: true
-  mem_limit: 6g
+  # Set to a production container's limit (e.g. 512m) to find how many streams fit in it.
+  mem_limit: ${SLUICE_MEM_LIMIT:-6g}
   ulimits:
     nofile:
       soft: 1048576
@@ -136,7 +142,7 @@ x-sluice: &sluice
 services:
   db:
     image: postgres:18.4-trixie
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick]
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle]
     restart: unless-stopped
     logging: *default-logging
     security_opt: ["no-new-privileges:true"]
@@ -179,7 +185,7 @@ services:
 
   jwks:
     <<: *loadtest
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick]
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle]
     command: ["jwks"]
     restart: unless-stopped
     user: "0:0"
@@ -220,7 +226,7 @@ services:
 
   sluice-rls:
     <<: *sluice
-    profiles: [rls-a, rls-b, rls-c, broadcast, presence, mixed]
+    profiles: [rls-a, rls-b, rls-c, broadcast, presence, mixed, idle]
     depends_on:
       db: { condition: service_healthy }
       jwks: { condition: service_healthy }
@@ -310,6 +316,15 @@ services:
       <<: *runner-env
       LOAD_SCENARIO: kick
       SLUICE_URL: http://sluice-issuer:4000/sluice/v1
+
+  runner-idle:
+    <<: *runner-rls
+    profiles: [idle]
+    environment:
+      <<: *runner-env
+      LOAD_SCENARIO: idle
+      LOAD_IDLE_HOLD: ${LOAD_IDLE_HOLD:-60s}
+      SLUICE_URL: http://sluice-rls:4000/sluice/v1
 
 volumes:
   db_data:

@@ -210,6 +210,11 @@ type Authorizer struct {
 	// Tier C subscribers rather than delivered unauthorized.
 	probeBudget *budget
 
+	// probeTimeout bounds each query a change waits on: Tier C probes and Tier
+	// B cross-checks run on the replication path, where one hung query would
+	// otherwise stall every subscriber.
+	probeTimeout time.Duration
+
 	// OnDowngrade is called when a cross-check fails. Wired to logging, metrics
 	// and a client warning, because a parser disagreeing with PostgreSQL is the
 	// single most serious thing that can go wrong here.
@@ -221,9 +226,14 @@ type Options struct {
 	TierC           string
 	MaxProbesPerSec int
 	VerifySamples   int
+	ProbeTimeout    time.Duration
 }
 
 func New(pool *pgxpool.Pool, cat *catalog.Cache, o Options) *Authorizer {
+	timeout := o.ProbeTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
 	return &Authorizer{
 		pool:          pool,
 		cat:           cat,
@@ -231,6 +241,7 @@ func New(pool *pgxpool.Pool, cat *catalog.Cache, o Options) *Authorizer {
 		tierC:         o.TierC,
 		verifySamples: int32(o.VerifySamples),
 		probeBudget:   newBudget(o.MaxProbesPerSec),
+		probeTimeout:  timeout,
 	}
 }
 
@@ -501,23 +512,42 @@ func (a *Authorizer) probePK(ctx context.Context, id Identity, rel *catalog.Rela
 // unwinds it at ROLLBACK regardless of what the pool does next. A connection
 // returned to the pool can never carry a stale role into another caller's query.
 // Identifiers come from the catalog and values are always bound parameters.
+//
+// The BEGIN, the impersonation and the query go in one pipelined batch, so a
+// probe costs two round trips (the batch, then the ROLLBACK) instead of four.
+// The ROLLBACK is its own statement because a failed statement in the batch
+// skips the rest of it.
 func (a *Authorizer) queryAs(ctx context.Context, id Identity, sql string, args ...any) (bool, error) {
-	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	ctx, cancel := context.WithTimeout(ctx, a.probeTimeout)
+	defer cancel()
+
+	conn, err := a.pool.Acquire(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	// The pool closes a connection released mid-transaction, so one whose
+	// ROLLBACK failed is never reused with the impersonation still in force.
+	defer conn.Release()
+	defer func() { _, _ = conn.Exec(ctx, "ROLLBACK") }()
 
-	if _, err := tx.Exec(ctx,
-		`SELECT set_config('role', $1, true), set_config('request.jwt.claims', $2, true)`,
-		id.Role, id.ClaimsRaw); err != nil {
-		return false, err
-	}
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN READ ONLY")
+	batch.Queue(`SELECT set_config('role', $1, true), set_config('request.jwt.claims', $2, true)`,
+		id.Role, id.ClaimsRaw)
+	batch.Queue(sql, args...)
+	br := conn.SendBatch(ctx, batch)
 	var ok bool
-	if err := tx.QueryRow(ctx, sql, args...).Scan(&ok); err != nil {
-		return false, err
+	_, err = br.Exec()
+	if err == nil {
+		_, err = br.Exec()
 	}
-	return ok, nil
+	if err == nil {
+		err = br.QueryRow().Scan(&ok)
+	}
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	return ok, err
 }
 
 // Refresh re-resolves a subscription and publishes the result. Returns false

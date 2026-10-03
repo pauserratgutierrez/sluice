@@ -33,6 +33,9 @@ type Config struct {
 	OpenTimeout     time.Duration
 	DeliveryTimeout time.Duration
 	PresenceWait    time.Duration
+	IdleHold        time.Duration
+	IdleShapes      int
+	SampleEvery     time.Duration
 	TokenTTL        time.Duration
 	Channel         string
 }
@@ -47,7 +50,7 @@ func LoadConfig() Config {
 		IssuerBearer:    envOr("SLUICE_ISSUER_BEARER", ""),
 		PrivateJWK:      envOr("LOAD_PRIVATE_JWK", "/keys/private.jwk"),
 		ResultsDir:      envOr("LOAD_RESULTS", "/results"),
-		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.1.4"),
+		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.3.0"),
 		Start:           envInt("LOAD_START", 100),
 		Cap:             envInt("LOAD_MAX_STREAMS", 0),
 		Granularity:     envInt("LOAD_GRANULARITY", 50),
@@ -58,6 +61,9 @@ func LoadConfig() Config {
 		OpenTimeout:     envDur("LOAD_OPEN_TIMEOUT", 3*time.Minute),
 		DeliveryTimeout: envDur("LOAD_DELIVERY_TIMEOUT", 90*time.Second),
 		PresenceWait:    envDur("LOAD_PRESENCE_WAIT", 8*time.Second),
+		IdleHold:        envDur("LOAD_IDLE_HOLD", time.Minute),
+		IdleShapes:      max(1, envInt("LOAD_IDLE_SHAPES", 5)),
+		SampleEvery:     envDur("LOAD_SAMPLE_EVERY", time.Second),
 		TokenTTL:        24 * time.Hour,
 		Channel:         envOr("LOAD_CHANNEL", "room:load"),
 	}
@@ -81,7 +87,12 @@ func LoadConfig() Config {
 			c.Ladder = []int{25, 50, 100, 200}
 		case "presence":
 			c.Ladder = []int{50, 100, 200, 400, 800}
+		case "idle":
+			c.Ladder = []int{1000, 5000, 10000, 20000}
 		}
+	}
+	if c.SampleEvery <= 0 {
+		c.SampleEvery = time.Second
 	}
 	return c
 }
