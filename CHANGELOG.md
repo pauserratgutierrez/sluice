@@ -2,7 +2,7 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
-## Unreleased
+## 0.4.0
 
 ### Fixed
 

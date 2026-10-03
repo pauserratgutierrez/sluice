@@ -2,7 +2,7 @@
 
 An independent Docker app that load-tests a **published** Sluice image. It is not the `deploy/` harness and it does not import Sluice's Go module. It speaks the public protocol the way a product would: mint JWTs, `POST /stream`, insert rows, count SSE events, and (for signalling) `POST /publish`, `POST /presence`, and `pg_logical_emit_message`.
 
-Default target: [`ghcr.io/pauserratgutierrez/sluice:0.3.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (healthcheck `/sluice -healthcheck`). `SLUICE_IMAGE` points it at another tag, and `make local P=<profile>` builds the working tree and runs a profile against that.
+Default target: [`ghcr.io/pauserratgutierrez/sluice:0.4.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (healthcheck `/sluice -healthcheck`). `SLUICE_IMAGE` points it at another tag, and `make local P=<profile>` builds the working tree and runs a profile against that.
 
 ## What it measures
 
@@ -24,11 +24,11 @@ A step **passes** when ≥95% of streams open, ≥90% of expected events (or pre
 
 Results are written to `results/` (`*.json` and `*.md`). That directory is gitignored except for `.gitkeep`.
 
-## Resources: 0.3.0 against the next release (this machine, 2026-10-03)
+## Resources: 0.3.0 against 0.4.0 (this machine, 2026-10-03)
 
 Same machine and runner, one profile at a time, fresh database each run. Memory per stream is measured from the fresh process (see [What it measures](#what-it-measures)).
 
-| Run | 0.3.0 | Next release |
+| Run | 0.3.0 | 0.4.0 |
 | --- | ---: | ---: |
 | `idle`, 1 shape + channel: memory per stream | 52 KiB | 37–41 KiB |
 | `idle`, 20 000 streams: peak RSS | 980 MiB | 783 MiB |
@@ -42,7 +42,7 @@ Same machine and runner, one profile at a time, fresh database each run. Memory 
 | `rls-a` fan-out to 16 000 connections, mean of 6: events/s | 152k | 157k |
 | … CPU per 1000 events | 83 ms | 77 ms |
 
-Fan-out throughput at 16 000 connections varies by ±20% between runs on this VM; the two are equal within that noise. Past about 10 000 streams in 512 MB the next release reaches its `GOMEMLIMIT` and spends CPU on collection instead of being OOM-killed, so a stream cap below that is the brake to set.
+Fan-out throughput at 16 000 connections varies by ±20% between runs on this VM; the two are equal within that noise. Past about 10 000 streams in 512 MB 0.4.0 reaches its `GOMEMLIMIT` and spends CPU on collection instead of being OOM-killed, so a stream cap below that is the brake to set.
 
 ## Results (0.1.4, this machine)
 
@@ -158,7 +158,7 @@ The schema is a small SaaS, not a copy of `deploy/db/fixtures.sql`:
 | `LOAD_IDLE_HOLD` | `60s` | how long `idle` holds its streams open |
 | `LOAD_IDLE_SHAPES` | `5` | shapes per `idle` stream, besides its channel |
 | `LOAD_SAMPLE_EVERY` | `1s` | resource sampling interval |
-| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.3.0` | override the target |
+| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.4.0` | override the target |
 | `SLUICE_PULL_POLICY` | `always` | `never` for a locally built image |
 | `SLUICE_MEM_LIMIT` | `6g` | the Sluice container's memory limit; set a production value to see how many streams fit |
 
