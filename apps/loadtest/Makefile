@@ -1,6 +1,6 @@
 # Independent realtime load-test app
 #
-# Consumes a published Sluice image (`ghcr.io/pauserratgutierrez/sluice:0.4.0` by
+# Consumes a published Sluice image (`ghcr.io/pauserratgutierrez/sluice:0.5.0` by
 # default, `SLUICE_IMAGE` to override). It does not import the Sluice Go module
 # and does not share the `deploy/` harness. The only coupling is the public
 # protocol: JWT + POST `/stream` (SSE) + SQL writes and, for signalling, POST

@@ -50,7 +50,7 @@ func LoadConfig() Config {
 		IssuerBearer:    envOr("SLUICE_ISSUER_BEARER", ""),
 		PrivateJWK:      envOr("LOAD_PRIVATE_JWK", "/keys/private.jwk"),
 		ResultsDir:      envOr("LOAD_RESULTS", "/results"),
-		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.4.0"),
+		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.5.0"),
 		Start:           envInt("LOAD_START", 100),
 		Cap:             envInt("LOAD_MAX_STREAMS", 0),
 		Granularity:     envInt("LOAD_GRANULARITY", 50),

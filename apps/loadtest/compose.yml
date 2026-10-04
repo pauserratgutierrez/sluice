@@ -38,7 +38,7 @@ x-runner-env: &runner-env
   LOAD_RESULTS: /results
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
   SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
-  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.4.0}
+  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.5.0}
   LOAD_DB_URL: postgres://postgres:${POSTGRES_PASSWORD:-loadtest-pg}@db:5432/postgres
   ISSUER_URL: http://issuer:8080
   LOAD_AXIS: ${LOAD_AXIS:-all}
@@ -93,7 +93,7 @@ x-runner-issuer: &runner-issuer
   networks: [loadtest]
 
 x-sluice: &sluice
-  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.4.0}
+  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.5.0}
   pull_policy: ${SLUICE_PULL_POLICY:-always}
   restart: unless-stopped
   logging: *default-logging

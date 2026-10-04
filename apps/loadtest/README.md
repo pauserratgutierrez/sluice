@@ -2,7 +2,7 @@
 
 An independent Docker app that load-tests a **published** Sluice image. It is not the `deploy/` harness and it does not import Sluice's Go module. It speaks the public protocol the way a product would: mint JWTs, `POST /stream`, insert rows, count SSE events, and (for signalling) `POST /publish`, `POST /presence`, and `pg_logical_emit_message`.
 
-Default target: [`ghcr.io/pauserratgutierrez/sluice:0.4.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (healthcheck `/sluice -healthcheck`). `SLUICE_IMAGE` points it at another tag, and `make local P=<profile>` builds the working tree and runs a profile against that.
+Default target: [`ghcr.io/pauserratgutierrez/sluice:0.5.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) (healthcheck `/sluice -healthcheck`). `SLUICE_IMAGE` points it at another tag, and `make local P=<profile>` builds the working tree and runs a profile against that.
 
 ## What it measures
 
@@ -158,7 +158,7 @@ The schema is a small SaaS, not a copy of `deploy/db/fixtures.sql`:
 | `LOAD_IDLE_HOLD` | `60s` | how long `idle` holds its streams open |
 | `LOAD_IDLE_SHAPES` | `5` | shapes per `idle` stream, besides its channel |
 | `LOAD_SAMPLE_EVERY` | `1s` | resource sampling interval |
-| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.4.0` | override the target |
+| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.5.0` | override the target |
 | `SLUICE_PULL_POLICY` | `always` | `never` for a locally built image |
 | `SLUICE_MEM_LIMIT` | `6g` | the Sluice container's memory limit; set a production value to see how many streams fit |
 
