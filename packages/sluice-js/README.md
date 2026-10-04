@@ -151,6 +151,8 @@ const sluice = createClient<Database>(url, {
 
 **Reconnection is automatic.** The client remembers the last commit LSN it saw per table and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). If the server no longer has that position (it restarted, or you were away too long), the shape gets `resume_too_old` with `action: 'resnapshot'` and the client forgets the stale position: discard what you hold for that shape and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, instead of its own backoff, before reconnecting.
 
+**Status.** `onStatusChange` and `.connectionStatus` report `idle` (nothing is subscribed, or the tab is hidden), `connecting`, `open`, `reconnecting` (the stream dropped or an attempt to open it failed) and `closed` (`close()` was called, or the server refused the stream). A stream the server ends on purpose, such as `token_expired` or `server_shutdown`, goes to `connecting`, not `reconnecting`: `reconnecting` always means the connection is failing.
+
 **Subscriptions made together are sent together.** `subscribe()` calls in the same tick (a page mounting several live views) go out in one request, which counts once against the server's subscribe rate.
 
 **Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
@@ -205,7 +207,7 @@ The full list is in the main README's [event reference](../../README.md#events).
 | `.channel<M>(name)` | signalling channel |
 | `.setAuth(token)` | use a refreshed token |
 | `.close()` | close the stream and forget everything |
-| `.connectionStatus` | `connecting` \| `open` \| `reconnecting` \| `closed` |
+| `.connectionStatus` | `idle` \| `connecting` \| `open` \| `reconnecting` \| `closed` |
 
 `parseSSE(body, signal)` is exported too, if you need the framing for a custom transport.
 

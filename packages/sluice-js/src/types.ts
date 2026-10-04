@@ -180,7 +180,15 @@ export interface SnapshotEndPayload {
   truncated?: boolean
 }
 
-export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed'
+/**
+ * - `idle`: no stream, on purpose: nothing is subscribed, or the document is hidden.
+ * - `connecting`: opening the stream, at first or to replace one the server ended (token expiry, shutdown).
+ * - `open`: the stream is up.
+ * - `reconnecting`: the stream dropped or an attempt to open it failed; retrying with backoff.
+ * - `closed`: stopped and not retrying: `close()` was called, or the server refused the stream
+ *   (401, 403). `setAuth` reopens a refused stream.
+ */
+export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
 
 export interface ClientOptions {
   /**

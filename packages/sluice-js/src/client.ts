@@ -56,7 +56,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
 
   private streamId: string | null = null
   private abort: AbortController | null = null
-  private status: ConnectionStatus = 'closed'
+  private status: ConnectionStatus = 'idle'
   private attempt = 0
   private closed = false
   /** True while the stream loop runs; there is never more than one. */
@@ -280,7 +280,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
     this.abort?.abort()
     this.abort = null
     this.streamId = null
-    this.setStatus(this.closed ? 'closed' : 'reconnecting')
+    this.setStatus(this.closed ? 'closed' : 'idle')
   }
 
   private setStatus(status: ConnectionStatus): void {
@@ -358,9 +358,13 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
 
   /** Opens the stream and keeps it open, reconnecting with backoff. */
   private async runStream(): Promise<void> {
+    // Only a failure is reported as reconnecting: a stream the server ended
+    // cleanly, on token expiry or shutdown, is replaced as planned.
+    let failed = false
+    let refused = false
     try {
       while (!this.closed && !this.paused && this.registrations.size > 0) {
-        this.setStatus(this.attempt === 0 ? 'connecting' : 'reconnecting')
+        this.setStatus(failed ? 'reconnecting' : 'connecting')
         const abort = new AbortController()
         this.abort = abort
 
@@ -389,6 +393,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
           }
 
           this.attempt = 0
+          failed = false
           for await (const ev of parseSSE(res.body, abort.signal)) {
             this.dispatch(ev.event, ev.data)
           }
@@ -403,12 +408,18 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
             retryable: true,
           })
           this.options.onError?.(e)
-          if (!e.retryable) break
+          if (!e.retryable) {
+            refused = true
+            break
+          }
+          failed = true
         } finally {
           this.streamId = null
         }
 
         if (this.closed || this.paused || this.registrations.size === 0) break
+        // Reported when the stream ends, not after the wait.
+        this.setStatus(failed ? 'reconnecting' : 'connecting')
 
         const schedule = this.options.backoff ?? DEFAULT_BACKOFF
         const wait = schedule[Math.min(this.attempt, schedule.length - 1)] ?? 1000
@@ -423,7 +434,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
     } finally {
       this.running = false
       this.streamId = null
-      this.setStatus(this.closed ? 'closed' : 'reconnecting')
+      this.setStatus(this.closed || refused ? 'closed' : 'idle')
       this.wake()
     }
   }

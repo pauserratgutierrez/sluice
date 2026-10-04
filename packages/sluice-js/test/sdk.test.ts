@@ -616,11 +616,13 @@ test('a channel refused when a reconnect resends it reports the error', async ()
 // token is refused, so the client stops. A refreshed token brings it back.
 test('setAuth reconnects a stream that stopped on an expired token', async () => {
   const auths: string[] = []
+  const statuses: string[] = []
   const ready = 'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'
   const client = createClient<Database>('https://example.test/sluice/v1', {
     accessToken: 'old',
     pauseWhenHidden: false,
     backoff: [1],
+    onStatusChange: (s) => statuses.push(s),
     fetch: async (_input, init) => {
       const auth = new Headers(init?.headers).get('Authorization') ?? ''
       auths.push(auth)
@@ -634,8 +636,48 @@ test('setAuth reconnects a stream that stopped on an expired token', async () =>
   await new Promise((r) => setTimeout(r, 40))
   await client.setAuth('fresh')
   assert.deepEqual(auths, ['Bearer old', 'Bearer old', 'Bearer fresh'])
-  assert.equal(client.connectionStatus, 'open')
+  // The server's close is a planned reconnect, and the refusal stops the
+  // client: neither is reported as reconnecting.
+  assert.deepEqual(statuses, ['connecting', 'open', 'connecting', 'closed', 'connecting', 'open'])
   client.close()
+})
+
+test('a failed attempt is reported as reconnecting', async () => {
+  const statuses: string[] = []
+  let calls = 0
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    onStatusChange: (s) => statuses.push(s),
+    onError: () => {},
+    fetch: async () => {
+      if (++calls === 1) throw new TypeError('network down')
+      return sse(openStream('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'))
+    },
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  assert.deepEqual(statuses, ['connecting', 'reconnecting', 'open'])
+  client.close()
+})
+
+test('a client with nothing to listen to is idle', async () => {
+  const statuses: string[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    onStatusChange: (s) => statuses.push(s),
+    fetch: async (input) => {
+      if (String(input).endsWith('/unsubscribe')) return new Response(JSON.stringify({ removed: 1 }))
+      return sse(openStream('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'))
+    },
+  })
+  assert.equal(client.connectionStatus, 'idle')
+  const sub = await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await sub.unsubscribe()
+  assert.deepEqual(statuses, ['connecting', 'open', 'idle'])
+  client.close()
+  assert.equal(client.connectionStatus, 'closed')
 })
 
 // ---------------------------------------------------------------------------

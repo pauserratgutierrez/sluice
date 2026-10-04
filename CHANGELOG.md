@@ -2,6 +2,25 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.5.0
+
+### Fixed
+
+- SDK: a client stopped by a refused stream (`401`, `403`) reported `reconnecting` although it no longer retried. It now reports `closed`; `setAuth` reopens it.
+- SDK: after the server ended a stream, the status stayed `open` while the client waited to reconnect, for up to `retry_after_ms` after `server_shutdown`.
+
+### Changed
+
+- SDK: `reconnecting` is reported only when the stream drops or an attempt to open it fails. Replacing a stream the server ended (`token_expired`, `server_shutdown`) is `connecting`.
+
+### Added
+
+- SDK: `idle` connection status, for a client with nothing subscribed or a hidden tab. It is also the status of a new client, which reported `closed` before.
+
+### For clients
+
+- A `switch` over `ConnectionStatus` needs an `idle` case. A "connection lost" notice can show `reconnecting` as is, without a delay to hide planned reconnects.
+
 ## 0.4.0
 
 ### Fixed
