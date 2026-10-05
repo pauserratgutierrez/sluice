@@ -166,6 +166,8 @@ func validate(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, log *
 	}
 
 	// ---- impersonation capability ----------------------------------------
+	// Issuer mode never impersonates, so it checks no roles. That includes
+	// SLUICE_JWT_REQUIRE_ROLE=false, which config only accepts in issuer mode.
 	if cfg.IssuerMode() {
 		if err := validateIssuerPrivileges(ctx, pool, cfg); err != nil {
 			return nil, err

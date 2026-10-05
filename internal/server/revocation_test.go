@@ -1,12 +1,25 @@
 package server
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/pauserratgutierrez/sluice/internal/auth"
 	"github.com/pauserratgutierrez/sluice/internal/authz"
+	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
+	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 )
@@ -19,6 +32,7 @@ func revocationServer(t *testing.T) (*Server, *pgoutput.Relation) {
 	s.cfg.RevocationEnabled = true
 	s.cfg.SessionsTable = "auth.sessions"
 	s.cfg.UsersTable = "auth.users"
+	s.cfg.UsersBanColumn = "banned_until"
 	s.revoker = auth.NewRevoker(0)
 	users := walRelation(t, 300, "auth", "users",
 		walColumn{1, "id", 2950}, walColumn{0, "banned_until", 1184})
@@ -108,5 +122,99 @@ func TestBanExpiry(t *testing.T) {
 		if _, active := banExpiry(c.in, now); active != c.active {
 			t.Errorf("banExpiry(%q) active = %v, want %v", c.in.String(), active, c.active)
 		}
+	}
+}
+
+// sidVerifier accepts tokens shaped like the identity service's: no `role`, the
+// session in `sid`. It returns a signer for such tokens.
+func sidVerifier(t *testing.T) (*auth.Verifier, func(sub, sid string) string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString
+	jwks, _ := json.Marshal(map[string]any{"keys": []map[string]string{{
+		"kty": "EC", "kid": "k", "crv": "P-256",
+		"x": b64(key.X.FillBytes(make([]byte, 32))), "y": b64(key.Y.FillBytes(make([]byte, 32))),
+	}}})
+	keys := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(jwks) }))
+	t.Cleanup(keys.Close)
+
+	v := auth.NewVerifier(keys.URL, "ES256", "", "", time.Second, time.Minute, nil)
+	v.SetClaimRules("sid", false)
+	if err := v.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return v, func(sub, sid string) string {
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+			"sub": sub, "sid": sid, "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		tok.Header["kid"] = "k"
+		signed, err := tok.SignedString(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+}
+
+// Sign-out DELETEs the session row. The stream whose token named that row in
+// `sid` closes with session_revoked; the same user's other session does not,
+// and the signed-out token can no longer open a stream.
+func TestSessionRevocationBySidClaim(t *testing.T) {
+	const (
+		user      = "0199b1c2-0000-7000-8000-000000000001"
+		signedOut = "0199b1c2-7a3e-7c11-9f00-6e5d4c3b2a10"
+		other     = "0199b1c2-7a3e-7c11-9f00-6e5d4c3b2a11"
+	)
+	s := testServer(t, stubOracle{name: oracle.NameIssuer})
+	s.cfg.RevocationEnabled = true
+	s.cfg.SessionsTable = "auth.session"
+	s.revoker = auth.NewRevoker(0)
+	verify, sign := sidVerifier(t)
+	s.verify = verify
+
+	open := func(sid string) (*hub.Stream, string) {
+		tok := sign(user, sid)
+		id, err := s.verifyToken(context.Background(), "Bearer "+tok)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s.hub.Open("n1."+sid, id), tok
+	}
+	gone, tok := open(signedOut)
+	kept, _ := open(other)
+
+	sessions := walRelation(t, 400, "auth", "session",
+		walColumn{1, "id", 2950}, walColumn{0, "user_id", 2950})
+	s.OnRelation(nil, sessions)
+	m := &pgoutput.Message{Type: pgoutput.MsgDelete, RelationOID: sessions.OID, Old: &pgoutput.Tuple{
+		Columns: []pgoutput.Column{
+			{Kind: pgoutput.ColText, Data: []byte(signedOut)},
+			{Kind: pgoutput.ColNull},
+		},
+	}}
+	if err := s.OnChange(m, sessions, 0x10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := gone.CloseCode(); code != "session_revoked" {
+		t.Fatalf("signed-out stream closed with %q, want session_revoked", code)
+	}
+	var sawError bool
+	for _, ev := range gone.Take(nil) {
+		if e, ok := ev.Data.(event.Error); ok && e.Code == "session_revoked" {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("the signed-out stream got no session_revoked error event")
+	}
+	if code := kept.CloseCode(); code != "" {
+		t.Fatalf("the user's other session closed with %q", code)
+	}
+	if _, err := s.verifyToken(context.Background(), "Bearer "+tok); !errors.Is(err, errSessionRevoked) {
+		t.Fatalf("reconnect with the signed-out token: err = %v, want errSessionRevoked", err)
 	}
 }

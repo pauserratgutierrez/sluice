@@ -2,6 +2,23 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.6.0
+
+### Added
+
+- `SLUICE_JWT_SESSION_CLAIM` (default `session_id`) names the claim that carries the session id, so session revocation works with identity services other than GoTrue (Better Auth: `sid`). The session id is lowercased on both sides of the comparison.
+- `SLUICE_JWT_REQUIRE_ROLE` (default `true`). With `false`, tokens without a `role` are accepted and the claim is ignored even when present; the identity's role is empty, `SLUICE_ALLOWED_ROLES` is unused, and startup checks no roles. Only accepted with `SLUICE_SHAPE_ORACLE=issuer`. In that mode no JWT is `service_role`, so `/admin/jwks/refresh` and `/diagnostics` are unreachable with a token; `/admin/shapes/drop` still takes the issuer bearer.
+- `SLUICE_REVOCATION_USERS_BAN_COLUMN` (default `banned_until`).
+
+### Changed
+
+- **Breaking:** `SLUICE_REVOCATION_USERS_TABLE` has no default. Unset, there is no user-level revocation. A GoTrue deployment that relies on bans closing streams must now set `SLUICE_REVOCATION_USERS_TABLE=auth.users`.
+
+### For operators
+
+- Upgrading with `SLUICE_REVOCATION_ENABLED=true` and GoTrue bans: set `SLUICE_REVOCATION_USERS_TABLE=auth.users`. Nothing else changes for GoTrue tokens.
+- The issuer and hook payloads now carry `"role": ""` for tokens accepted without a role.
+
 ## 0.5.0
 
 ### Fixed

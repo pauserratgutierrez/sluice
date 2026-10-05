@@ -370,13 +370,15 @@ A transactional message (`true`) exists only if the transaction commits. Content
 
 ## Session revocation
 
-Optional (`SLUICE_REVOCATION_ENABLED`), for GoTrue-style auth schemas. Add the tables to the publication:
+Optional (`SLUICE_REVOCATION_ENABLED`), for any identity service that deletes a session row on sign-out and names that row in the token. Add the tables to the publication, each with its primary key as replica identity. For GoTrue:
 
 ```sql
 ALTER PUBLICATION sluice ADD TABLE auth.sessions, auth.users;
 ```
 
-A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `session_id` claim) closes every stream holding that session with `session_revoked`. An `UPDATE` on `SLUICE_REVOCATION_USERS_TABLE` that leaves `banned_until` in the future closes the user's streams with `user_banned`; a `banned_until` already past, as GoTrue leaves it when a timed ban runs out, is not a ban, and an `UPDATE` that clears it or moves it into the past lifts the ban. Revoked sessions are remembered for two hours, and bans until `banned_until` or for two hours, whichever is sooner: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
+with `SLUICE_REVOCATION_USERS_TABLE=auth.users`. A service without bans publishes only its sessions table and leaves `SLUICE_REVOCATION_USERS_TABLE` unset.
+
+A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `SLUICE_JWT_SESSION_CLAIM` claim, `session_id` for GoTrue) closes every stream holding that session with `session_revoked`. Both ids are compared lowercased. Deleting an account whose sessions cascade revokes each of them the same way. When `SLUICE_REVOCATION_USERS_TABLE` is set, an `UPDATE` on it that leaves `SLUICE_REVOCATION_USERS_BAN_COLUMN` (`banned_until`) in the future closes the user's streams with `user_banned`; a ban time already past, as GoTrue leaves it when a timed ban runs out, is not a ban, and an `UPDATE` that clears it or moves it into the past lifts the ban. Revoked sessions are remembered for two hours, and bans until their time or for two hours, whichever is sooner: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
 
 Streams are also closed with `token_expired` at the first heartbeat after the token's `exp`.
 
@@ -467,7 +469,8 @@ The slot and warning metrics refresh every `SLUICE_CATALOG_REFRESH`.
 
 ## Security model
 
-- **Tokens.** The algorithm is pinned (`SLUICE_JWT_ALG`, ES256 or RS256; HS256 is not offered), `exp` is required, the `role` must be in `SLUICE_ALLOWED_ROLES`, `iss` is checked when `SLUICE_JWT_ISSUER` is set, and `aud` for tokens that have a `sub`. `sb_*` opaque keys are refused. The JWKS is refetched every `SLUICE_JWKS_REFRESH` (checked on the catalog tick), on `POST /admin/jwks/refresh`, and when a token names an unknown `kid`, at most once every 10 seconds.
+- **Tokens.** The algorithm is pinned (`SLUICE_JWT_ALG`, ES256 or RS256; HS256 is not offered), `exp` is required, the `role` must be in `SLUICE_ALLOWED_ROLES` (see below for tokens without one), `iss` is checked when `SLUICE_JWT_ISSUER` is set, and `aud` for tokens that have a `sub`. `sb_*` opaque keys are refused. The JWKS is refetched every `SLUICE_JWKS_REFRESH` (checked on the catalog tick), on `POST /admin/jwks/refresh`, and when a token names an unknown `kid`, at most once every 10 seconds.
+- **Tokens without a role.** With `SLUICE_JWT_REQUIRE_ROLE=false`, accepted only with `SLUICE_SHAPE_ORACLE=issuer` (RLS mode needs a role for `SET LOCAL ROLE`), the `role` claim is ignored, present or not, and the identity has an empty role: `SLUICE_ALLOWED_ROLES` is not used, and the issuer and hooks receive `"role": ""`. No token can then be `service_role`, so `POST /admin/jwks/refresh` and `GET /diagnostics` are unreachable with a JWT; `POST /admin/shapes/drop` still takes the issuer bearer.
 - **No tokens in URLs.** The stream is a `POST`, so the token is always a header.
 - **Stream ownership.** A control request must carry a token with the stream's `sub` and `role`; a header/body disagreement on the stream id is rejected.
 - **Least data.** Filters only narrow what the oracle grants; projections are intersected with grants; undecidable changes are withheld; a failed catalog refresh keeps the previous state rather than widening it.
@@ -504,7 +507,9 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_JWT_ISSUER` | empty | not checked when empty |
 | `SLUICE_JWT_AUDIENCE` | `authenticated` | |
 | `SLUICE_JWT_LEEWAY` | `10s` | |
-| `SLUICE_ALLOWED_ROLES` | `anon,authenticated,service_role` | |
+| `SLUICE_ALLOWED_ROLES` | `anon,authenticated,service_role` | ignored when the role is not required |
+| `SLUICE_JWT_REQUIRE_ROLE` | `true` | `false` accepts tokens without `role`; issuer mode only |
+| `SLUICE_JWT_SESSION_CLAIM` | `session_id` | claim holding the session row's `id` (e.g. `sid`) |
 | `SLUICE_SHAPE_ORACLE` | `rls` | or `issuer` |
 | `SLUICE_ISSUER_URL` / `SLUICE_ISSUER_BEARER` | empty | required in issuer mode |
 | `SLUICE_ISSUER_TIMEOUT` | `2s` | |
@@ -533,7 +538,9 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_CHANNEL_HOOK_TTL` / `_TIMEOUT` | `60s` / `2s` | |
 | `SLUICE_CHANNEL_HOOK_BEARER` | empty | sent only when set |
 | `SLUICE_REVOCATION_ENABLED` | `false` | |
-| `SLUICE_REVOCATION_SESSIONS_TABLE` / `_USERS_TABLE` | `auth.sessions` / `auth.users` | |
+| `SLUICE_REVOCATION_SESSIONS_TABLE` | `auth.sessions` | |
+| `SLUICE_REVOCATION_USERS_TABLE` | unset | no user-level revocation when unset; `auth.users` for GoTrue bans |
+| `SLUICE_REVOCATION_USERS_BAN_COLUMN` | `banned_until` | |
 | `SLUICE_METRICS_ENABLED` / `SLUICE_DIAGNOSTICS_ENABLED` | `true` / `true` | |
 
 ## Clients

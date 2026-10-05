@@ -86,10 +86,10 @@ func (s *Server) OnRelation(old, nw *pgoutput.Relation) {
 	// Resolve the revocation tables to OIDs here, once, so the per-change check
 	// is an integer comparison.
 	if s.cfg.RevocationEnabled {
-		switch nw.FullName() {
-		case s.cfg.SessionsTable:
+		switch name := nw.FullName(); {
+		case name == s.cfg.SessionsTable:
 			s.sessionsOID.Store(nw.OID)
-		case s.cfg.UsersTable:
+		case s.cfg.UsersTable != "" && name == s.cfg.UsersTable:
 			s.usersOID.Store(nw.OID)
 		}
 	}
@@ -579,12 +579,15 @@ func (s *Server) noteUnknown(rel *pgoutput.Relation, op string) {
 	metrics.AuthzUnknown.WithLabelValues(rel.Namespace, rel.Name, op).Inc()
 }
 
-// handleRevocation watches auth.sessions and auth.users on the same slot.
+// handleRevocation watches the sessions table and, when one is configured, the
+// users table on the same slot.
 //
 // Verified against supabase/auth v2.195.0: sign-out DELETEs the auth.sessions
 // row (LogoutSession/Logout/LogoutAllExceptMe are all DELETE), and the
 // `session_id` JWT claim is that row's id. Watching refresh_tokens.revoked
-// instead would miss every sign-out, because those rows vanish by cascade.
+// instead would miss every sign-out, because those rows vanish by cascade. Any
+// identity service that deletes the session row on sign-out works the same way;
+// SLUICE_JWT_SESSION_CLAIM names the claim that carries the row's id.
 //
 // The relation is matched by OID, resolved once per Relation message, so the
 // per-change cost is an integer comparison rather than two string comparisons.
@@ -607,7 +610,7 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 		if !ok || idv.IsNull() {
 			return
 		}
-		banned, ok := row.Column("banned_until")
+		banned, ok := row.Column(s.cfg.UsersBanColumn)
 		if !ok {
 			return
 		}
@@ -621,8 +624,8 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 	}
 }
 
-// banExpiry reads auth.users.banned_until and reports whether the ban is in
-// force, and until when.
+// banExpiry reads the ban column (GoTrue: auth.users.banned_until) and reports
+// whether the ban is in force, and until when.
 //
 // A ban whose time has passed is no ban. The auth service leaves the column set
 // when a timed ban runs out, so the next unrelated UPDATE of that user (a
@@ -654,6 +657,7 @@ func (s *Server) closeStreamsForSession(sessionID string) {
 	if sessionID == "" {
 		return
 	}
+	sessionID = strings.ToLower(sessionID)
 	for _, st := range s.hub.Streams() {
 		if st.Identity().SessionID != sessionID {
 			continue

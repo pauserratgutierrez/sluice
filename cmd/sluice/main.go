@@ -127,7 +127,12 @@ func run() error {
 	}
 
 	// ---- catalog ---------------------------------------------------------
-	cat := catalog.New(pool, cfg.AllowedRoles...)
+	// Without a role claim there are no JWT roles whose memberships matter.
+	var roles []string
+	if cfg.JWTRequireRole {
+		roles = cfg.AllowedRoles
+	}
+	cat := catalog.New(pool, roles...)
 	if err := cat.Refresh(ctx, cfg.Publication); err != nil {
 		return fmt.Errorf("load catalog: %w", err)
 	}
@@ -136,6 +141,7 @@ func run() error {
 	// ---- auth ------------------------------------------------------------
 	verifier := auth.NewVerifier(cfg.JWKSURL, cfg.JWTAlg, cfg.JWTIssuer, cfg.JWTAudience,
 		cfg.JWTLeeway, cfg.JWKSRefresh, cfg.AllowedRoles)
+	verifier.SetClaimRules(cfg.JWTSessionClaim, cfg.JWTRequireRole)
 	if err := verifier.Refresh(ctx); err != nil {
 		var warn *auth.WarnSymmetricKey
 		if !errors.As(err, &warn) {
@@ -143,7 +149,8 @@ func run() error {
 		}
 		log.Warn("JWKS hygiene", "warning", warn.Error())
 	}
-	log.Info("JWKS loaded", "url", cfg.JWKSURL, "alg", cfg.JWTAlg)
+	log.Info("JWKS loaded", "url", cfg.JWKSURL, "alg", cfg.JWTAlg,
+		"session_claim", cfg.JWTSessionClaim, "require_role", cfg.JWTRequireRole)
 
 	revoker := auth.NewRevoker(0)
 

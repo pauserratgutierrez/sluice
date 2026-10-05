@@ -19,7 +19,7 @@ import { createClient } from '@pauserratgutierrez/sluice-js'
 import type { Database } from './database.types' // your generated PostgREST types
 
 const sluice = createClient<Database>('https://api.example.com/sluice/v1', {
-  accessToken: async () => (await supabase.auth.getSession()).data.session?.access_token,
+  accessToken: async () => await auth.getAccessToken(), // your auth client's current JWT
 })
 
 const docs = await sluice
@@ -158,10 +158,13 @@ const sluice = createClient<Database>(url, {
 **Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
 
 ```ts
-supabase.auth.onAuthStateChange((_e, session) => {
-  if (session) void sluice.setAuth(session.access_token)
+// whatever your auth library calls on sign-in and refresh
+auth.onTokenChange((token) => {
+  if (token) void sluice.setAuth(token)
 })
 ```
+
+With Supabase, that is `supabase.auth.onAuthStateChange((_e, session) => { if (session) void sluice.setAuth(session.access_token) })`.
 
 If a **hold** row is deleted (issuer mode), that shape is cut with `shape_not_authorized` and the stream stays open. If the user signs out and the server has session revocation enabled, the stream closes with `session_revoked` and reconnecting with that token is refused.
 

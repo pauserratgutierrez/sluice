@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,5 +92,84 @@ func TestUnknownKidRefetchIsThrottled(t *testing.T) {
 	}
 	if got := hits.Load() - before; got != 1 {
 		t.Fatalf("20 unknown-kid tokens caused %d JWKS fetches, want 1", got)
+	}
+}
+
+// signClaims signs arbitrary claims with the "ec" key.
+func signClaims(t *testing.T, key *ecdsa.PrivateKey, claims jwt.MapClaims) string {
+	t.Helper()
+	claims["exp"] = time.Now().Add(time.Hour).Unix()
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok.Header["kid"] = "ec"
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestRoleIsOptionalOnlyWhenNotRequired(t *testing.T) {
+	ec, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	rs, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv, _ := jwksServer(t, &ec.PublicKey, &rs.PublicKey)
+	ctx := context.Background()
+	noRole := signClaims(t, ec, jwt.MapClaims{"sub": "u1", "aud": "authenticated"})
+
+	v := NewVerifier(srv.URL, "ES256", "", "authenticated", time.Second, time.Minute, []string{"authenticated"})
+	if err := v.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Verify(ctx, noRole); err == nil {
+		t.Fatal("a token without role was accepted while the role is required")
+	}
+
+	v.SetClaimRules("sid", false)
+	id, err := v.Verify(ctx, noRole)
+	if err != nil {
+		t.Fatalf("a token without role was rejected while the role is optional: %v", err)
+	}
+	if id.Role != "" {
+		t.Fatalf("Role = %q, want empty", id.Role)
+	}
+
+	// The claim is ignored, not just tolerated: a token cannot claim its way
+	// into service_role.
+	id, err = v.Verify(ctx, signClaims(t, ec, jwt.MapClaims{"sub": "u1", "role": "service_role"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Role != "" {
+		t.Fatalf("Role = %q from an ignored role claim, want empty", id.Role)
+	}
+}
+
+func TestSessionClaimIsConfigurableAndLowercased(t *testing.T) {
+	ec, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	rs, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv, _ := jwksServer(t, &ec.PublicKey, &rs.PublicKey)
+	ctx := context.Background()
+	const sid = "0199B1C2-7A3E-7C11-9F00-6E5D4C3B2A10"
+	tok := signClaims(t, ec, jwt.MapClaims{
+		"sub": "u1", "role": "authenticated", "sid": sid, "session_id": "other",
+	})
+
+	v := NewVerifier(srv.URL, "ES256", "", "", time.Second, time.Minute, []string{"authenticated"})
+	if err := v.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := v.Verify(ctx, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.SessionID != "other" {
+		t.Fatalf("default SessionID = %q, want the session_id claim", id.SessionID)
+	}
+
+	v.SetClaimRules("sid", true)
+	if id, err = v.Verify(ctx, tok); err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.ToLower(sid); id.SessionID != want {
+		t.Fatalf("SessionID = %q, want %q", id.SessionID, want)
 	}
 }

@@ -14,7 +14,9 @@
 //     sign-out DELETEs the row. So Sluice watches auth.sessions on the
 //     replication slot it already consumes and kills the affected streams in
 //     milliseconds, with no polling and no extra query. Supabase's own docs
-//     recommend exactly this check.
+//     recommend exactly this check. Other identity services work the same way
+//     as long as the token names the session row (SLUICE_JWT_SESSION_CLAIM)
+//     and sign-out deletes it.
 package auth
 
 import (
@@ -49,6 +51,11 @@ type Verifier struct {
 	refresh  time.Duration
 	allowed  map[string]bool
 
+	// sessionClaim names the claim that carries the session id, and requireRole
+	// says whether a token must carry an allowed `role`. See SetClaimRules.
+	sessionClaim string
+	requireRole  bool
+
 	client *http.Client
 
 	mu        sync.RWMutex
@@ -74,9 +81,22 @@ func NewVerifier(url, alg, issuer, audience string, leeway, refresh time.Duratio
 	return &Verifier{
 		url: url, alg: alg, issuer: issuer, audience: audience,
 		leeway: leeway, refresh: refresh, allowed: allowed,
+		sessionClaim: "session_id", requireRole: true,
 		client: &http.Client{Timeout: 5 * time.Second},
 		keys:   map[string]any{},
 	}
+}
+
+// SetClaimRules adapts the verifier to a token that is not shaped like
+// GoTrue's. sessionClaim names the claim holding the session id (GoTrue:
+// `session_id`). With requireRole false the `role` claim is ignored entirely,
+// even when present, and the identity carries no role: such a token can never
+// pass for service_role. Call it before the verifier is used.
+func (v *Verifier) SetClaimRules(sessionClaim string, requireRole bool) {
+	if sessionClaim != "" {
+		v.sessionClaim = sessionClaim
+	}
+	v.requireRole = requireRole
 }
 
 // Refresh fetches the JWKS.
@@ -251,12 +271,15 @@ func (v *Verifier) Verify(ctx context.Context, bearer string) (authz.Identity, e
 		return authz.Identity{}, fmt.Errorf("auth: %w", err)
 	}
 
-	role, _ := claims["role"].(string)
-	if role == "" {
-		return authz.Identity{}, fmt.Errorf("auth: token has no role claim")
-	}
-	if !v.allowed[role] {
-		return authz.Identity{}, fmt.Errorf("auth: role %q is not permitted", role)
+	var role string
+	if v.requireRole {
+		role, _ = claims["role"].(string)
+		if role == "" {
+			return authz.Identity{}, fmt.Errorf("auth: token has no role claim")
+		}
+		if !v.allowed[role] {
+			return authz.Identity{}, fmt.Errorf("auth: role %q is not permitted", role)
+		}
 	}
 	if v.issuer != "" {
 		if iss, _ := claims["iss"].(string); iss != v.issuer {
@@ -277,12 +300,14 @@ func (v *Verifier) Verify(ctx context.Context, bearer string) (authz.Identity, e
 		return authz.Identity{}, err
 	}
 	sub, _ := claims["sub"].(string)
-	sid, _ := claims["session_id"].(string)
+	// Lowercased like `sub`: the WAL side of the comparison is a uuid column,
+	// which arrives lowercase.
+	sid, _ := claims[v.sessionClaim].(string)
 
 	return authz.Identity{
 		Role:      role,
 		Sub:       strings.ToLower(sub),
-		SessionID: sid,
+		SessionID: strings.ToLower(sid),
 		Claims:    expr.Claims(claims),
 		ClaimsRaw: string(raw),
 	}, nil
@@ -349,7 +374,7 @@ func (r *Revoker) RevokeSession(id string) {
 		return
 	}
 	r.mu.Lock()
-	r.sessions[id] = time.Now()
+	r.sessions[strings.ToLower(id)] = time.Now()
 	r.mu.Unlock()
 }
 
@@ -380,7 +405,7 @@ func (r *Revoker) Revoked(id authz.Identity) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if id.SessionID != "" {
-		if _, ok := r.sessions[id.SessionID]; ok {
+		if _, ok := r.sessions[strings.ToLower(id.SessionID)]; ok {
 			return true
 		}
 	}

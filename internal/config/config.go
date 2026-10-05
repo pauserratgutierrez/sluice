@@ -62,6 +62,12 @@ type Config struct {
 	JWTAudience  string
 	JWTLeeway    time.Duration
 	AllowedRoles []string
+	// JWTSessionClaim names the claim carrying the session id that revocation
+	// matches against the sessions table's `id`.
+	JWTSessionClaim string
+	// JWTRequireRole false accepts tokens without a `role` and ignores the
+	// claim. Only valid with the issuer oracle: RLS mode impersonates the role.
+	JWTRequireRole bool
 
 	AuthzLease      time.Duration
 	CatalogRefresh  time.Duration
@@ -109,7 +115,9 @@ type Config struct {
 
 	RevocationEnabled bool
 	SessionsTable     string
-	UsersTable        string
+	// UsersTable is empty when there is no user-level revocation.
+	UsersTable     string
+	UsersBanColumn string
 
 	MetricsEnabled     bool
 	DiagnosticsEnabled bool
@@ -153,6 +161,9 @@ func Load() (*Config, error) {
 		JWTAudience:  env("SLUICE_JWT_AUDIENCE", "authenticated"),
 		JWTLeeway:    envDur("SLUICE_JWT_LEEWAY", 10*time.Second),
 		AllowedRoles: envList("SLUICE_ALLOWED_ROLES", []string{"anon", "authenticated", "service_role"}),
+
+		JWTSessionClaim: env("SLUICE_JWT_SESSION_CLAIM", "session_id"),
+		JWTRequireRole:  envBool("SLUICE_JWT_REQUIRE_ROLE", true),
 
 		AuthzLease:     envDur("SLUICE_AUTHZ_LEASE", 60*time.Second),
 		CatalogRefresh: envDur("SLUICE_CATALOG_REFRESH", 30*time.Second),
@@ -200,7 +211,10 @@ func Load() (*Config, error) {
 
 		RevocationEnabled: envBool("SLUICE_REVOCATION_ENABLED", false),
 		SessionsTable:     env("SLUICE_REVOCATION_SESSIONS_TABLE", "auth.sessions"),
-		UsersTable:        env("SLUICE_REVOCATION_USERS_TABLE", "auth.users"),
+		// No default: an identity service without bans has no users table to
+		// watch, and env() cannot tell an empty value from an unset one.
+		UsersTable:     env("SLUICE_REVOCATION_USERS_TABLE", ""),
+		UsersBanColumn: env("SLUICE_REVOCATION_USERS_BAN_COLUMN", "banned_until"),
 
 		MetricsEnabled:     envBool("SLUICE_METRICS_ENABLED", true),
 		DiagnosticsEnabled: envBool("SLUICE_DIAGNOSTICS_ENABLED", true),
@@ -291,6 +305,10 @@ func (c *Config) validate() error {
 		}
 	default:
 		return fmt.Errorf("SLUICE_SHAPE_ORACLE must be rls or issuer, got %q", c.ShapeOracle)
+	}
+	if !c.JWTRequireRole && !c.IssuerMode() {
+		return fmt.Errorf("SLUICE_JWT_REQUIRE_ROLE=false needs SLUICE_SHAPE_ORACLE=issuer: " +
+			"the rls oracle runs snapshots and probes under SET LOCAL ROLE, which needs the token's role")
 	}
 	return nil
 }

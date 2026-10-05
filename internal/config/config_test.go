@@ -17,15 +17,21 @@ func baseValid() *Config {
 		PresenceWindow:  30_000_000_000,
 		MessagePrefix:   "sluice:",
 		ShapeOracle:     "rls",
+		JWTRequireRole:  true,
 	}
+}
+
+func setRequired(t *testing.T) {
+	t.Helper()
+	t.Setenv("SLUICE_DB_REPL_URL", "postgres://r@db/postgres?replication=database")
+	t.Setenv("SLUICE_DB_AUTHZ_URL", "postgres://a@db/postgres")
+	t.Setenv("SLUICE_JWKS_URL", "http://auth/.well-known/jwks.json")
 }
 
 // A hook namespace must work in rls mode with neither the issuer bearer nor the
 // hook bearer set: the hook bearer is optional and independent of the oracle.
 func TestLoadHookBearerIsOptionalAndSeparate(t *testing.T) {
-	t.Setenv("SLUICE_DB_REPL_URL", "postgres://r@db/postgres?replication=database")
-	t.Setenv("SLUICE_DB_AUTHZ_URL", "postgres://a@db/postgres")
-	t.Setenv("SLUICE_JWKS_URL", "http://auth/.well-known/jwks.json")
+	setRequired(t)
 	t.Setenv("SLUICE_CHANNELS", "billing:hook:http://api:8080/authz")
 	t.Setenv("SLUICE_ISSUER_BEARER", "issuer-secret")
 
@@ -85,5 +91,63 @@ func TestValidateRejectsUnknownOracle(t *testing.T) {
 	c.ShapeOracle = "both"
 	if err := c.validate(); err == nil {
 		t.Fatal("AND/OR of oracles is not a mode")
+	}
+}
+
+// The defaults keep a GoTrue deployment's tokens working unchanged; user-level
+// revocation is opt-in.
+func TestLoadTokenAndRevocationDefaults(t *testing.T) {
+	setRequired(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JWTSessionClaim != "session_id" {
+		t.Errorf("JWTSessionClaim = %q, want session_id", c.JWTSessionClaim)
+	}
+	if !c.JWTRequireRole {
+		t.Error("JWTRequireRole must default to true")
+	}
+	if c.UsersTable != "" {
+		t.Errorf("UsersTable = %q, want unset", c.UsersTable)
+	}
+	if c.UsersBanColumn != "banned_until" {
+		t.Errorf("UsersBanColumn = %q, want banned_until", c.UsersBanColumn)
+	}
+}
+
+func TestLoadTokenAndRevocationOverrides(t *testing.T) {
+	setRequired(t)
+	t.Setenv("SLUICE_SHAPE_ORACLE", "issuer")
+	t.Setenv("SLUICE_ISSUER_URL", "http://api/sluice/shapes")
+	t.Setenv("SLUICE_ISSUER_BEARER", "secret")
+	t.Setenv("SLUICE_JWT_SESSION_CLAIM", "sid")
+	t.Setenv("SLUICE_JWT_REQUIRE_ROLE", "false")
+	t.Setenv("SLUICE_REVOCATION_USERS_TABLE", "auth.user")
+	t.Setenv("SLUICE_REVOCATION_USERS_BAN_COLUMN", "suspended_until")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JWTSessionClaim != "sid" || c.JWTRequireRole ||
+		c.UsersTable != "auth.user" || c.UsersBanColumn != "suspended_until" {
+		t.Fatalf("got session claim %q, require role %v, users table %q, ban column %q",
+			c.JWTSessionClaim, c.JWTRequireRole, c.UsersTable, c.UsersBanColumn)
+	}
+}
+
+// RLS mode impersonates the token's role, so it cannot run without one.
+func TestValidateOptionalRoleNeedsIssuer(t *testing.T) {
+	c := baseValid()
+	c.JWTRequireRole = false
+	if err := c.validate(); err == nil {
+		t.Fatal("SLUICE_JWT_REQUIRE_ROLE=false must be rejected in rls mode")
+	}
+	c.ShapeOracle = "issuer"
+	c.IssuerURL = "http://api/sluice/shapes"
+	c.IssuerBearer = "secret"
+	c.IssuerTimeout = 2_000_000_000
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
 	}
 }
