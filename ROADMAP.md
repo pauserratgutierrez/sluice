@@ -7,13 +7,14 @@ Nothing in this file is implemented. [README.md](README.md) describes what Sluic
 Current behavior that is deliberate or accepted for now, with its consequence.
 
 - **One process serves every stream.** A second process on the same slot only stands by. There is no bus to share fan-out across processes, so capacity is one process's, and a takeover or restart reconnects every client.
-- **Resume does not survive a Sluice restart.** The resume buffer is in memory, so after a restart every client resnapshots.
+- **Resume does not survive a Sluice restart.** The resume buffer is in memory, so after a restart every subscription comes back `resumed: false` and its client reads its state again.
+- **A replay runs beside live delivery.** A live change can reach the client before older replayed ones, and the client's position moves to it. If the stream drops again before the replay finishes, the next resume starts past what was not yet replayed. It takes a second drop within the replay, which lasts as long as the client takes to read it.
 - **Revocation of a policy is bounded, not instant.** Policy, RLS, role and membership changes reach open streams on the next `SLUICE_CATALOG_REFRESH` tick; PostgreSQL emits no notification for them.
 - **Column grants are not re-checked.** `REVOKE SELECT (column)` does not reach open streams; privileges are checked at subscribe time only, against answers cached until the next catalog refresh.
 - **Tier C reads live tables.** A policy with a subquery is evaluated against the database's current state, not the state at commit time, and the probe runs on the replication path (bounded by `SLUICE_TIER_C_TIMEOUT`).
 - **Table-owner RLS bypass is not modeled.** An owner's subscription is judged by the policies (fail-closed).
 - **Tier B compares in Go.** Text comparisons use byte order rather than the column's collation, and `numeric` comparisons use float64. The PostgreSQL cross-check on the first decisions per subscription is the safeguard.
-- **Session revocation only knows what it saw.** Sessions deleted before the process started are not known, and a revoked session is remembered for two hours.
+- **Session revocation only knows what it saw.** Without `SLUICE_REVOCATION_SESSION_LOOKUP`, sessions deleted before the process started are not known. A revoked session is remembered for two hours.
 - **The value encoding follows `to_jsonb` with three exceptions.** A `json` column is embedded as stored, not normalized the way `jsonb` would be. A float may arrive in exponent form (`1e+30`) where `to_jsonb` writes every digit. A type that `to_jsonb` converts through a cast to `json` (for example `hstore`) arrives as its text output.
 - **Snapshots are one query.** At most `SLUICE_SNAPSHOT_MAX_ROWS` rows, with `truncated` set when more matched; there is no paging.
 - **Snapshots for `BYPASSRLS` roles** need `sluice_authz` to be granted that role.
@@ -46,7 +47,6 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 
 - Paged snapshots for large shapes.
 - A durable or shared resume buffer, so a restart or takeover does not force a resnapshot.
-- A subscribe-time `auth.sessions` lookup, to refuse tokens whose session was deleted before the process started.
 
 ### Scale
 

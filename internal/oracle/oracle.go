@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -76,6 +77,17 @@ func (e *ErrDenied) WireCode() string {
 	}
 	return "shape_not_authorized"
 }
+
+// ErrUnavailable is an issuer that gave no verdict: it was unreachable, timed
+// out, answered 5xx, 408 or 429, or sent a body that could not be read. It is
+// not a denial, and the shape may be asked for again.
+type ErrUnavailable struct {
+	Reason string
+	// RetryAfter is the delay the issuer asked for with Retry-After, or zero.
+	RetryAfter time.Duration
+}
+
+func (e *ErrUnavailable) Error() string { return e.Reason }
 
 // New constructs the process-wide oracle from config.
 func New(cfg *config.Config, az *authz.Authorizer, cat *catalog.Cache) (Oracle, error) {

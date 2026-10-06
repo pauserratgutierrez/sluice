@@ -3,6 +3,7 @@ import {
   SluiceError,
   type ChangePayload,
   type GenericDatabase,
+  type LiveEvent,
   type Operation,
   type RowOf,
   type ShapeSpec,
@@ -55,6 +56,7 @@ export class ShapeBuilder<
   private errorHandler?: (e: SluiceError) => void
   private warningHandler?: (w: SubscriptionWarning) => void
   private snapshotEndHandler?: (info: SnapshotEndPayload) => void
+  private liveHandler?: (event: LiveEvent) => void
 
   constructor(
     private readonly client: SluiceClient<GenericDatabase>,
@@ -182,6 +184,22 @@ export class ShapeBuilder<
     return this
   }
 
+  /**
+   * Called each time the server installs the subscription: when it first goes
+   * live, and again after every reconnect or retry. From that moment every
+   * change reaches the handlers, so a read made here cannot miss one. Unless
+   * `resumed` is true, changes may have been missed before it: read the current
+   * state again.
+   *
+   * ```ts
+   * .onLive((e) => { if (!e.resumed) refetch() })
+   * ```
+   */
+  onLive(handler: (event: LiveEvent) => void): this {
+    this.liveHandler = handler
+    return this
+  }
+
   /** Registers the subscription with the server and starts the stream. */
   async subscribe(): Promise<ShapeSubscription> {
     const spec: ShapeSpec = {
@@ -217,6 +235,9 @@ export class ShapeBuilder<
             return
           case 'snapshot_end':
             this.snapshotEndHandler?.(payload as SnapshotEndPayload)
+            return
+          case 'live':
+            this.liveHandler?.(payload as LiveEvent)
             return
         }
       },

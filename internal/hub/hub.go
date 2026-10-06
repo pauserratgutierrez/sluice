@@ -242,12 +242,12 @@ type Hub struct {
 	rings    *Rings
 }
 
-func New(queueSize, ringEvents int, ringMaxAge, presenceTick time.Duration) *Hub {
+func New(queueSize, ringEvents, ringMaxBytes int, ringMaxAge, presenceTick time.Duration) *Hub {
 	h := &Hub{
 		queueSize: queueSize,
 		streams:   map[string]*Stream{},
 		byChannel: map[string]map[string]*Stream{},
-		rings:     NewRings(ringEvents, ringMaxAge),
+		rings:     NewRings(ringEvents, ringMaxBytes, ringMaxAge),
 	}
 	h.presence = NewPresence(h, presenceTick)
 	return h

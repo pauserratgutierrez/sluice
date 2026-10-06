@@ -37,6 +37,16 @@ var (
 		Help: "Times the replication stream failed and was reopened.",
 	})
 
+	SlotRecreated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sluice_slot_recreated_total",
+		Help: "Times an invalidated replication slot was replaced at startup (SLUICE_SLOT_RECREATE).",
+	})
+
+	ResumeBufferBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sluice_resume_buffer_bytes",
+		Help: "Tuple bytes held by the resume buffer across every table.",
+	})
+
 	ReaderIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_reader_is_leader",
 		Help: "1 when this process holds the single-reader advisory lock; 0 while it stands by.",

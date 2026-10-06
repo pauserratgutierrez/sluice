@@ -3,6 +3,7 @@ package oracle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -112,7 +113,7 @@ func newIssuer(t *testing.T, h http.HandlerFunc) *Issuer {
 	return iss
 }
 
-func TestIssuerFailClosedOnTimeout(t *testing.T) {
+func TestIssuerTimeoutIsUnavailable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		issuerOK(w, []string{"id", "title"})
@@ -133,21 +134,65 @@ func TestIssuerFailClosedOnTimeout(t *testing.T) {
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.42"),
 	})
-	if _, ok := err.(*ErrDenied); !ok {
-		t.Fatalf("timeout must deny, got %v", err)
+	if _, ok := err.(*ErrUnavailable); !ok {
+		t.Fatalf("a timeout is no verdict, got %v", err)
 	}
 }
 
-func TestIssuerFailClosedOnNon2xx(t *testing.T) {
+func TestIssuerStatusClassification(t *testing.T) {
+	for _, tc := range []struct {
+		status      int
+		unavailable bool
+	}{
+		{http.StatusInternalServerError, true},
+		{http.StatusServiceUnavailable, true},
+		{http.StatusRequestTimeout, true},
+		{http.StatusTooManyRequests, true},
+		{http.StatusForbidden, false},
+		{http.StatusNotFound, false},
+		{http.StatusUnauthorized, false},
+	} {
+		iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			_, _ = io.WriteString(w, "nope")
+		})
+		_, err := iss.Resolve(context.Background(), Request{
+			Identity: identity(), Relation: docsRel(),
+		})
+		var unavailable *ErrUnavailable
+		var denied *ErrDenied
+		switch {
+		case tc.unavailable && !errors.As(err, &unavailable):
+			t.Errorf("HTTP %d is no verdict, got %v", tc.status, err)
+		case !tc.unavailable && !errors.As(err, &denied):
+			t.Errorf("HTTP %d must deny, got %v", tc.status, err)
+		}
+	}
+}
+
+func TestIssuerRetryAfter(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, "nope")
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	_, err := iss.Resolve(context.Background(), Request{
-		Identity: identity(), Relation: docsRel(),
-	})
-	if _, ok := err.(*ErrDenied); !ok {
-		t.Fatalf("non-2xx must deny, got %v", err)
+	_, err := iss.Resolve(context.Background(), Request{Identity: identity(), Relation: docsRel()})
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) || unavailable.RetryAfter != 3*time.Second {
+		t.Fatalf("got %v, want unavailable with a 3s Retry-After", err)
+	}
+
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	for v, want := range map[string]time.Duration{
+		"":                              0,
+		"soon":                          0,
+		"-5":                            0,
+		"7200":                          maxRetryAfter,
+		"Tue, 06 Oct 2026 12:00:10 GMT": 10 * time.Second,
+		"Tue, 06 Oct 2026 11:59:00 GMT": 0,
+	} {
+		if got := retryAfter(v, now); got != want {
+			t.Errorf("retryAfter(%q) = %v, want %v", v, got, want)
+		}
 	}
 }
 
@@ -186,15 +231,15 @@ func TestIssuerFailClosedOnRedirect(t *testing.T) {
 	}
 }
 
-func TestIssuerFailClosedOnUnreadableBody(t *testing.T) {
+func TestIssuerUnreadableBodyIsUnavailable(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "not-json")
 	})
 	_, err := iss.Resolve(context.Background(), Request{
 		Identity: identity(), Relation: docsRel(),
 	})
-	if _, ok := err.(*ErrDenied); !ok {
-		t.Fatalf("bad body must deny, got %v", err)
+	if _, ok := err.(*ErrUnavailable); !ok {
+		t.Fatalf("an unreadable body is no verdict, got %v", err)
 	}
 }
 

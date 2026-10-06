@@ -12,7 +12,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 )
 
-func newHub(queue int) *Hub { return New(queue, 8, time.Minute, 10*time.Millisecond) }
+func newHub(queue int) *Hub { return New(queue, 8, 1<<20, time.Minute, 10*time.Millisecond) }
 
 func drain(s *Stream) []event.Event {
 	return s.Take(nil)
@@ -346,7 +346,7 @@ func ringEntry(lsn uint64) RingEntry {
 }
 
 func TestRingReplay(t *testing.T) {
-	r := NewRings(4, time.Minute)
+	r := NewRings(4, 1<<20, time.Minute)
 	r.SetStart(5)
 	for i := uint64(1); i <= 3; i++ {
 		r.Append(ringEntry(i * 10))
@@ -372,7 +372,7 @@ func TestRingReplay(t *testing.T) {
 // a client asking for a position that has been evicted must be told to
 // resnapshot rather than silently handed a gap.
 func TestRingReportsGapWhenOverwritten(t *testing.T) {
-	r := NewRings(3, time.Minute)
+	r := NewRings(3, 1<<20, time.Minute)
 	r.SetStart(5)
 	for i := uint64(1); i <= 10; i++ {
 		r.Append(ringEntry(i * 10))
@@ -391,7 +391,7 @@ func TestRingReportsGapWhenOverwritten(t *testing.T) {
 // nothing is covered; after, a quiet table with no buffered change is covered
 // from the start LSN on.
 func TestRingCoverageStartsWithReplication(t *testing.T) {
-	r := NewRings(4, time.Minute)
+	r := NewRings(4, 1<<20, time.Minute)
 	if _, ok := r.Replay(99, 500); ok {
 		t.Fatal("nothing is covered before replication starts")
 	}
@@ -408,7 +408,7 @@ func TestRingCoverageStartsWithReplication(t *testing.T) {
 // Age is a memory bound, not a coverage rule: a table that went quiet keeps
 // its newest transaction, so a client that saw it can still resume.
 func TestRingSweepKeepsNewestTransaction(t *testing.T) {
-	r := NewRings(8, time.Millisecond)
+	r := NewRings(8, 1<<20, time.Millisecond)
 	r.SetStart(5)
 	r.Append(ringEntry(10))
 	r.Append(ringEntry(20))
@@ -421,6 +421,62 @@ func TestRingSweepKeepsNewestTransaction(t *testing.T) {
 	}
 	if _, ok := r.Replay(1, 10); ok {
 		t.Error("a swept transaction must report a gap")
+	}
+}
+
+func TestRingDisabledCoversNothing(t *testing.T) {
+	r := NewRings(0, 1<<20, time.Minute)
+	r.SetStart(5)
+	r.Append(ringEntry(10))
+	if got, ok := r.Replay(1, 10); ok || len(got) != 0 {
+		t.Fatalf("a disabled buffer must report every position uncovered: %v ok=%v", lsns(got), ok)
+	}
+}
+
+// The byte limit spans every table: a burst on one evicts the oldest entries
+// wherever they are, and each ring still reports the gap honestly.
+func TestRingByteLimitEvictsOldestOverall(t *testing.T) {
+	wide := func(oid uint32, lsn uint64) RingEntry {
+		e := ringEntry(lsn)
+		e.Relation = &pgoutput.Relation{OID: oid, Namespace: "public", Name: "t"}
+		e.New = &pgoutput.Tuple{Columns: []pgoutput.Column{{Kind: pgoutput.ColText, Data: make([]byte, 1000)}}}
+		return e
+	}
+	one := entryOverhead + tupleSize(wide(1, 0).New)
+	r := NewRings(100, 3*one, time.Minute)
+	r.SetStart(5)
+	r.Append(wide(1, 10))
+	r.Append(wide(2, 20))
+	r.Append(wide(2, 30))
+	r.Append(wide(2, 40))
+
+	if _, ok := r.Replay(1, 10); ok {
+		t.Error("the oldest entry, on another table, must be evicted and reported as a gap")
+	}
+	if got, ok := r.Replay(2, 20); !ok || len(got) != 3 {
+		t.Errorf("the entries within the limit must replay: %v ok=%v", lsns(got), ok)
+	}
+	if r.bytes != 3*one {
+		t.Errorf("held %d bytes, want %d", r.bytes, 3*one)
+	}
+}
+
+// A ring grows from a few slots towards its capacity, wrapping around, without
+// reordering what it holds.
+func TestRingGrowsInOrder(t *testing.T) {
+	r := NewRings(64, 1<<20, time.Minute)
+	r.SetStart(1)
+	for i := uint64(1); i <= 100; i++ {
+		r.Append(ringEntry(i))
+	}
+	got, ok := r.Replay(1, 37)
+	if !ok || len(got) != 64 || got[0].LSN != 37 || got[63].LSN != 100 {
+		t.Fatalf("replay = %v ok=%v, want 37..100", lsns(got), ok)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].LSN != got[i-1].LSN+1 {
+			t.Fatalf("out of order at %d: %v", i, lsns(got))
+		}
 	}
 }
 

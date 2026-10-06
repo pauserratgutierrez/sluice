@@ -56,6 +56,33 @@ func TestExistsSQLReadsOnlyTheHoldTable(t *testing.T) {
 	}
 }
 
+// TRUNCATE removes every row of the table, so every watch with a hold there is
+// cut, whatever its filter, and no other watch is.
+func TestOnTruncateCutsEveryHoldOnTheTable(t *testing.T) {
+	idx := New()
+	other := membersRel()
+	other.OID, other.Name = 300, "teams"
+	idx.Add("s1", "a", []Spec{holdSpec(t, membersRel(), "project_id=eq.1,user_id=eq.u1")})
+	idx.Add("s2", "b", []Spec{holdSpec(t, membersRel(), "project_id=eq.2,user_id=eq.u2")})
+	idx.Add("s3", "c", []Spec{holdSpec(t, other, "project_id=eq.1,user_id=eq.u1")})
+
+	cuts := idx.OnTruncate(membersRel().OID)
+	if len(cuts) != 2 {
+		t.Fatalf("cuts = %+v, want both watches on project_members", cuts)
+	}
+	for _, c := range cuts {
+		if !strings.Contains(c.Reason, "public.project_members") {
+			t.Errorf("reason %q must name the truncated table", c.Reason)
+		}
+	}
+	if idx.Count() != 1 {
+		t.Fatalf("%d watches left, want only the one on teams", idx.Count())
+	}
+	if len(idx.OnTruncate(membersRel().OID)) != 0 {
+		t.Fatal("a watch must not be cut twice")
+	}
+}
+
 func TestOnChangeCutsDeleteOfHold(t *testing.T) {
 	idx := New()
 	rel := membersRel()

@@ -53,7 +53,9 @@ USER 65532:65532
 EXPOSE 4000
 
 # The binary already implements -healthcheck: it GETs /healthz (registered both
-# prefixed and unprefixed) and exits 0/1. No curl/wget in the image.
+# prefixed and unprefixed) and exits 0/1. No curl/wget in the image. The default
+# is liveness because a process standing by for the reader lock is never ready;
+# a single-process deployment can use -readycheck (/readyz) instead.
 # Compose overrides these timings for the harness; this is the standalone default.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
   CMD ["/sluice", "-healthcheck"]

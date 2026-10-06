@@ -91,7 +91,11 @@ export interface SluiceErrorPayload {
   message: string
   retryable?: boolean
   action?: string
-  /** How long to wait before reconnecting, e.g. after `server_shutdown`. */
+  /**
+   * How long to wait before trying again. Without `sub`, before reconnecting
+   * (`server_shutdown`). With `sub`, the server removed or refused the
+   * subscription (`issuer_unavailable`), and the client subscribes again after it.
+   */
   retry_after_ms?: number
 }
 
@@ -109,14 +113,43 @@ export interface SubscriptionResult {
   reason?: string
   error?: SluiceErrorPayload
   warnings?: SubscriptionWarning[]
+  /**
+   * Present when the request carried a resume position for the shape's table:
+   * true when the server replays every change since it, false when it cannot.
+   */
+  resumed?: boolean
 }
 
 export interface ReadyPayload {
   stream_id: string
   server_time: string
   heartbeat_ms: number
+  /** A resume position for these subscriptions: resuming from it replays whatever they miss. */
   wal_lsn?: string
   subscriptions: SubscriptionResult[]
+}
+
+/**
+ * A shape subscription is live on the server: from now on, every change to the
+ * shape reaches its handlers.
+ *
+ * It fires when the server has installed the subscription, before any change
+ * committed afterwards can be missed, so a read made from this callback cannot
+ * fall into a gap: every change it does not see is delivered. A change may
+ * arrive before the callback; it is already part of the live stream.
+ */
+export interface LiveEvent {
+  sub: string
+  /** `subscribed` the first time the subscription goes live; `resubscribed` every time after. */
+  reason: 'subscribed' | 'resubscribed'
+  /**
+   * True only when the server is replaying every change since the previous
+   * stream, so nothing was missed. When false, changes may have been missed:
+   * read the current state again.
+   */
+  resumed: boolean
+  /** The resume position the server gave for this stream. */
+  walLsn?: string
 }
 
 /** A row change, with the projection applied at the type level. */

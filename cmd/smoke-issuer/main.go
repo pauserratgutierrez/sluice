@@ -146,6 +146,29 @@ func main() {
 		"an INSERT after /token is delivered on the live shape",
 		fmt.Sprintf("got %v", changeTitles(got, "docs")))
 
+	fmt.Println("\n-- an issuer outage is no verdict, not a denial --")
+	downRes, err := subscribe(ctx, aliceTok, stream.id, compactJSON(`{
+		"sub":"down","shape":{"schema":"public","table":"iss_documents",
+		  "filter":"project_id=eq.outage"}}`))
+	must(err, "subscribe while the issuer answers 503")
+	var down struct {
+		Results []struct {
+			OK    bool `json:"ok"`
+			Error struct {
+				Code         string `json:"code"`
+				Retryable    bool   `json:"retryable"`
+				RetryAfterMs int64  `json:"retry_after_ms"`
+			} `json:"error"`
+		} `json:"results"`
+	}
+	if json.Unmarshal([]byte(downRes), &down) != nil || len(down.Results) != 1 {
+		fatal("parse /subscribe response: %s", downRes)
+	}
+	r := down.Results[0]
+	check(!r.OK && r.Error.Code == "issuer_unavailable" && r.Error.Retryable && r.Error.RetryAfterMs == 2000,
+		"a 503 from the issuer refuses the shape with a retryable issuer_unavailable after its Retry-After",
+		truncate(downRes, 240))
+
 	fmt.Println("\n-- stub does not receive access_token --")
 	saw, n, err := stubSawAccessToken(ctx)
 	must(err, "read issuer-stub /debug")

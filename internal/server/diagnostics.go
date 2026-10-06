@@ -88,13 +88,16 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 // RefreshHealth runs on every catalog tick. It keeps the slot and warning
 // metrics current without anyone calling /diagnostics, and bounds the memory
-// the resume buffer holds for tables that went quiet.
+// the resume buffer and the session lookup hold.
 func (s *Server) RefreshHealth(ctx context.Context) {
 	if s.reader != nil && s.pool != nil {
 		s.slotInfo(ctx)
 	}
 	setWarningMetrics(s.diagnostics())
 	s.hub.Rings().Sweep()
+	if s.sessions != nil {
+		s.sessions.sweep()
+	}
 }
 
 // setWarningMetrics resets then sets sluice_config_warnings, so a resolved

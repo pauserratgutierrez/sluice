@@ -146,6 +146,62 @@ check(received.length === afterUnsub, 'no events arrive after unsubscribe',
 client.close()
 await sleep(200)
 
+// ---- reconnect: live again, with nothing missed ----------------------------
+// A fresh client whose only shape sees no change before its stream drops. A
+// change committed while it is disconnected must still arrive, and onLive must
+// say the subscription was resumed.
+console.log('\n-- reconnect --')
+let cut = () => {}
+let releaseReconnect = () => {}
+const reconnectHeld = new Promise((r) => (releaseReconnect = r))
+let streamRequests = 0
+const gapClient = createClient(sluiceURL, {
+  accessToken: () => token,
+  pauseWhenHidden: false,
+  backoff: [50],
+  fetch: async (input, init) => {
+    if (!String(input).endsWith('/stream')) return fetch(input, init)
+    streamRequests++
+    if (streamRequests === 2) await reconnectHeld
+    const res = await fetch(input, init)
+    if (streamRequests > 1) return res
+    // The first stream can be cut by the test, as a dropped connection would be.
+    const reader = res.body.getReader()
+    cut = () => reader.cancel()
+    const body = new ReadableStream({
+      async pull(c) {
+        const { done, value } = await reader.read()
+        if (done) c.close()
+        else c.enqueue(value)
+      },
+    })
+    return new Response(body, { status: res.status, headers: res.headers })
+  },
+})
+const lives = []
+const gapSeen = []
+await gapClient
+  .from('documents')
+  .as('gap')
+  .eq('owner_id', userId)
+  .on('INSERT', (c) => gapSeen.push(c.record?.title))
+  .onLive((e) => lives.push(e))
+  .subscribe()
+check(lives[0]?.reason === 'subscribed' && lives[0]?.resumed === false && !!lives[0]?.walLsn,
+  'onLive fires when the shape is first live, not resumed, with a position', JSON.stringify(lives[0]))
+
+cut()
+await insertDoc('while disconnected')
+await sleep(300)
+releaseReconnect()
+for (let i = 0; i < 100 && (lives.length < 2 || !gapSeen.includes('while disconnected')); i++) await sleep(50)
+check(lives[1]?.reason === 'resubscribed' && lives[1]?.resumed === true,
+  'after the reconnect onLive reports the shape resubscribed and resumed', JSON.stringify(lives[1]))
+check(gapSeen.includes('while disconnected'), 'the change committed while disconnected was replayed',
+  JSON.stringify(gapSeen))
+gapClient.close()
+await sleep(200)
+
 console.log(`\n== ${checks} checks, ${failures} failures ==`)
 if (warnings.length) console.log(`   server warnings seen: ${[...new Set(warnings)].join(', ')}`)
 process.exit(failures > 0 ? 1 : 0)

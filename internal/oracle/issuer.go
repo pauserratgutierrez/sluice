@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,8 +19,11 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
-// Issuer asks an application endpoint to authorize a shape. Fail closed: a
-// timeout, a non-2xx, or an unreadable body is a deny. There is no allow cache.
+// Issuer asks an application endpoint to authorize a shape. Fail closed: only an
+// allow grants. `allow: false`, a redirect or a 4xx other than 408 and 429 is a
+// deny; no verdict at all (unreachable, timeout, 5xx, 408, 429, an unreadable
+// body) is ErrUnavailable, which grants nothing either but may be retried.
+// There is no allow cache.
 type Issuer struct {
 	url    string
 	bearer string
@@ -323,21 +327,47 @@ func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPRespons
 
 	resp, err := i.client.Do(httpReq)
 	if err != nil {
-		return nil, &ErrDenied{Reason: fmt.Sprintf("shape issuer unreachable: %v", err)}
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("shape issuer unreachable: %v", err)}
 	}
 	defer resp.Body.Close()
 
 	limited := io.LimitReader(resp.Body, 64<<10)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	switch code := resp.StatusCode; {
+	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
 		_, _ = io.Copy(io.Discard, limited)
-		return nil, &ErrDenied{Reason: fmt.Sprintf("shape issuer returned HTTP %d", resp.StatusCode)}
+		return nil, &ErrUnavailable{
+			Reason:     fmt.Sprintf("shape issuer returned HTTP %d", code),
+			RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
+	case code < 200 || code >= 300:
+		_, _ = io.Copy(io.Discard, limited)
+		return nil, &ErrDenied{Reason: fmt.Sprintf("shape issuer returned HTTP %d", code)}
 	}
 
 	var out issuerHTTPResponse
 	if err := json.NewDecoder(limited).Decode(&out); err != nil {
-		return nil, &ErrDenied{Reason: "shape issuer returned an unreadable body"}
+		return nil, &ErrUnavailable{Reason: "shape issuer returned an unreadable body"}
 	}
 	return &out, nil
+}
+
+// maxRetryAfter caps the delay an issuer may ask for, so a misconfigured
+// Retry-After does not park subscriptions for hours.
+const maxRetryAfter = time.Minute
+
+// retryAfter reads a Retry-After header, in seconds or as an HTTP date. It is
+// zero when the header is absent or unreadable.
+func retryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = t.Sub(now)
+	}
+	return min(max(d, 0), maxRetryAfter)
 }
 
 func physicalColumns(ctx context.Context, cat *catalog.Cache, rel *catalog.Relation, requested []string) ([]string, []string, error) {

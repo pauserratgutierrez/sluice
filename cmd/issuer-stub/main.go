@@ -2,7 +2,8 @@
 //
 // Sluice POSTs here; the smoke process is not the issuer. Membership is a live
 // SELECT on iss_project_members (superuser, no cache). GET /healthz does not
-// touch that table.
+// touch that table. Project "outage" answers 503 with Retry-After, so the smoke
+// can watch Sluice treat an issuer outage as no verdict rather than a denial.
 package main
 
 import (
@@ -159,6 +160,11 @@ func (s *stub) handleShapes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	projectID := parseProjectID(req.Requested.Filter)
+	if projectID == outageProject {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "issuer down", http.StatusServiceUnavailable)
+		return
+	}
 	table := req.Requested.Table
 	if projectID == "" || table != "iss_documents" || req.Identity.Sub == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"allow": false})
@@ -201,6 +207,9 @@ func (s *stub) member(ctx context.Context, projectID, sub string) (bool, error) 
 		)`, projectID, sub).Scan(&ok)
 	return ok, err
 }
+
+// outageProject is the project the stub answers as if it were down.
+const outageProject = "outage"
 
 func parseProjectID(filter string) string {
 	for _, part := range strings.Split(filter, ",") {

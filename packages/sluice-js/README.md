@@ -65,7 +65,7 @@ if (docs.oracle === 'issuer') console.log('effective filter', docs.filter)
 
 `indexed: false` means the shape has no equality filter on an indexed column, so the server scans it for every change to that table.
 
-A subscription the server refuses resolves with `ok: false` and `error`, calls `onError`, and is not resent on reconnect.
+A subscription the server refuses resolves with `ok: false` and `error`, calls `onError`, and is not resent on reconnect. One the server could not decide yet — `issuer_unavailable`, with `retryable: true` — resolves and calls `onError` the same way but stays registered: the client asks for it again after `error.retryAfterMs`, and `onLive` fires once it is live. Do not call `subscribe()` again for it.
 
 ## Changes
 
@@ -92,6 +92,24 @@ sluice.from('documents')
 **`withInitialSnapshot()`** makes the server read the current rows itself and then continue live, with no gap between the two. Rows arrive as `INSERT` with `snapshot: true`, followed by `onSnapshotEnd({ rows, truncated })` (`truncated` when more rows matched than the server's cap). Duplicates around the boundary are possible and intended — upsert by primary key. Snapshot rows and live changes use the same value encoding, the one PostgREST returns (ISO 8601 timestamps, JSON arrays), so they match the generated `Database` types.
 
 `ops('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')` restricts operations; the default is the first three.
+
+### Going live: `onLive`
+
+```ts
+sluice.from('messages')
+  .eq('room_id', roomId)
+  .on('*', () => invalidate())
+  .onLive(e => { if (!e.resumed) invalidate() })
+  .onError(e => { if (!e.retryable) leaveRoom(e) })
+  .subscribe()
+```
+
+`onLive(e)` fires every time the server installs the subscription: the first time (`reason: 'subscribed'`), and after every reconnect, and after the client asks again for a subscription the server dropped or could not decide yet (`reason: 'resubscribed'`). The event is `{ sub, reason, resumed, walLsn }`.
+
+- **It fires once the subscription is live on the server.** Every change from then on reaches the handlers, so a read made in `onLive` cannot fall into a gap: whatever it does not see arrives as a change. A change may arrive before `onLive`; it is already part of the live stream. For the first time, `onLive` runs before `subscribe()` resolves, so register it before calling `subscribe()`.
+- **`resumed: true`** means the server is replaying every change since the previous stream: nothing was missed and nothing needs reading again. It is never true for `reason: 'subscribed'`, nor after the subscription was not installed for a while (dropped with `issuer_unavailable`), nor when the server's resume buffer did not reach back far enough (after a server restart, or with the buffer disabled). **`resumed: false`** means changes may have been missed: read the current state again.
+
+An app that reads its data over HTTP and uses changes only as a signal to read again needs nothing else: read in `onLive` unless `resumed`, and on every change.
 
 ### Filters
 
@@ -149,13 +167,13 @@ const sluice = createClient<Database>(url, {
 })
 ```
 
-**Reconnection is automatic.** The client remembers the last commit LSN it saw per table and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). If the server no longer has that position (it restarted, or you were away too long), the shape gets `resume_too_old` with `action: 'resnapshot'` and the client forgets the stale position: discard what you hold for that shape and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, instead of its own backoff, before reconnecting.
+**Reconnection is automatic.** The client keeps a resume position per table — the last commit LSN it saw there, or the position the server gave when the table's shapes went live — and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). Each shape then gets `onLive` with `resumed: true`. If the server no longer has that position (it restarted, or you were away too long), `onLive` says `resumed: false`: read the current state again, or, for a shape whose state you hold from its changes, discard it and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, instead of its own backoff, before reconnecting.
 
 **Status.** `onStatusChange` and `.connectionStatus` report `idle` (nothing is subscribed, or the tab is hidden), `connecting`, `open`, `reconnecting` (the stream dropped or an attempt to open it failed) and `closed` (`close()` was called, or the server refused the stream). A stream the server ends on purpose, such as `token_expired` or `server_shutdown`, goes to `connecting`, not `reconnecting`: `reconnecting` always means the connection is failing.
 
 **Subscriptions made together are sent together.** `subscribe()` calls in the same tick (a page mounting several live views) go out in one request, which counts once against the server's subscribe rate.
 
-**Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
+**Tokens.** `accessToken` is called on every (re)connect and control request, so a function returning the current token is enough in most apps. Call `setAuth(token)` when your auth library refreshes: from then on the client uses that token, and an open stream is rebound to it — every authorization decision is re-resolved server-side, and a subscription no longer permitted is dropped with an error. In issuer mode, a shape the issuer cannot decide at that moment is dropped with `issuer_unavailable` and asked for again under the new token; `onLive` reports it with `resumed: false`. If the stream closed with `token_expired` and the reconnect was refused, `setAuth` reconnects it.
 
 ```ts
 // whatever your auth library calls on sign-in and refresh
@@ -181,22 +199,24 @@ import { SluiceError } from '@pauserratgutierrez/sluice-js'
 })
 ```
 
-Subscription errors go to that subscription's `onError`; stream errors go to the client's `onError`. If `subscribe()` itself rejects (a network error, `429 rate_limited`, …), nothing stays registered, so calling it again with the same label is safe.
+Subscription errors go to that subscription's `onError`; stream errors go to the client's `onError`. An error with `retryable: false` has ended the subscription; one with `retryable: true` has not, or the client is already asking for it again. If `subscribe()` itself rejects (a network error, `429 rate_limited`, …), nothing stays registered, so calling it again with the same label is safe.
 
 | Code | Meaning |
 | --- | --- |
 | `shape_not_authorized` | not permitted: RLS policy, issuer deny, revoked on refresh, hold removed, or dropped by an operator |
+| `issuer_unavailable` | the issuer gave no verdict (retryable); the client asks again after `retryAfterMs` |
 | `relation_not_published` / `relation_unpublished` | the table is not (or no longer) in the publication |
 | `invalid_filter`, `invalid_columns` | unknown column or bad value |
 | `unknown_namespace` | the channel's namespace is not configured |
 | `channel_not_authorized` | the channel was refused, or its join was revoked later |
-| `resume_too_old` | the resume position is gone; resnapshot |
+| `resume_too_old` | the buffer no longer reaches an initial snapshot's floor; resnapshot |
 | `snapshot_failed` | the initial snapshot failed (retryable) |
 | `stream_lagging` | the client did not keep up; the stream reconnects with a resume |
 | `server_shutdown` | the server is restarting; the stream reconnects after `retryAfterMs`, with a resume |
 | `token_expired` | the token expired; the stream closed |
 | `session_revoked`, `user_banned` | the identity was revoked; the stream closed |
 | `http_401`, `http_403` | the stream request was refused; the client stops retrying |
+| `http_503` | the server is full, shutting down, or could not check the session; the client retries |
 
 The full list is in the main README's [event reference](../../README.md#events).
 

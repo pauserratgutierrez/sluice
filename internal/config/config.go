@@ -45,15 +45,20 @@ type Config struct {
 	PoolMin      int32
 	ParanoidPool bool
 
-	SlotName      string
+	SlotName string
+	// SlotRecreate lets a process replace an invalidated slot at startup
+	// instead of refusing to stream.
+	SlotRecreate  bool
 	Publication   string
 	ProtoVersion  int
 	Messages      bool
 	StatusEvery   time.Duration
 	MessagePrefix string
 
-	RingEvents int
-	RingMaxAge time.Duration
+	// RingEvents is the resume buffer's capacity per table; 0 disables it.
+	RingEvents   int
+	RingMaxBytes int
+	RingMaxAge   time.Duration
 
 	JWKSURL      string
 	JWKSRefresh  time.Duration
@@ -118,6 +123,9 @@ type Config struct {
 	// UsersTable is empty when there is no user-level revocation.
 	UsersTable     string
 	UsersBanColumn string
+	// SessionLookup checks that a token's session row still exists when it
+	// opens a stream or is presented to /token.
+	SessionLookup bool
 
 	MetricsEnabled     bool
 	DiagnosticsEnabled bool
@@ -139,8 +147,9 @@ func Load() (*Config, error) {
 		PoolMin:      int32(envInt("SLUICE_DB_POOL_MIN_CONNS", 2)),
 		ParanoidPool: envBool("SLUICE_PARANOID_POOL_RESET", false),
 
-		SlotName:    env("SLUICE_SLOT_NAME", "sluice"),
-		Publication: env("SLUICE_PUBLICATION", "sluice"),
+		SlotName:     env("SLUICE_SLOT_NAME", "sluice"),
+		SlotRecreate: envBool("SLUICE_SLOT_RECREATE", false),
+		Publication:  env("SLUICE_PUBLICATION", "sluice"),
 
 		// The negotiated version only declares capability; with streaming off
 		// the options, not the version, decide the message set. 4 needs
@@ -151,8 +160,9 @@ func Load() (*Config, error) {
 		StatusEvery:   envDur("SLUICE_STATUS_INTERVAL", 10*time.Second),
 		MessagePrefix: env("SLUICE_MESSAGE_PREFIX", "sluice:"),
 
-		RingEvents: envInt("SLUICE_RING_EVENTS", 4096),
-		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", 60*time.Second),
+		RingEvents:   envInt("SLUICE_RING_EVENTS", 4096),
+		RingMaxBytes: envInt("SLUICE_RING_MAX_BYTES", 64<<20),
+		RingMaxAge:   envDur("SLUICE_RING_MAX_AGE", 60*time.Second),
 
 		JWKSURL:      env("SLUICE_JWKS_URL", ""),
 		JWKSRefresh:  envDur("SLUICE_JWKS_REFRESH", 5*time.Minute),
@@ -215,6 +225,7 @@ func Load() (*Config, error) {
 		// watch, and env() cannot tell an empty value from an unset one.
 		UsersTable:     env("SLUICE_REVOCATION_USERS_TABLE", ""),
 		UsersBanColumn: env("SLUICE_REVOCATION_USERS_BAN_COLUMN", "banned_until"),
+		SessionLookup:  envBool("SLUICE_REVOCATION_SESSION_LOOKUP", false),
 
 		MetricsEnabled:     envBool("SLUICE_METRICS_ENABLED", true),
 		DiagnosticsEnabled: envBool("SLUICE_DIAGNOSTICS_ENABLED", true),
@@ -276,6 +287,20 @@ func (c *Config) validate() error {
 	case "withhold", "deliver":
 	default:
 		return fmt.Errorf("SLUICE_DEGRADED_DELETES must be withhold or deliver")
+	}
+	if c.RingEvents < 0 {
+		return fmt.Errorf("SLUICE_RING_EVENTS must not be negative")
+	}
+	if c.RingEvents > 0 && c.RingMaxBytes <= 0 {
+		return fmt.Errorf("SLUICE_RING_MAX_BYTES must be positive")
+	}
+	if c.RingEvents == 0 && c.SnapshotEnabled {
+		return fmt.Errorf("SLUICE_RING_EVENTS=0 needs SLUICE_SNAPSHOT_ENABLED=false: a snapshot " +
+			"replays the resume buffer from its floor, which is what makes it gapless")
+	}
+	if c.SessionLookup && !c.RevocationEnabled {
+		return fmt.Errorf("SLUICE_REVOCATION_SESSION_LOOKUP=true needs SLUICE_REVOCATION_ENABLED=true: " +
+			"a session found once is trusted until its deletion arrives through the slot")
 	}
 	if c.PresenceWindow <= 0 {
 		return fmt.Errorf("SLUICE_PRESENCE_WINDOW must be positive")

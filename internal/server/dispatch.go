@@ -11,6 +11,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
+	"github.com/pauserratgutierrez/sluice/internal/hold"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
@@ -135,9 +136,12 @@ func sameColumns(a, b *pgoutput.Relation) bool {
 	return true
 }
 
+// OnTruncate cuts the shapes held by a row of a truncated table, then delivers
+// TRUNCATE to every subscription on a truncated table that asked for it.
 func (s *Server) OnTruncate(rels []uint32) {
 	metrics.WALMessages.WithLabelValues("truncate").Inc()
 	for _, oid := range rels {
+		s.applyHoldCuts(s.holds.OnTruncate(oid))
 		for _, sub := range s.reg.All() {
 			if sub.Relation.OID != oid || !sub.Ops.Truncate {
 				continue
@@ -146,6 +150,21 @@ func (s *Server) OnTruncate(rels []uint32) {
 				Sub: sub.Label, Op: "TRUNCATE",
 				Schema: sub.Relation.Schema, Table: sub.Relation.Name,
 			}})
+		}
+	}
+}
+
+// applyHoldCuts drops the shapes whose holds no longer hold. The watches are
+// already out of the hold index.
+func (s *Server) applyHoldCuts(cuts []hold.Cut) {
+	for _, cut := range cuts {
+		if st, ok := s.hub.Get(cut.StreamID); ok {
+			s.dropShape(st, cut.Label, event.Error{
+				Code:    "shape_not_authorized",
+				Message: cut.Reason,
+			})
+		} else if removed := s.reg.Remove(cut.StreamID, cut.Label); removed != nil {
+			s.decSubMetric(removed)
 		}
 	}
 }
@@ -230,19 +249,7 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 		if m.New != nil {
 			newR = newRow
 		}
-		for _, cut := range s.holds.OnChange(rel.OID, m.Type, oldR, newR) {
-			if st, ok := s.hub.Get(cut.StreamID); ok {
-				s.dropShape(st, cut.Label, event.Error{
-					Code:    "shape_not_authorized",
-					Message: cut.Reason,
-				})
-			} else {
-				s.holds.Remove(cut.StreamID, cut.Label)
-				if removed := s.reg.Remove(cut.StreamID, cut.Label); removed != nil {
-					s.decSubMetric(removed)
-				}
-			}
-		}
+		s.applyHoldCuts(s.holds.OnChange(rel.OID, m.Type, oldR, newR))
 	}
 
 	// Route on both tuples. Routing only on the new one would miss a row that

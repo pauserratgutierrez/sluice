@@ -60,6 +60,8 @@ type Server struct {
 	verify  *auth.Verifier
 	revoker *auth.Revoker
 	reader  *reader.Reader
+	// sessions is nil unless SLUICE_REVOCATION_SESSION_LOOKUP is on.
+	sessions *sessionLookup
 
 	ctx context.Context
 
@@ -134,6 +136,9 @@ func New(ctx context.Context, o Options) *Server {
 	}
 	if s.oracle == nil && o.Authz != nil && o.Catalog != nil {
 		s.oracle = oracle.NewRLS(o.Authz, o.Catalog)
+	}
+	if o.Config.SessionLookup && o.Pool != nil {
+		s.sessions = newSessionLookup(o.Pool, o.Config.SessionsTable)
 	}
 	return s
 }
@@ -225,6 +230,10 @@ type subResult struct {
 	Reason     string          `json:"reason,omitempty"`
 	Error      *event.Error    `json:"error,omitempty"`
 	Warnings   []event.Warning `json:"warnings,omitempty"`
+	// Resumed is set when the request carried a resume position for the
+	// shape's table: true when every change since it is being replayed, false
+	// when the buffer does not reach back that far.
+	Resumed *bool `json:"resumed,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +254,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if s.hub.Count() >= s.cfg.MaxStreams {
 		writeErr(w, http.StatusServiceUnavailable, "too_many_streams",
 			"this node is at its configured stream limit")
+		return
+	}
+	if !s.checkSession(w, r, id) {
 		return
 	}
 
@@ -292,6 +304,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.Flush()
 
+	liveFrom := s.liveFrom()
 	results := s.applySubscriptions(r.Context(), st, id, req.Subscriptions, req.Resume)
 
 	ready := map[string]any{
@@ -300,8 +313,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		"heartbeat_ms":  s.cfg.Heartbeat.Milliseconds(),
 		"subscriptions": results,
 	}
-	if s.reader != nil {
-		ready["wal_lsn"] = reader.FormatLSN(s.reader.ConfirmedLSN())
+	if liveFrom != "" {
+		ready["wal_lsn"] = liveFrom
 	}
 	_ = s.writeEvents(w, rc, []event.Event{{Kind: event.KindReady, Data: ready}})
 
@@ -478,8 +491,27 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 			"this stream may issue at most %d subscribe requests per second", s.cfg.SubscribeRate))
 		return
 	}
+	liveFrom := s.liveFrom()
 	results := s.applySubscriptions(r.Context(), st, id, req.Subscriptions, nil)
-	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+	body := map[string]any{"results": results}
+	if liveFrom != "" {
+		body["wal_lsn"] = liveFrom
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// liveFrom is a resume position for subscriptions installed after this call:
+// resuming from it later replays everything they may have missed. It is the
+// reader's confirmed LSN taken BEFORE installing -- the same floor a snapshot
+// uses. Every change dispatched after this point commits at or after it, so a
+// change dispatched in the instant before a subscription existed is still
+// covered; one dispatched earlier committed before the subscription, and the
+// client's own read sees it.
+func (s *Server) liveFrom() string {
+	if s.reader == nil {
+		return ""
+	}
+	return reader.FormatLSN(s.reader.ConfirmedLSN())
 }
 
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
@@ -848,9 +880,10 @@ func (s *Server) subscribeShape(
 	}
 
 	// A resume and a snapshot are alternatives: resuming means the client
-	// already holds a base state to apply changes to. A resume the buffer
-	// cannot cover is reported rather than silently replaced by a snapshot,
-	// because only the client knows to discard the state it holds.
+	// already holds a base state to apply changes to. Whether the buffer covers
+	// the position is decided here, so the result tells the client; one it
+	// cannot cover is not silently replaced by a snapshot, because only the
+	// client knows to discard the state it holds.
 	if lsnStr := resume[rel.FullName()]; lsnStr != "" {
 		from, err := reader.ParseLSN(lsnStr)
 		if err != nil {
@@ -858,9 +891,14 @@ func (s *Server) subscribeShape(
 				Message: "resume LSN could not be parsed"})
 			return res
 		}
-		// Off the request: a replay waits for the writer to make room, and on a
-		// stream being opened the writer only starts after the ready event.
-		go s.resume(sub, from)
+		entries, ok := s.hub.Rings().Replay(rel.OID, from)
+		res.Resumed = &ok
+		if len(entries) > 0 {
+			// Off the request: a replay waits for the writer to make room, and
+			// on a stream being opened the writer only starts after the ready
+			// event.
+			go s.replay(sub, entries)
+		}
 		return res
 	}
 	if wantSnapshot {
@@ -875,28 +913,25 @@ func errResumeTooOld(label string) event.Error {
 		Retryable: true, Action: "resnapshot"}
 }
 
-// resume replays a reconnecting subscription from the position its client last
-// saw, or tells it the buffer no longer reaches that far.
-func (s *Server) resume(sub *registry.Subscription, from uint64) {
-	if !s.replayFrom(sub, from) {
-		hub.SendError(streamOf(sub), errResumeTooOld(sub.Label))
-	}
-}
-
-// replayFrom re-delivers buffered changes at or after `from`, re-filtered and
-// re-authorized: replay is never trusted to have been authorized on its first
-// pass. It returns false, delivering nothing, when the buffer cannot cover it.
+// replayFrom re-delivers buffered changes at or after `from`. It returns false,
+// delivering nothing, when the buffer cannot cover it.
 func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 	entries, ok := s.hub.Rings().Replay(sub.Relation.OID, from)
-	if !ok {
-		return false
+	if ok {
+		s.replay(sub, entries)
 	}
+	return ok
+}
+
+// replay re-delivers buffered changes, re-filtered and re-authorized: replay is
+// never trusted to have been authorized on its first pass.
+func (s *Server) replay(sub *registry.Subscription, entries []hub.RingEntry) {
 	for _, e := range entries {
 		// A replay can outlast the subscription, or a /token can rebind it to a
 		// new filter and columns while it runs; follow what is registered now.
 		cur := s.reg.Get(sub.Sink.StreamID(), sub.Label)
 		if cur == nil {
-			return true
+			return
 		}
 		m := messageFromRing(e)
 		s.deliver(cur, m, e.Relation,
@@ -904,7 +939,6 @@ func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 			s.newTuples(e.Relation, m),
 			e.LSN, e.CommitTime, opName(e.Op), true)
 	}
-	return true
 }
 
 func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpec) subResult {
@@ -1080,6 +1114,9 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
+	if !s.checkSession(w, r, newID) {
+		return
+	}
 	st, ok := s.hub.Get(req.StreamID)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "unknown_stream", "no such stream on this node")
@@ -1096,12 +1133,11 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	revoked := 0
 	for _, sub := range s.reg.StreamSubscriptions(st.StreamID()) {
 		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
-			if !s.refreshIssuerShape(r.Context(), st, sub, newID) {
-				metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
+			result := s.refreshIssuerShape(r.Context(), st, sub, newID)
+			metrics.AuthzLeaseRefreshes.WithLabelValues(result).Inc()
+			if result != "held" {
 				revoked++
-				continue
 			}
-			metrics.AuthzLeaseRefreshes.WithLabelValues("held").Inc()
 			continue
 		}
 		eqs := sub.Filter.Equalities
@@ -1390,6 +1426,7 @@ func (s *Server) impersonateSnapshots() bool {
 func (s *Server) mapOracleErr(res *subResult, err error) {
 	var denied *authz.ErrDenied
 	var issuerDenied *oracle.ErrDenied
+	var unavailable *oracle.ErrUnavailable
 	var tierC *authz.ErrTierCDisabled
 	switch {
 	case errors.As(err, &denied):
@@ -1398,6 +1435,10 @@ func (s *Server) mapOracleErr(res *subResult, err error) {
 	case errors.As(err, &issuerDenied):
 		metrics.AuthzResolutions.WithLabelValues("-", "denied").Inc()
 		res.Error = &event.Error{Code: issuerDenied.WireCode(), Message: issuerDenied.Reason}
+	case errors.As(err, &unavailable):
+		metrics.AuthzResolutions.WithLabelValues("-", "unavailable").Inc()
+		e := issuerUnavailable(unavailable)
+		res.Error = &e
 	case errors.As(err, &tierC):
 		metrics.AuthzResolutions.WithLabelValues("C", "refused").Inc()
 		res.Error = &event.Error{Code: "policy_requires_impersonation", Message: tierC.Reason}
@@ -1406,10 +1447,34 @@ func (s *Server) mapOracleErr(res *subResult, err error) {
 	}
 }
 
+// Without a Retry-After from the issuer, a retry is spread over this window, so
+// the subscriptions of a reconnect wave that found the issuer down do not all
+// come back at once.
+const (
+	issuerRetryMin    = time.Second
+	issuerRetrySpread = 4 * time.Second
+)
+
+// issuerUnavailable is the error for a shape the issuer could not decide:
+// retryable, after the delay the issuer asked for or a spread one.
+func issuerUnavailable(e *oracle.ErrUnavailable) event.Error {
+	delay := e.RetryAfter
+	if delay <= 0 {
+		delay = issuerRetryMin + rand.N(issuerRetrySpread)
+	}
+	return event.Error{Code: "issuer_unavailable", Message: e.Reason,
+		Retryable: true, RetryAfterMs: delay.Milliseconds()}
+}
+
 // refreshIssuerShape is the /token path for the issuer oracle: re-ask the
 // issuer, then apply the grant without a window where the shape is live and
-// unwatched.
-func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) bool {
+// unwatched. It returns the lease-refresh outcome: held, revoked or unavailable.
+//
+// An issuer that gives no verdict fails closed: the shape is dropped with the
+// retryable issuer_unavailable, and the client subscribes again. Keeping the
+// previous grant instead would let a token that changed what its holder may see
+// keep the old view for as long as the issuer is down.
+func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) string {
 	grant, err := s.oracle.Refresh(ctx, oracle.Request{
 		Action:   oracle.ActionRefresh,
 		Identity: id,
@@ -1417,12 +1482,20 @@ func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *re
 		Filter:   sub.Filter,
 		Columns:  sub.Columns,
 	})
+	var unavailable *oracle.ErrUnavailable
+	if errors.As(err, &unavailable) {
+		s.dropShape(st, sub.Label, issuerUnavailable(unavailable))
+		return "unavailable"
+	}
 	if err != nil || grant == nil {
 		s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
 			Message: "the refreshed token no longer grants access to this shape"})
-		return false
+		return "revoked"
 	}
-	return s.applyIssuerGrant(ctx, st, sub.Label, grant)
+	if !s.applyIssuerGrant(ctx, st, sub.Label, grant) {
+		return "revoked"
+	}
+	return "held"
 }
 
 // applyIssuerGrant installs a refresh grant on a live shape. Holds are

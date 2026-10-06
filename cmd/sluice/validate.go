@@ -150,7 +150,8 @@ func validate(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, log *
 	if err := pool.QueryRow(ctx, `SHOW idle_replication_slot_timeout`).Scan(&idleTimeout); err == nil && idleTimeout != "0" {
 		warn(server.Diagnostic{Code: "idle_slot_timeout", Severity: "medium",
 			Reason: "idle_replication_slot_timeout is " + idleTimeout + ": if Sluice is offline longer than " +
-				"that, PostgreSQL invalidates the slot and Sluice refuses to start until it is recreated",
+				"that, PostgreSQL invalidates the slot and Sluice refuses to stream until it is recreated " +
+				"(by hand, or at startup with SLUICE_SLOT_RECREATE=true)",
 			Remedy: "ALTER SYSTEM SET idle_replication_slot_timeout = 0; -- or a value longer than any outage"})
 	}
 
@@ -163,6 +164,18 @@ func validate(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, log *
 			Reason: fmt.Sprintf("published tables without a primary key: %v; clients cannot reliably "+
 				"identify or deduplicate their rows", noPK),
 			Remedy: "ALTER TABLE <table> ADD PRIMARY KEY (...);"})
+	}
+
+	// ---- FATAL: session lookup without read access ------------------------
+	if cfg.SessionLookup {
+		var readable *bool
+		if err := pool.QueryRow(ctx,
+			`SELECT has_column_privilege(to_regclass($1), 'id', 'SELECT')`,
+			cfg.SessionsTable).Scan(&readable); err != nil || readable == nil || !*readable {
+			return nil, fmt.Errorf("validate: SLUICE_REVOCATION_SESSION_LOOKUP=true needs the pool role "+
+				"to read the id column of %s: GRANT SELECT (id) ON %s TO <authz role>",
+				cfg.SessionsTable, cfg.SessionsTable)
+		}
 	}
 
 	// ---- impersonation capability ----------------------------------------

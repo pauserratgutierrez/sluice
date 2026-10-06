@@ -196,7 +196,7 @@ services:
       SLUICE_REVOCATION_SESSIONS_TABLE: auth.sessions
       SLUICE_REVOCATION_USERS_TABLE: auth.users
     healthcheck:
-      test: ["CMD", "/sluice", "-healthcheck"]
+      test: ["CMD", "/sluice", "-readycheck"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -275,7 +275,7 @@ services:
       # Default false. Do not copy the RLS process's true: auth.sessions / auth.users
       # are not in publication sluice_issuer, so a true here would not revoke.
     healthcheck:
-      test: ["CMD", "/sluice", "-healthcheck"]
+      test: ["CMD", "/sluice", "-readycheck"]
       interval: 10s
       timeout: 5s
       retries: 6

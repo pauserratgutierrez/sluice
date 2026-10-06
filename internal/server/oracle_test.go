@@ -53,7 +53,7 @@ func testServer(t *testing.T, orc oracle.Oracle) *Server {
 		UnindexedMax:       200,
 		ReplicaIdentity:    "warn",
 	}
-	h := hub.New(16, 8, time.Minute, time.Second)
+	h := hub.New(16, 8, 1<<20, time.Minute, time.Second)
 	s := New(context.Background(), Options{
 		Config:  cfg,
 		Logger:  slog.New(slog.DiscardHandler),
@@ -457,7 +457,7 @@ func TestTokenRefreshAppliesNarrowerGrant(t *testing.T) {
 	st := s.hub.Open("n1.token-narrow", authz.Identity{Sub: "u1", Role: "authenticated"})
 	sub := issuerLiveSub(t, s, st, wide, []string{"id", "project_id", "title"}, holdF)
 
-	if !s.refreshIssuerShape(context.Background(), st, sub, st.Identity()) {
+	if s.refreshIssuerShape(context.Background(), st, sub, st.Identity()) != "held" {
 		t.Fatal("an allowed refresh must keep the shape")
 	}
 	if orc.last.Action != oracle.ActionRefresh {

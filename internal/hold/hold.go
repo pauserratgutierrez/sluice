@@ -334,6 +334,35 @@ func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 	return cuts
 }
 
+// OnTruncate returns every watch with a hold on a truncated relation: TRUNCATE
+// removes every row without a DELETE for each. Like OnChange, it removes the
+// watches from the index; the caller drops the shapes.
+func (x *Index) OnTruncate(oid uint32) []Cut {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	ri := x.rels[oid]
+	if ri == nil {
+		return nil
+	}
+	cuts := make([]Cut, 0, len(ri.all))
+	for w := range ri.all {
+		name := ""
+		for _, spec := range w.Holds {
+			if spec.Rel != nil && spec.Rel.OID == oid {
+				name = spec.Rel.FullName()
+				break
+			}
+		}
+		cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label,
+			Reason: "a hold on " + name + " no longer exists: the table was truncated"})
+	}
+	for _, c := range cuts {
+		x.removeLocked(c.StreamID, c.Label)
+	}
+	return cuts
+}
+
 func watchBroken(w *Watch, oid uint32, op byte, oldRow, newRow expr.Row) (string, bool) {
 	for _, spec := range w.Holds {
 		if spec.Rel == nil || spec.Rel.OID != oid || spec.Filter == nil {

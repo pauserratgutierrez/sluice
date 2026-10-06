@@ -50,6 +50,7 @@ export type {
   GenericSchema,
   GenericTable,
   Json,
+  LiveEvent,
   Operation,
   Oracle,
   PresenceMember,

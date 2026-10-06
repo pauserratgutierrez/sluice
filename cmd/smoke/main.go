@@ -48,7 +48,7 @@ var (
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
 	fmt.Println("== Sluice end-to-end smoke test ==")
@@ -311,11 +311,41 @@ func main() {
 	first.Close()
 	resumed, err := openStream(ctx, tok, fmt.Sprintf(`%s,"resume":{"public.documents":%q}}`, shapeReq, from))
 	must(err, "open the resuming stream")
-	replayed := changeTitles(resumed.collect(3*time.Second), "r")
+	resumedEvents := resumed.collect(3 * time.Second)
 	resumed.Close()
+	replayed := changeTitles(resumedEvents, "r")
 	check(len(live) == 3 && slices.Equal(live, replayed),
 		"a resumed stream replays the missed changes with their original content",
 		fmt.Sprintf("live=%v replayed=%v", live, replayed))
+	check(resultResumed(resumedEvents, "r") == "true",
+		"the ready result says the resume is covered", resultResumed(resumedEvents, "r"))
+
+	// A shape that has seen no change yet resumes from the position its ready
+	// event gave, so a change made while it was disconnected is still replayed.
+	quietReq := fmt.Sprintf(`{"subscriptions":[{"sub":"q","shape":{"table":"documents","filter":"owner_id=eq.%s"}}]`, userID)
+	quiet, err := openStream(ctx, tok, quietReq+"}")
+	must(err, "open a stream that sees no change")
+	quietReady, err := quiet.next(10 * time.Second)
+	must(err, "receive its ready event")
+	quiet.Close()
+	walLSN := readyWalLSN(quietReady)
+	mustExec(ctx, fmt.Sprintf(`insert into documents (owner_id, title, body) values ('%s', 'while-away', 'w')`, userID))
+	back, err := openStream(ctx, tok, fmt.Sprintf(`%s,"resume":{"public.documents":%q}}`, quietReq, walLSN))
+	must(err, "reopen it with the ready's wal_lsn")
+	backEvents := back.collect(3 * time.Second)
+	back.Close()
+	check(walLSN != "" && resultResumed(backEvents, "q") == "true" &&
+		slices.Contains(changeTitles(backEvents, "q"), "while-away"),
+		"a shape with no change yet resumes from the ready's wal_lsn and gets what it missed",
+		fmt.Sprintf("wal_lsn=%q resumed=%s titles=%v", walLSN, resultResumed(backEvents, "q"), changeTitles(backEvents, "q")))
+
+	stale, err := openStream(ctx, tok, quietReq+`,"resume":{"public.documents":"0/1"}}`)
+	must(err, "open a stream resuming from before the buffer")
+	staleEvents := stale.collect(2 * time.Second)
+	stale.Close()
+	check(resultResumed(staleEvents, "q") == "false" && !strings.Contains(string(rawOf(staleEvents)), "resume_too_old"),
+		"a position the buffer does not cover is reported as resumed: false, not as an error",
+		fmt.Sprintf("resumed=%s", resultResumed(staleEvents, "q")))
 
 	phaseWireEncoding(ctx, tok, userID)
 
@@ -329,6 +359,8 @@ func main() {
 	phaseSecurity(ctx, tok, otherTok, stream.id, userID)
 
 	phaseLoad(ctx, tok, userID, loadStreams, loadChanges)
+
+	phaseSlotLoss(ctx, tok, userID)
 
 	// ---- summary ---------------------------------------------------------
 	fmt.Printf("\n== %d checks, %d failures ==\n", checks, failures)
@@ -678,6 +710,39 @@ func changeTitles(events []sseEvent, sub string) []string {
 		}
 	}
 	return out
+}
+
+// readyWalLSN is the position a ready event says its subscriptions are live from.
+func readyWalLSN(ready sseEvent) string {
+	var r struct {
+		WalLSN string `json:"wal_lsn"`
+	}
+	if ready.Name != "ready" || json.Unmarshal(ready.Data, &r) != nil {
+		return ""
+	}
+	return r.WalLSN
+}
+
+// resultResumed reports the ready result's `resumed` for a subscription:
+// "true", "false", or "absent".
+func resultResumed(events []sseEvent, sub string) string {
+	for _, e := range events {
+		var r struct {
+			Subscriptions []struct {
+				Sub     string `json:"sub"`
+				Resumed *bool  `json:"resumed"`
+			} `json:"subscriptions"`
+		}
+		if e.Name != "ready" || json.Unmarshal(e.Data, &r) != nil {
+			continue
+		}
+		for _, s := range r.Subscriptions {
+			if s.Sub == sub && s.Resumed != nil {
+				return fmt.Sprint(*s.Resumed)
+			}
+		}
+	}
+	return "absent"
 }
 
 func countSub(events []sseEvent, sub string) int {

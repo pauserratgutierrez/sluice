@@ -6,8 +6,10 @@ import {
   type ClientOptions,
   type ConnectionStatus,
   type Json,
+  type LiveEvent,
   type PresencePayload,
   type ReadyPayload,
+  type ShapeSpec,
   type SnapshotEndPayload,
   type SubscribeSpec,
   type SubscriptionResult,
@@ -28,12 +30,21 @@ interface Registration {
   spec: SubscribeSpec
   onEvent(kind: string, payload: unknown): void
   onResult(result: SubscriptionResult): void
+  /** Set once the server has installed it. */
+  live?: boolean
+  /**
+   * Set while the server does not hold it and the client is to ask again
+   * (`issuer_unavailable`): no resume covers that time.
+   */
+  lapsed?: boolean
 }
 
 interface PendingSubscribe {
   reg: Registration
-  resolve(result: SubscriptionResult): void
-  reject(err: unknown): void
+  /** Asked for again by the client, with no caller waiting. */
+  retry?: boolean
+  resolve?(result: SubscriptionResult): void
+  reject?(err: unknown): void
 }
 
 /**
@@ -49,8 +60,14 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   private readonly fetchImpl: typeof globalThis.fetch
 
   private registrations = new Map<string, Registration>()
-  /** Last commit LSN seen per relation, so a reconnect resumes instead of gapping. */
+  /**
+   * Resume position per relation, so a reconnect resumes instead of gapping:
+   * the last commit LSN seen, or the position the server gave when the
+   * relation's shapes went live.
+   */
   private resumeFrom = new Map<string, string>()
+  /** Subscriptions waiting to be asked for again, by label. */
+  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** Results the current stream's ready event carried, by label. */
   private readyResults = new Map<string, SubscriptionResult>()
 
@@ -165,7 +182,6 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
   private async flushPending(): Promise<void> {
     const batch = this.pending
     this.pending = []
-    const subs = batch.map((p) => p.reg.spec.sub)
 
     let body: Record<string, unknown>
     try {
@@ -178,14 +194,20 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       })
     } catch (err) {
       // A rejected subscribe leaves nothing registered, so retrying with the
-      // same label works. The server may still have processed the request (a
-      // lost response looks like a network error), so it is also asked to
-      // drop the labels -- and that finishes before rejecting, so it cannot
-      // race a retry.
-      await this.unregisterAll(subs)
-      for (const p of batch) p.reject(err)
+      // same label works; a retry stays registered and is asked for again
+      // later. The server may still have processed the request (a lost
+      // response looks like a network error), so it is also asked to drop the
+      // labels -- and that finishes before rejecting or retrying, so it cannot
+      // race either.
+      this.forget(batch.filter((p) => !p.retry).map((p) => p.reg.spec.sub))
+      await this.dropOnServer(batch.map((p) => p.reg.spec.sub))
+      for (const p of batch) {
+        if (p.retry) this.scheduleRetry(p.reg.spec.sub)
+        else p.reject?.(err)
+      }
       return
     }
+    const walLsn = body.wal_lsn as string | undefined
     const results = new Map((body.results as SubscriptionResult[] | undefined)?.map((r) => [r.sub, r]))
     for (const p of batch) {
       const result = results.get(p.reg.spec.sub) ?? {
@@ -193,21 +215,29 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         ok: false,
         error: { code: 'bad_response', message: 'the server returned no result for this subscription' },
       }
-      this.handleResult(result)
-      p.resolve(result)
+      this.handleResult(result, walLsn)
+      p.resolve?.(result)
     }
   }
 
   /** @internal */
   async unregister(sub: string): Promise<void> {
-    await this.unregisterAll([sub])
+    this.forget([sub])
+    await this.dropOnServer([sub])
   }
 
-  private async unregisterAll(subs: string[]): Promise<void> {
+  /** Forgets subscriptions on the client only. */
+  private forget(subs: string[]): void {
     for (const sub of subs) {
       this.registrations.delete(sub)
       this.readyResults.delete(sub)
+      clearTimeout(this.retryTimers.get(sub))
+      this.retryTimers.delete(sub)
     }
+  }
+
+  /** Asks the server to drop subscriptions, and closes the stream when nothing is left. */
+  private async dropOnServer(subs: string[]): Promise<void> {
     if (!this.streamId) return
     try {
       await this.post('/unsubscribe', { stream_id: this.streamId, subs })
@@ -216,6 +246,37 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       // stream closes, and the stream is closed below if nothing is left.
     }
     if (this.registrations.size === 0) this.disconnect()
+  }
+
+  /**
+   * Asks for a subscription again after a delay: the server could not decide
+   * it yet (`issuer_unavailable`), or the request to ask again failed. A
+   * reconnect resends every registration anyway, so without a stream there is
+   * nothing to do.
+   */
+  private scheduleRetry(sub: string, delayMs = this.retryDelay()): void {
+    clearTimeout(this.retryTimers.get(sub))
+    this.retryTimers.set(
+      sub,
+      setTimeout(() => {
+        this.retryTimers.delete(sub)
+        const reg = this.registrations.get(sub)
+        if (!reg || !this.streamId) return
+        if (this.pending.length === 0) queueMicrotask(() => void this.flushPending())
+        this.pending.push({ reg, retry: true })
+      }, delayMs),
+    )
+  }
+
+  /** Full jitter over the last backoff step, for a retry the server gave no delay for. */
+  private retryDelay(): number {
+    const schedule = this.options.backoff ?? DEFAULT_BACKOFF
+    return Math.random() * (schedule[schedule.length - 1] ?? 1000)
+  }
+
+  private clearRetries(): void {
+    for (const timer of this.retryTimers.values()) clearTimeout(timer)
+    this.retryTimers.clear()
   }
 
   /** @internal */
@@ -265,6 +326,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
     this.registrations.clear()
     this.readyResults.clear()
     this.resumeFrom.clear()
+    this.clearRetries()
     if (this.visibilityHandler && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.visibilityHandler)
       this.visibilityHandler = null
@@ -454,9 +516,11 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         this.streamId = ready.stream_id
         this.setStatus('open')
         this.readyResults.clear()
+        // The stream request carried every registration, retries included.
+        this.clearRetries()
         for (const result of ready.subscriptions ?? []) {
           this.readyResults.set(result.sub, result)
-          this.handleResult(result)
+          this.handleResult(result, ready.wal_lsn)
         }
         this.wake()
         return
@@ -494,18 +558,16 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const err = new SluiceError(e)
         if (e.sub) {
           const reg = this.registrations.get(e.sub)
-          // The position is gone from the server's buffer; resending it on the
-          // next reconnect would only fail again.
-          if (e.code === 'resume_too_old' && reg?.spec.shape) {
-            this.resumeFrom.delete(`${reg.spec.shape.schema ?? 'public'}.${reg.spec.shape.table}`)
-          }
           // A subscription-scoped error that is not retryable ends that
           // subscription; the stream and every other subscription carry on.
           // It is forgotten before the handler runs, so the handler may
-          // subscribe again under the same name.
+          // subscribe again under the same name. A retryable one with a delay
+          // removed it for now: it is asked for again after the delay.
           if (!e.retryable) {
-            this.registrations.delete(e.sub)
-            this.readyResults.delete(e.sub)
+            this.forget([e.sub])
+          } else if (reg && e.retry_after_ms !== undefined) {
+            reg.lapsed = true
+            this.scheduleRetry(e.sub, e.retry_after_ms)
           }
           reg?.onEvent('error', err)
         } else {
@@ -520,12 +582,43 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
     }
   }
 
-  private handleResult(result: SubscriptionResult): void {
+  /** Applies a subscription result from a ready event or a /subscribe, with the position it came with. */
+  private handleResult(result: SubscriptionResult, walLsn?: string): void {
     for (const w of result.warnings ?? []) this.options.onWarning?.(w)
     const reg = this.registrations.get(result.sub)
-    // A refused subscription is not resent on every reconnect.
-    if (!result.ok) this.registrations.delete(result.sub)
+    // A refused subscription is not resent on every reconnect; one the server
+    // could not decide yet is kept and asked for again.
+    if (!result.ok) {
+      if (!result.error?.retryable) {
+        this.registrations.delete(result.sub)
+      } else if (reg) {
+        reg.lapsed = true
+        this.scheduleRetry(result.sub, result.error.retry_after_ms)
+      }
+    }
     reg?.onResult(result)
+    if (result.ok && reg?.spec.shape) this.live(reg, reg.spec.shape, result, walLsn)
+  }
+
+  /** Reports a shape the server installed, and keeps its table's resume position. */
+  private live(reg: Registration, shape: ShapeSpec, result: SubscriptionResult, walLsn?: string): void {
+    const table = `${shape.schema ?? 'public'}.${shape.table}`
+    // A position the server could not resume from is stale, and a table with
+    // none needs one; either way, resuming from walLsn later misses nothing. A
+    // position being replayed is kept: the replayed changes advance it.
+    if (walLsn && (result.resumed === false || !this.resumeFrom.has(table))) this.resumeFrom.set(table, walLsn)
+    const reason = reg.live ? 'resubscribed' : 'subscribed'
+    const live: LiveEvent = {
+      sub: result.sub,
+      reason,
+      // Only a subscription that was installed until the stream ended is
+      // covered by the replay.
+      resumed: reason === 'resubscribed' && !reg.lapsed && result.resumed === true,
+      walLsn,
+    }
+    reg.live = true
+    reg.lapsed = false
+    reg.onEvent('live', live)
   }
 }
 

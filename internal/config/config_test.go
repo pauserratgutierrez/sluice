@@ -151,3 +151,40 @@ func TestValidateOptionalRoleNeedsIssuer(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestValidateRingDisabledNeedsSnapshotsOff(t *testing.T) {
+	c := baseValid()
+	c.SnapshotEnabled = true
+	if err := c.validate(); err == nil {
+		t.Fatal("snapshots replay the resume buffer; disabling it must require snapshots off")
+	}
+	c.SnapshotEnabled = false
+	if err := c.validate(); err != nil {
+		t.Fatalf("a disabled buffer without snapshots is valid: %v", err)
+	}
+	c.RingEvents = -1
+	if err := c.validate(); err == nil {
+		t.Fatal("a negative SLUICE_RING_EVENTS must be rejected")
+	}
+	c.RingEvents = 4096
+	if err := c.validate(); err == nil {
+		t.Fatal("an enabled buffer needs a positive SLUICE_RING_MAX_BYTES")
+	}
+	c.RingMaxBytes = 64 << 20
+	c.SnapshotEnabled = true
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateSessionLookupNeedsRevocation(t *testing.T) {
+	c := baseValid()
+	c.SessionLookup = true
+	if err := c.validate(); err == nil {
+		t.Fatal("the session lookup without revocation must be rejected")
+	}
+	c.RevocationEnabled = true
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+}

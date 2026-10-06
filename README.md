@@ -90,7 +90,7 @@ docker run --rm -p 4000:4000 --env-file deploy/sluice.env.example \
   ghcr.io/pauserratgutierrez/sluice:latest
 ```
 
-`sluice -healthcheck` probes `GET /healthz` (the image's `HEALTHCHECK`); `sluice -version` prints the version.
+`sluice -healthcheck` probes `GET /healthz` (the image's `HEALTHCHECK`), `sluice -readycheck` probes `GET /readyz`; `sluice -version` prints the version. A single-process deployment should use `-readycheck`: it reports a process that is up but not streaming from its slot. Docker Compose does not restart an unhealthy container; Sluice exits on its own when it cannot go on (see [Operating it](#operating-it)).
 
 Behind a proxy, disable response buffering for the stream route (Caddy: `flush_interval -1`; nginx honours the `X-Accel-Buffering: no` header Sluice sends) and do not time out long-lived responses. CORS is the gateway's job; Sluice sends no CORS headers.
 
@@ -120,7 +120,9 @@ Tier C evaluates the policy under the caller's role and claims against the WAL t
 
 ### Issuer oracle
 
-`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded). Redirects are not followed; a timeout (`SLUICE_ISSUER_TIMEOUT`), a non-2xx or an unreadable body denies.
+`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded). Redirects are not followed.
+
+Only an allow grants. `"allow": false`, a redirect or a `4xx` other than `408` and `429` denies, with `shape_not_authorized`. No verdict at all — unreachable, a timeout (`SLUICE_ISSUER_TIMEOUT`), a `5xx`, `408` or `429`, or an unreadable body — refuses the shape with `issuer_unavailable`, which is retryable: `retry_after_ms` is the issuer's `Retry-After` (seconds or an HTTP date, at most 60 s) or, without one, a delay spread between 1 and 5 s. The SDK asks again after it on its own.
 
 ```json
 {
@@ -131,7 +133,7 @@ Tier C evaluates the policy under the caller's role and claims against the WAL t
 }
 ```
 
-`action` is `refresh` when the stream presents a new token (`POST /token`). A grant:
+`action` is `refresh` when the stream presents a new token (`POST /token`). There, a shape the issuer denies is dropped with `shape_not_authorized`, and one it gives no verdict on is dropped with `issuer_unavailable`, so a new token never keeps a grant made for the previous one; the client subscribes again. A grant:
 
 ```json
 {
@@ -151,7 +153,7 @@ Sluice checks the grant before using it:
 - Columns are the requested ones (or all) plus the key columns, intersected with `shape.columns` when present (an empty list denies), and with the pool role's physical `SELECT`.
 - `holds` is non-empty. Every hold table is published, and every hold filter has an equality and only reads columns in that table's replica identity (otherwise its `DELETE` could not be detected).
 
-Sluice then installs the hold watches and the shape, and only after that checks that every hold row exists, so a `DELETE` racing the join is still caught. When a hold row is deleted, or updated out of its filter, the shape is dropped with `shape_not_authorized`; the stream and its other subscriptions continue. Zero rows in the subscribed table is a valid, empty shape. The ready result carries `oracle: "issuer"` and the effective `filter`, and no `tier`. Snapshots and `EXISTS` run as the pool role.
+Sluice then installs the hold watches and the shape, and only after that checks that every hold row exists, so a `DELETE` racing the join is still caught. When a hold row is deleted, or updated out of its filter, or its table is truncated, the shape is dropped with `shape_not_authorized`; the stream and its other subscriptions continue. Zero rows in the subscribed table is a valid, empty shape. The ready result carries `oracle: "issuer"` and the effective `filter`, and no `tier`. Snapshots and `EXISTS` run as the pool role.
 
 `POST /admin/shapes/drop` (service_role token, or the issuer bearer) drops this process's subscriptions matching a table, equalities and optionally an identity:
 
@@ -257,7 +259,7 @@ Accept: text/event-stream
   "resume": { "public.documents": "0/1A2B3C4" } }
 ```
 
-The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`) or `503 server_shutdown` (the process is stopping). Closing the response is how a client leaves: everything the stream held, presence included, is released.
+The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`), `503 server_shutdown` (the process is stopping) or `503 session_check_unavailable` (the session lookup could not reach the database; retry). Closing the response is how a client leaves: everything the stream held, presence included, is released.
 
 Control requests name the stream with `stream_id` in the body, the `Sluice-Stream-Id` header, or both; if both are present and differ the request is rejected (`400 stream_id_mismatch`). The token must name the same `sub` and `role` as the stream (`403 forbidden`); stream ids are not secrets. A stream id from another process is `404 unknown_stream`.
 
@@ -275,7 +277,9 @@ Each event is an SSE frame `event: <name>` + `data: <one JSON line>`. A heartbea
     { "sub": "room", "ok": true } ] }
 ```
 
-A subscription result has `sub`, `ok`, and then either an `error` (`{code, message}`) or: `tier` (RLS) or `oracle: "issuer"` and `filter` (issuer), `indexed`, `routing_key`, `reason`, `warnings`. The same warnings are also sent as `warning` events.
+A subscription result has `sub`, `ok`, and then either an `error` (`{code, message, retryable, retry_after_ms?}`) or: `tier` (RLS) or `oracle: "issuer"` and `filter` (issuer), `indexed`, `routing_key`, `reason`, `warnings`, and `resumed` when the request carried a resume position for the shape's table (see [Resume](#resume)). The same warnings are also sent as `warning` events.
+
+When `ready` is written, its subscriptions are installed: every change from then on reaches them. `wal_lsn` is a resume position for them, taken before they were installed, so resuming from it later replays whatever they missed even if they never received a change.
 
 **`change`** — `id: <commit_lsn>:<seq>` (not on snapshot rows or `TRUNCATE`):
 
@@ -296,11 +300,12 @@ A subscription result has `sub`, `ok`, and then either an `error` (`{code, messa
 
 **`warning`** — `{ "sub"?, "code", "message", "effect"?, "remedy"? }`.
 
-**`error`** — `{ "sub"?, "code", "message", "retryable", "action"?, "retry_after_ms"? }`. With `sub` it ends that subscription (or reports a retryable problem with it) and the stream continues; without `sub` the stream is closing. `retry_after_ms` is how long to wait before reconnecting.
+**`error`** — `{ "sub"?, "code", "message", "retryable", "action"?, "retry_after_ms"? }`. With `sub` it ends that subscription (or reports a retryable problem with it) and the stream continues; without `sub` the stream is closing. Without `sub`, `retry_after_ms` is how long to wait before reconnecting; with `sub`, the subscription was removed and may be requested again after that long.
 
 | Code | Where | Meaning |
 | --- | --- | --- |
-| `shape_not_authorized` | subscribe, later | denied, revoked by a policy change or `/token`, hold removed, or dropped by an operator |
+| `shape_not_authorized` | subscribe, later | denied, revoked by a policy change or `/token`, hold removed or truncated, or dropped by an operator |
+| `issuer_unavailable` | subscribe, `/token` | the issuer gave no verdict; retryable, subscribe again after `retry_after_ms` |
 | `column_not_granted` | subscribe | the role may read none of the requested columns |
 | `policy_requires_impersonation` | subscribe | Tier C with `SLUICE_TIER_C=deny` |
 | `relation_not_published`, `relation_unpublished` | subscribe, later | the table (or a hold table) is not, or no longer, in the publication |
@@ -309,7 +314,7 @@ A subscription result has `sub`, `ok`, and then either an `error` (`{code, messa
 | `replica_identity_insufficient` | subscribe | `SLUICE_REPLICA_IDENTITY=strict` |
 | `unknown_namespace` | subscribe | channel refused |
 | `channel_not_authorized` | subscribe, later | channel refused, or a hook channel's join revoked on re-check or `/token` |
-| `resume_too_old` | subscribe, after a snapshot | the position is no longer buffered; `action: "resnapshot"` |
+| `resume_too_old` | after a snapshot | the buffer no longer reaches the snapshot's floor; `action: "resnapshot"` |
 | `invalid_resume`, `snapshot_failed`, `internal` | subscribe | as named |
 | `stream_lagging` | stream | the client did not keep up; `action: "resnapshot"` |
 | `server_shutdown` | stream | the process is stopping; reconnect after `retry_after_ms` (spread over `SLUICE_RECONNECT_SPREAD`), with resume |
@@ -321,17 +326,19 @@ Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insuf
 
 | Request body | Response |
 | --- | --- |
-| `/subscribe` `{ "stream_id", "subscriptions": [ … ] }` | `{ "results": [ … ] }`; `429 rate_limited` past `SLUICE_SUBSCRIBE_RATE`/s |
+| `/subscribe` `{ "stream_id", "subscriptions": [ … ] }` | `{ "results": [ … ], "wal_lsn" }`, installed when the response is written; `429 rate_limited` past `SLUICE_SUBSCRIBE_RATE`/s |
 | `/unsubscribe` `{ "stream_id", "subs": ["docs"] }` | `{ "removed": n }` |
 | `/publish` `{ "stream_id", "channel", "event", "payload", "self" }` | `{ "delivered": n }`; `403 channel_not_subscribed`, `413 payload_too_large`, `429 rate_limited` |
 | `/presence` `{ "stream_id", "channel", "action": "track" \| "update" \| "untrack", "meta" }` | `{ "ok": true }`; `403 presence_key_not_allowed`, `403 channel_not_subscribed`, `429 rate_limited`, `429 presence_too_many_keys` |
-| `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch` |
+| `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch`, `503 session_check_unavailable` |
 
-`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape), and every hook channel is asked about again; `revoked_subscriptions` counts both.
+`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape), and every hook channel is asked about again; `revoked_subscriptions` counts both, including shapes dropped with `issuer_unavailable`.
 
 ### Resume
 
-A client that reconnects sends `resume: { "schema.table": "<commit_lsn>" }` with the last commit LSN it saw per table. For each shape on that table Sluice replays, from its in-memory buffer, every change whose commit LSN is **at or after** that position, re-filtered and re-authorized; the snapshot is skipped. The buffer holds up to `SLUICE_RING_EVENTS` changes per table since this process started replicating; entries older than `SLUICE_RING_MAX_AGE` are swept, except each table's newest transaction. A position the buffer cannot cover — older than what it holds, or from before this process started — returns `resume_too_old` (`action: "resnapshot"`); the subscription is live, but the client must discard its state and resubscribe (for example with a snapshot). Broadcasts, presence and `TRUNCATE` are not replayed.
+A client that reconnects sends `resume: { "schema.table": "<lsn>" }` per table: the last commit LSN it saw there, or, for a table whose shapes have seen no change, the `wal_lsn` of the `ready` (or `/subscribe` response) that installed them. For each shape on that table Sluice replays, from its in-memory buffer, every change whose commit LSN is **at or after** that position, re-filtered and re-authorized; the snapshot is skipped. The result says whether it could: `resumed: true` means nothing was missed; `resumed: false` means the buffer does not reach that far (older than what it holds, or from before this process started), and the subscription is live but the client must read the current state again. The SDK reports both as `onLive`.
+
+The buffer holds up to `SLUICE_RING_EVENTS` changes per table since this process started replicating, and at most `SLUICE_RING_MAX_BYTES` of row data across every table, evicting the oldest first; entries older than `SLUICE_RING_MAX_AGE` are swept, except each table's newest transaction. `SLUICE_RING_EVENTS=0` disables it, which requires `SLUICE_SNAPSHOT_ENABLED=false` (a snapshot replays the buffer from its floor): every resume is then `resumed: false`, for clients that read the current state over HTTP whenever a subscription goes live. Broadcasts, presence and `TRUNCATE` are not replayed.
 
 ## Channels: broadcast and presence
 
@@ -379,6 +386,8 @@ ALTER PUBLICATION sluice ADD TABLE auth.sessions, auth.users;
 with `SLUICE_REVOCATION_USERS_TABLE=auth.users`. A service without bans publishes only its sessions table and leaves `SLUICE_REVOCATION_USERS_TABLE` unset.
 
 A `DELETE` on `SLUICE_REVOCATION_SESSIONS_TABLE` (sign-out deletes the session row whose `id` is the token's `SLUICE_JWT_SESSION_CLAIM` claim, `session_id` for GoTrue) closes every stream holding that session with `session_revoked`. Both ids are compared lowercased. Deleting an account whose sessions cascade revokes each of them the same way. When `SLUICE_REVOCATION_USERS_TABLE` is set, an `UPDATE` on it that leaves `SLUICE_REVOCATION_USERS_BAN_COLUMN` (`banned_until`) in the future closes the user's streams with `user_banned`; a ban time already past, as GoTrue leaves it when a timed ban runs out, is not a ban, and an `UPDATE` that clears it or moves it into the past lifts the ban. Revoked sessions are remembered for two hours, and bans until their time or for two hours, whichever is sooner: their tokens are refused on every endpoint, and open streams are also checked on every heartbeat. Only revocations the slot delivered since the process started are known.
+
+With `SLUICE_REVOCATION_SESSION_LOOKUP=true`, opening a stream and `POST /token` also check that the token's session row still exists, so a session signed out before a restart cannot reconnect while its token is unexpired. It is one indexed query on `SLUICE_REVOCATION_SESSIONS_TABLE`'s `id` (a `uuid` column, or text holding lowercase ids), and the pool role needs `GRANT SELECT (id) ON <sessions table> TO <authz role>`, checked at startup. A session that is found is trusted for 30 s without asking again (its deletion still arrives through the slot); one that is missing is refused with `401` and remembered as revoked; a lookup that fails answers `503 session_check_unavailable`, which clients retry. Tokens without a session claim are not checked.
 
 Streams are also closed with `token_expired` at the first heartbeat after the token's `exp`.
 
@@ -433,18 +442,19 @@ Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers.
 | --- | --- |
 | `sluice_wal_lsn` (gauge), `sluice_wal_lag_bytes`, `sluice_slot_retained_bytes` | `kind` = received, confirmed |
 | `sluice_wal_messages_total` | `type` |
-| `sluice_reader_reconnects_total`, `sluice_reader_is_leader` | |
+| `sluice_reader_reconnects_total`, `sluice_reader_is_leader`, `sluice_slot_recreated_total` | |
+| `sluice_resume_buffer_bytes` (gauge) | |
 | `sluice_changes_total` | `schema`, `table`, `op` |
 | `sluice_change_dispatch_seconds`, `sluice_routing_candidates` (histograms) | `schema`, `table` |
 | `sluice_toast_unchanged_total` | `schema`, `table`, `column` |
 | `sluice_changes_truncated_total` | `schema`, `table` |
 | `sluice_subscriptions` (gauge) | `schema`, `table`, `tier`, `indexed` |
-| `sluice_authz_resolutions_total` | `tier`, `result` = granted, denied, refused |
+| `sluice_authz_resolutions_total` | `tier`, `result` = granted, denied, refused, unavailable |
 | `sluice_authz_resolve_seconds` | `tier` |
 | `sluice_authz_tier_c_probes_total`, `sluice_authz_tier_c_withheld_total`, `sluice_authz_downgrades_total` | `schema`, `table` |
 | `sluice_authz_compile_failures_total` | `schema`, `table`, `reason` |
 | `sluice_authz_unknown_total` | `schema`, `table`, `op` |
-| `sluice_authz_lease_refreshes_total` | `result` = held, revoked |
+| `sluice_authz_lease_refreshes_total` | `result` = held, revoked, unavailable |
 | `sluice_channel_hook_rechecks_total` (per joined channel) | `result` = held, revoked, unavailable |
 | `sluice_streams` (gauge) | |
 | `sluice_stream_dropped_events_total` | `kind` |
@@ -455,13 +465,13 @@ Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers.
 | `sluice_revocations_total` | `source` = session, ban |
 | `sluice_config_warnings` (gauge, 1 per active `/diagnostics` warning) | `code` |
 
-The slot and warning metrics refresh every `SLUICE_CATALOG_REFRESH`.
+The slot, warning and resume buffer metrics refresh every `SLUICE_CATALOG_REFRESH`.
 
 **Failures.**
 
 - **PostgreSQL restart or dropped replication connection:** the reader reconnects with backoff (1 s, doubling to about 30 s) from the slot's confirmed position; streams stay open.
-- **Slot invalidated:** the reader stops and the process exits, because resuming would hide a gap. Recreate the slot; clients must resnapshot.
-- **Sluice restart:** streams are closed; clients reconnect, and their resume positions are no longer buffered, so they resnapshot.
+- **Slot gone** (invalidated — `max_slot_wal_keep_size` exceeded, `idle_replication_slot_timeout` — or dropped, as after restoring the database): after a failed stream the reader reads the slot from `pg_replication_slots`, and when it can no longer stream every change since its confirmed position the process exits with an error, because streaming on would hide a gap. Every stream ends with `server_shutdown`, and the container's restart policy brings the process back. A missing slot is created again at startup. An invalidated one stops the process at startup until it is dropped (`SELECT pg_drop_replication_slot('<slot>')`), unless `SLUICE_SLOT_RECREATE=true`: then the process holding the reader lock drops and recreates it, never while another process is streaming it, logs a warning and counts `sluice_slot_recreated_total`. Either way the changes made while the slot was unusable are never delivered, so clients must read their state again; a client that does so whenever a subscription goes live without `resumed: true` (the SDK's `onLive`) needs nothing more.
+- **Sluice restart:** streams are closed; clients reconnect, and their resume positions are no longer buffered, so their results say `resumed: false` and they read their state again.
 - **A table leaves the publication:** its shapes are dropped with `relation_unpublished`.
 - **A table's definition changes:** its subscriptions get `schema_changed`; dropped columns disappear from events, and new columns are not added until the client resubscribes.
 
@@ -496,11 +506,13 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_DB_POOL_MAX_CONNS` / `_MIN_CONNS` | `8` / `2` | the reading process keeps one for its lock |
 | `SLUICE_PARANOID_POOL_RESET` | `false` | `DISCARD ALL` on every returned connection |
 | `SLUICE_SLOT_NAME` / `SLUICE_PUBLICATION` | `sluice` / `sluice` | |
+| `SLUICE_SLOT_RECREATE` | `false` | replace an invalidated slot at startup instead of stopping |
 | `SLUICE_PROTO_VERSION` | `4` | 1–4 |
 | `SLUICE_MESSAGES` | `true` | deliver `pg_logical_emit_message` |
 | `SLUICE_STATUS_INTERVAL` | `10s` | slot acknowledgement interval |
 | `SLUICE_MESSAGE_PREFIX` | `sluice:` | must not be empty |
-| `SLUICE_RING_EVENTS` / `SLUICE_RING_MAX_AGE` | `4096` / `60s` | resume buffer per table |
+| `SLUICE_RING_EVENTS` / `SLUICE_RING_MAX_AGE` | `4096` / `60s` | resume buffer per table; `0` disables it (needs `SLUICE_SNAPSHOT_ENABLED=false`) |
+| `SLUICE_RING_MAX_BYTES` | `67108864` | row data the resume buffer holds across every table |
 | `SLUICE_JWKS_URL` | required | |
 | `SLUICE_JWKS_REFRESH` | `5m` | |
 | `SLUICE_JWT_ALG` | `ES256` | or `RS256` |
@@ -527,7 +539,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_HEARTBEAT` | `20s` | at least 5 s |
 | `SLUICE_STREAM_QUEUE` | `256` | most events queued per stream |
 | `SLUICE_WRITE_TIMEOUT` | `10s` | per write |
-| `SLUICE_MAX_STREAMS` | `50000` | per process |
+| `SLUICE_MAX_STREAMS` | `50000` | per process; size it to the memory limit (about 8 000 streams of five shapes and a channel fit in 512 MB, see [`apps/loadtest`](apps/loadtest/README.md)) |
 | `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
 | `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |
 | `SLUICE_SUBSCRIBE_RATE` / `SLUICE_PUBLISH_RATE` | `20` / `100` | per second per stream |
@@ -541,6 +553,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_REVOCATION_SESSIONS_TABLE` | `auth.sessions` | |
 | `SLUICE_REVOCATION_USERS_TABLE` | unset | no user-level revocation when unset; `auth.users` for GoTrue bans |
 | `SLUICE_REVOCATION_USERS_BAN_COLUMN` | `banned_until` | |
+| `SLUICE_REVOCATION_SESSION_LOOKUP` | `false` | check the session row on `/stream` and `/token`; needs `SLUICE_REVOCATION_ENABLED` |
 | `SLUICE_METRICS_ENABLED` / `SLUICE_DIAGNOSTICS_ENABLED` | `true` / `true` | |
 
 ## Clients
@@ -565,11 +578,11 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
 
 | Tool | What it checks |
 | --- | --- |
-| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, value encoding vs `to_jsonb`, evaluator vs PostgreSQL, security negatives, a small fan-out |
-| `cmd/smoke-issuer` | the issuer process: grants, narrowing, hold cut, `/token` refresh (run after `cmd/smoke`) |
+| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, value encoding vs `to_jsonb`, evaluator vs PostgreSQL, security negatives, a small fan-out, and last the loss of the slot (it restarts Sluice) |
+| `cmd/smoke-issuer` | the issuer process: grants, narrowing, hold cut, `/token` refresh, an issuer outage (run after `cmd/smoke`) |
 | `cmd/audit` | a broad policy spectrum, DML and WAL edge cases, revocation, `/diagnostics`; needs `SERVICE_ROLE_KEY` and writes a JSON report to `/out` |
 | `cmd/load` | a fan-out soak on the harness (`LOAD_SCENARIO`, `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`) |
-| `node packages/sluice-js/test/live.mjs [baseUrl]` | the built SDK through the gateway |
+| `node packages/sluice-js/test/live.mjs [baseUrl]` | the built SDK through the gateway, including a reconnect that must miss nothing |
 | [`apps/loadtest`](apps/loadtest/README.md) | capacity hunts against a published image, with its own compose stack |
 
 The harness applies `deploy/db/fixtures.sql`, `issuer_fixtures.sql` and `audit_fixtures.sql` on every `up`. Releases (image and SDK, from `v*.*.*` tags) are described in [MAINTENANCE.md](MAINTENANCE.md).

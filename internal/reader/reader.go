@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -109,40 +110,141 @@ func (r *Reader) seedConfirmed(ctx context.Context) {
 	}
 }
 
-// EnsureSlot creates the replication slot if it does not exist.
+// slotState is the slot as pg_replication_slots reports it.
+type slotState struct {
+	exists       bool
+	active       bool
+	walStatus    string
+	invalidation string
+}
+
+// gone says why the slot can no longer stream every change since its confirmed
+// position, or "" while it still can.
+func (s slotState) gone() string {
+	switch {
+	case !s.exists:
+		return "does not exist"
+	case s.invalidation != "":
+		return "was invalidated (" + s.invalidation + ")"
+	case s.walStatus == "lost":
+		return "has lost WAL it needs"
+	}
+	return ""
+}
+
+type slotAction int
+
+const (
+	slotUse slotAction = iota
+	slotCreate
+	slotRecreate
+	slotRefuse
+)
+
+// action decides what to do with the slot as found before streaming. Only an
+// invalidated slot is ever replaced, only when the operator allowed it, and
+// never while some other process holds it.
+func (s slotState) action(recreate bool) slotAction {
+	switch {
+	case !s.exists:
+		return slotCreate
+	case s.gone() == "":
+		return slotUse
+	case recreate && !s.active:
+		return slotRecreate
+	}
+	return slotRefuse
+}
+
+func (r *Reader) readSlot(ctx context.Context) (slotState, error) {
+	st := slotState{exists: true}
+	// invalidation_reason exists from PostgreSQL 17; through to_jsonb it reads
+	// as NULL on 16 rather than failing the query.
+	err := r.pool.QueryRow(ctx, `
+		SELECT active, coalesce(wal_status, ''), coalesce(to_jsonb(s) ->> 'invalidation_reason', '')
+		  FROM pg_replication_slots s WHERE slot_name = $1`,
+		r.cfg.SlotName).Scan(&st.active, &st.walStatus, &st.invalidation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return slotState{}, nil
+	}
+	return st, err
+}
+
+// prepareSlot readies the slot before the first START_REPLICATION. It runs in
+// the process holding the reader lock, so no other Sluice is streaming it.
 //
 // The slot is PERMANENT, deliberately. supabase/realtime uses a temporary slot,
 // which is dropped on any error or session end -- silently losing every change
 // between the failure and the reconnect. A permanent slot is crash-safe and
 // resumes from confirmed_flush_lsn.
-func (r *Reader) EnsureSlot(ctx context.Context) (created bool, err error) {
-	var exists bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`,
-		r.cfg.SlotName).Scan(&exists); err != nil {
-		return false, fmt.Errorf("reader: check slot: %w", err)
-	}
-	if exists {
-		return false, nil
-	}
-
-	conn, err := r.connect(ctx)
+//
+// A missing slot is created: that is every first start, and a process whose
+// slot disappeared has already exited, closing every stream. An invalidated
+// slot stops the process unless SLUICE_SLOT_RECREATE allows replacing it,
+// because a new slot starts after whatever the old one lost.
+func (r *Reader) prepareSlot(ctx context.Context) error {
+	st, err := r.readSlot(ctx)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("reader: read slot %q: %w", r.cfg.SlotName, err)
 	}
-	defer conn.Close(context.Background())
+	switch st.action(r.cfg.SlotRecreate) {
+	case slotUse:
+		r.log.Info("using existing replication slot", "slot", r.cfg.SlotName)
+	case slotCreate:
+		conn, err := r.connect(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close(context.Background())
+		if err := r.createSlot(ctx, conn); err != nil {
+			return err
+		}
+		r.log.Info("created replication slot", "slot", r.cfg.SlotName)
+	case slotRecreate:
+		conn, err := r.connect(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close(context.Background())
+		if err := pglogrepl.DropReplicationSlot(ctx, conn, r.cfg.SlotName,
+			pglogrepl.DropReplicationSlotOptions{}); err != nil {
+			return fmt.Errorf("reader: drop slot %q: %w", r.cfg.SlotName, err)
+		}
+		if err := r.createSlot(ctx, conn); err != nil {
+			return err
+		}
+		metrics.SlotRecreated.Inc()
+		r.log.Warn("recreated the replication slot; changes made while it was unusable were not delivered",
+			"slot", r.cfg.SlotName, "reason", st.gone())
+	default:
+		if st.active {
+			return fmt.Errorf("reader: replication slot %q %s and another process holds it; not recreating it",
+				r.cfg.SlotName, st.gone())
+		}
+		return fmt.Errorf("reader: replication slot %q %s, so the change stream has a gap. "+
+			"Drop it with SELECT pg_drop_replication_slot('%s'); or set SLUICE_SLOT_RECREATE=true",
+			r.cfg.SlotName, st.gone(), r.cfg.SlotName)
+	}
+	return nil
+}
 
+func (r *Reader) createSlot(ctx context.Context, conn *pgconn.PgConn) error {
 	if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.cfg.SlotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false}); err != nil {
-		// Two processes starting together can both see no slot; the loser's
-		// create fails with duplicate_object, which is the outcome it wanted.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "42710" {
-			return false, nil
-		}
-		return false, fmt.Errorf("reader: create slot %q: %w", r.cfg.SlotName, err)
+		return fmt.Errorf("reader: create slot %q: %w", r.cfg.SlotName, err)
 	}
-	return true, nil
+	return nil
+}
+
+// slotGone checks, after a failed stream, whether the slot itself is the
+// problem. A query that fails, as while PostgreSQL restarts, is no answer, and
+// the reader retries.
+func (r *Reader) slotGone(ctx context.Context) string {
+	st, err := r.readSlot(ctx)
+	if err != nil {
+		return ""
+	}
+	return st.gone()
 }
 
 // connect opens the replication connection with the output settings the wire
@@ -164,8 +266,12 @@ func (r *Reader) connect(ctx context.Context) (*pgconn.PgConn, error) {
 	return conn, nil
 }
 
-// Run streams until the context is cancelled, reconnecting with backoff.
+// Run streams until the context is cancelled, reconnecting with backoff. It
+// returns an error, and the process exits, when the slot is gone.
 func (r *Reader) Run(ctx context.Context) error {
+	if err := r.prepareSlot(ctx); err != nil {
+		return err
+	}
 	backoff := time.Second
 	for {
 		started := time.Now()
@@ -177,11 +283,12 @@ func (r *Reader) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// An invalidated slot is fatal by design. Silently resuming from a
-		// new position would be silent data loss, so the operator must act.
-		if isSlotInvalidated(err) {
-			return fmt.Errorf("reader: replication slot %q has been invalidated; "+
-				"the change stream has a gap and clients must resnapshot: %w", r.cfg.SlotName, err)
+		// A slot that is gone is fatal by design: streaming on from a new
+		// position would hide the gap. Exiting closes every stream, so every
+		// client reconnects knowing it was not resumed.
+		if why := r.slotGone(ctx); why != "" {
+			return fmt.Errorf("reader: replication slot %q %s; the change stream has a gap: %w",
+				r.cfg.SlotName, why, err)
 		}
 		// A stream that ran for a while failed on its own, not because the
 		// last attempt did; start the backoff over.
@@ -199,12 +306,6 @@ func (r *Reader) Run(ctx context.Context) error {
 			backoff *= 2
 		}
 	}
-}
-
-func isSlotInvalidated(err error) bool {
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "can no longer get changes from replication slot") ||
-		strings.Contains(s, "requested wal segment") && strings.Contains(s, "removed")
 }
 
 func (r *Reader) stream(ctx context.Context) error {
@@ -312,7 +413,7 @@ func (r *Reader) stream(ctx context.Context) error {
 			}
 
 		case *pgproto3.ErrorResponse:
-			return fmt.Errorf("reader: server error: %s: %s", msg.Severity, msg.Message)
+			return fmt.Errorf("reader: server error: %w", pgconn.ErrorResponseToPgError(msg))
 		}
 	}
 }

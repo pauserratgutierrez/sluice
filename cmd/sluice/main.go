@@ -36,7 +36,8 @@ import (
 var version = "dev"
 
 func main() {
-	healthcheck := flag.Bool("healthcheck", false, "probe the local server and exit")
+	healthcheck := flag.Bool("healthcheck", false, "probe the local server's liveness (/healthz) and exit")
+	readycheck := flag.Bool("readycheck", false, "probe the local server's readiness (/readyz) and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -45,7 +46,10 @@ func main() {
 		return
 	}
 	if *healthcheck {
-		os.Exit(runHealthcheck())
+		os.Exit(probe("/healthz"))
+	}
+	if *readycheck {
+		os.Exit(probe("/readyz"))
 	}
 
 	if err := run(); err != nil {
@@ -54,7 +58,8 @@ func main() {
 	}
 }
 
-func runHealthcheck() int {
+// probe GETs a local health endpoint and returns the exit code for it.
+func probe(path string) int {
 	addr := os.Getenv("SLUICE_LISTEN_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:4000"
@@ -65,9 +70,9 @@ func runHealthcheck() int {
 		}
 	}
 	c := &http.Client{Timeout: 3 * time.Second}
-	resp, err := c.Get("http://" + addr + "/healthz")
+	resp, err := c.Get("http://" + addr + path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		fmt.Fprintln(os.Stderr, path+":", err)
 		return 1
 	}
 	defer resp.Body.Close()
@@ -155,7 +160,7 @@ func run() error {
 	revoker := auth.NewRevoker(0)
 
 	// ---- hub, authorizer, server ----------------------------------------
-	h := hub.New(cfg.StreamQueue, cfg.RingEvents, cfg.RingMaxAge, cfg.PresenceBcast)
+	h := hub.New(cfg.StreamQueue, cfg.RingEvents, cfg.RingMaxBytes, cfg.RingMaxAge, cfg.PresenceBcast)
 	go h.Presence().Run()
 	defer h.Presence().Stop()
 
@@ -193,14 +198,6 @@ func run() error {
 
 	rd := reader.New(cfg, pool, log, srv)
 	srv.SetReader(rd)
-
-	if created, err := rd.EnsureSlot(ctx); err != nil {
-		return err
-	} else if created {
-		log.Info("created replication slot", "slot", cfg.SlotName)
-	} else {
-		log.Info("using existing replication slot", "slot", cfg.SlotName)
-	}
 
 	// ---- background loops -----------------------------------------------
 	// The shared heartbeat wheel: one timer for every stream on the node.

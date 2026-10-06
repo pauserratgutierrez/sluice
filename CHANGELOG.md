@@ -2,6 +2,54 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.7.0
+
+### Fixed
+
+- A replication slot invalidated on PostgreSQL 18 (`max_slot_wal_keep_size` exceeded, `idle_replication_slot_timeout`), or dropped while Sluice ran (a database restore), left the reader retrying forever: streams stayed open with heartbeats only and no error. PostgreSQL 18 reports an invalidated slot with a message Sluice did not recognise. After a failed stream the reader now reads the slot from `pg_replication_slots`, and when it can no longer stream every change the process exits with an error, ending every stream with `server_shutdown`.
+- SDK: a shape that had received no change before its stream dropped reconnected without a resume position, so the changes made while it was disconnected were lost without notice, on every server restart among other times. Shapes now resume from the position the server gives when they go live.
+- An issuer timeout, network error or `5xx` refused the shape as `shape_not_authorized`, which the SDK forgets: a brief issuer outage during a reconnect wave or a `/token` ejected live subscriptions for good. It is now the retryable `issuer_unavailable`.
+- `TRUNCATE` of a hold table did not cut the shapes it held. They are now dropped with `shape_not_authorized`.
+
+### Changed
+
+- **Breaking (protocol):** whether a resume is covered is in the subscription result, as `resumed: true | false`, instead of an asynchronous `resume_too_old` error. `resume_too_old` is now only sent when the buffer no longer reaches an initial snapshot's floor. Clients other than the SDK that send `resume` must read `resumed`.
+- `wal_lsn` in `ready` is taken before the subscriptions are installed, and `/subscribe` returns one too: resuming from it replays whatever those subscriptions missed.
+- An issuer `4xx` other than `408` and `429`, a redirect and `"allow": false` still deny. A `5xx`, `408`, `429`, timeout, network error or unreadable body is `issuer_unavailable`, with the issuer's `Retry-After` (at most 60 s) or a delay spread between 1 and 5 s as `retry_after_ms`.
+- `POST /token` in issuer mode drops a shape the issuer gives no verdict on with `issuer_unavailable` (it was `shape_not_authorized`), and counts it in `revoked_subscriptions`. A new token never keeps a grant made for the previous one.
+- The resume buffer grows with each table's traffic up to `SLUICE_RING_EVENTS`, instead of reserving every slot on the first change, and is bounded in bytes by `SLUICE_RING_MAX_BYTES` across every table, evicting the oldest change first.
+- The replication slot is created by the process that takes the reader lock, after taking it; a process standing by no longer creates it.
+- SDK: a subscription refused with a retryable error stays registered and is asked for again after `retry_after_ms`. A subscription error with `retry_after_ms` means the server removed it and the client subscribes again. The client no longer forgets a position on `resume_too_old`.
+- Harness: the Sluice containers' healthcheck is `-readycheck`.
+
+### Added
+
+- SDK: `onLive` on shapes, called each time the server installs the subscription, with `{ sub, reason: 'subscribed' | 'resubscribed', resumed, walLsn }`. It fires once the shape is live, so a read made from it cannot miss a change. `resumed` is true only when the server replays everything since the previous stream. Type `LiveEvent`.
+- `issuer_unavailable` subscription error: retryable, with `retry_after_ms`.
+- `SLUICE_RING_EVENTS=0` disables the resume buffer; it needs `SLUICE_SNAPSHOT_ENABLED=false`. Every resume is then `resumed: false`.
+- `SLUICE_RING_MAX_BYTES` (default `67108864`, 64 MiB).
+- `SLUICE_SLOT_RECREATE` (default `false`). With `true`, an invalidated slot is dropped and recreated at startup instead of stopping the process, never while another process holds it; it logs a warning and counts `sluice_slot_recreated_total`.
+- `SLUICE_REVOCATION_SESSION_LOOKUP` (default `false`; needs `SLUICE_REVOCATION_ENABLED=true`). `POST /stream` and `POST /token` check that the token's session row still exists, so a session signed out before a restart cannot reconnect: `401` when it is gone, `503 session_check_unavailable` when the lookup fails. Found sessions are trusted for 30 s.
+- `sluice -readycheck` probes `/readyz`.
+- Metrics `sluice_slot_recreated_total` and `sluice_resume_buffer_bytes`; `result="unavailable"` on `sluice_authz_resolutions_total` and `sluice_authz_lease_refreshes_total`.
+
+### For clients
+
+- Register `onLive` before `subscribe()` and read the current state there unless `e.resumed`. The first `onLive` (`reason: 'subscribed'`) replaces a read made after subscribing; it runs before `subscribe()` resolves.
+- `issuer_unavailable` is retryable and handled by the SDK: `subscribe()` resolves with `ok: false` and `onError` receives it with `retryable: true`, but the subscription stays registered and `onLive` follows once it is live. Treat only `retryable: false` errors as the end of a subscription.
+- `POST /stream` and `POST /token` may answer `503 session_check_unavailable` with the session lookup on; the SDK retries the stream (`http_503`), and `setAuth` throws a retryable error.
+
+### For issuers
+
+- Deny with `200 {"allow": false}` or a `4xx`. A `5xx`, `408` or `429` is an outage: the client is told to try again, after your `Retry-After` when you send one.
+
+### For operators
+
+- With `SLUICE_REVOCATION_SESSION_LOOKUP=true`: `GRANT SELECT (id) ON <sessions table> TO <authz role>;`. Startup refuses without it. The `id` column must be `uuid` or text holding lowercase ids.
+- Health: use `sluice -readycheck` (`/readyz`) for a single-process deployment. Docker Compose does not restart unhealthy containers; Sluice exits on its own when its slot is gone, and needs a restart policy.
+- An invalidated slot now stops the process at startup until it is dropped, or until `SLUICE_SLOT_RECREATE=true` replaces it.
+- Size `SLUICE_MAX_STREAMS` to the memory limit (about 8 000 five-shape streams in 512 MB, measured with 0.4.0).
+
 ## 0.6.0
 
 ### Added

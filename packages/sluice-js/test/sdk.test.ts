@@ -457,7 +457,32 @@ test('a shutdown error sets the delay before the reconnect', async () => {
   client.close()
 })
 
-test('resume_too_old forgets the position instead of resending it', async () => {
+/** A ready event for one subscription. */
+const readyFor = (walLsn: string, result: Record<string, unknown>) =>
+  'event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', wal_lsn: walLsn, subscriptions: [result] }) + '\n\n'
+
+// The gap this closes: a shape that saw no change before the stream dropped
+// used to reconnect without a position, so whatever happened meanwhile was
+// silently lost.
+test('a shape that saw no change resumes from the ready wal_lsn', async () => {
+  const resumes: Record<string, string>[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (_input, init) => {
+      resumes.push(JSON.parse(String(init?.body)).resume)
+      if (resumes.length === 1) return sse(readyFor('0/5', { sub: 's1', ok: true }))
+      return sse(openStream(readyFor('0/9', { sub: 's1', ok: true, resumed: true })))
+    },
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 40))
+  assert.deepEqual(resumes, [{}, { 'public.documents': '0/5' }])
+  client.close()
+})
+
+test('a position the server could not resume from is replaced by the ready wal_lsn', async () => {
   const resumes: Record<string, string>[] = []
   const change = { sub: 's1', op: 'INSERT', schema: 'public', table: 'documents', commit_lsn: '0/10', seq: 1, record: { id: 1 } }
   const client = createClient<Database>('https://example.test/sluice/v1', {
@@ -466,20 +491,125 @@ test('resume_too_old forgets the position instead of resending it', async () => 
     backoff: [1],
     fetch: async (_input, init) => {
       resumes.push(JSON.parse(String(init?.body)).resume)
-      const ready = 'event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'
-      if (resumes.length === 1) return sse(ready + 'event: change\ndata: ' + JSON.stringify(change) + '\n\n')
-      if (resumes.length === 2) {
-        return sse(ready + 'event: error\ndata: {"sub":"s1","code":"resume_too_old","message":"gone","retryable":true,"action":"resnapshot"}\n\n')
-      }
-      return sse(openStream(ready))
+      if (resumes.length === 1) return sse(readyFor('0/5', { sub: 's1', ok: true }) + 'event: change\ndata: ' + JSON.stringify(change) + '\n\n')
+      if (resumes.length === 2) return sse(readyFor('0/20', { sub: 's1', ok: true, resumed: false }))
+      return sse(openStream(readyFor('0/30', { sub: 's1', ok: true, resumed: true })))
     },
   })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 60))
+  assert.deepEqual(resumes.slice(0, 3), [{}, { 'public.documents': '0/10' }, { 'public.documents': '0/20' }])
+  client.close()
+})
 
-  await client.from('documents').as('s1').on('*', () => {}).onError(() => {}).subscribe()
-  await new Promise((r) => setTimeout(r, 80))
-  assert.ok(resumes.length >= 3, `expected three stream requests, saw ${resumes.length}`)
-  assert.deepEqual(resumes[1], { 'public.documents': '0/10' })
-  assert.deepEqual(resumes[2], {}, 'the position the server no longer has must not be resent')
+test('onLive reports every installation, and whether the server resumed it', async () => {
+  let streams = 0
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async () => {
+      streams++
+      if (streams === 1) return sse(readyFor('0/5', { sub: 's1', ok: true }))
+      if (streams === 2) return sse(readyFor('0/6', { sub: 's1', ok: true, resumed: true }))
+      return sse(openStream(readyFor('0/7', { sub: 's1', ok: true, resumed: false })))
+    },
+  })
+  const lives: unknown[] = []
+  await client.from('documents').as('s1').on('*', () => {}).onLive((e) => lives.push(e)).subscribe()
+  assert.deepEqual(lives[0], { sub: 's1', reason: 'subscribed', resumed: false, walLsn: '0/5' }, 'it fires before subscribe() resolves')
+  await new Promise((r) => setTimeout(r, 60))
+  assert.deepEqual(lives, [
+    { sub: 's1', reason: 'subscribed', resumed: false, walLsn: '0/5' },
+    { sub: 's1', reason: 'resubscribed', resumed: true, walLsn: '0/6' },
+    { sub: 's1', reason: 'resubscribed', resumed: false, walLsn: '0/7' },
+  ])
+  client.close()
+})
+
+test('issuer_unavailable keeps the subscription and asks again after retry_after_ms', async () => {
+  const subscribes: string[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    fetch: async (input, init) => {
+      const body = JSON.parse(String(init?.body))
+      if (String(input).endsWith('/subscribe')) {
+        const sub = body.subscriptions[0].sub
+        subscribes.push(sub)
+        const result = subscribes.length === 1
+          ? { sub, ok: false, error: { code: 'issuer_unavailable', message: 'down', retryable: true, retry_after_ms: 20 } }
+          : { sub, ok: true }
+        return new Response(JSON.stringify({ results: [result], wal_lsn: '0/8' }))
+      }
+      return sse(openStream(readyFor('0/5', { sub: 'first', ok: true })))
+    },
+  })
+  await client.from('metrics').as('first').on('*', () => {}).subscribe()
+
+  const errors: { code: string; retryable: boolean }[] = []
+  const lives: unknown[] = []
+  const sub = await client
+    .from('documents')
+    .as('s1')
+    .on('*', () => {})
+    .onError((e) => errors.push({ code: e.code, retryable: e.retryable }))
+    .onLive((e) => lives.push(e))
+    .subscribe()
+  assert.equal(sub.ok, false)
+  assert.deepEqual(errors, [{ code: 'issuer_unavailable', retryable: true }])
+  await new Promise((r) => setTimeout(r, 60))
+  assert.deepEqual(subscribes, ['s1', 's1'], 'asked for again once, after the delay')
+  assert.deepEqual(lives, [{ sub: 's1', reason: 'subscribed', resumed: false, walLsn: '0/8' }])
+  client.close()
+})
+
+// /token drops a live shape with issuer_unavailable when the issuer is down.
+test('a shape the server dropped retryably is subscribed again, and never reported resumed', async () => {
+  const live = pushStream()
+  let streams = 0
+  const subscribes: string[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (input) => {
+      if (String(input).endsWith('/subscribe')) {
+        subscribes.push('s1')
+        return new Response(JSON.stringify({ results: [{ sub: 's1', ok: true }], wal_lsn: '0/7' }))
+      }
+      streams++
+      if (streams === 1) {
+        live.push(readyFor('0/5', { sub: 's1', ok: true }))
+        return sse(live.body)
+      }
+      return sse(openStream(readyFor('0/9', { sub: 's1', ok: true, resumed: true })))
+    },
+  })
+  const lives: { reason: string; resumed: boolean }[] = []
+  await client
+    .from('documents')
+    .as('s1')
+    .on('*', () => {})
+    .onError(() => {})
+    .onLive((e) => lives.push({ reason: e.reason, resumed: e.resumed }))
+    .subscribe()
+
+  const dropped = { sub: 's1', code: 'issuer_unavailable', message: 'down', retryable: true }
+  live.push('event: error\ndata: ' + JSON.stringify({ ...dropped, retry_after_ms: 10 }) + '\n\n')
+  await new Promise((r) => setTimeout(r, 40))
+  assert.deepEqual(subscribes, ['s1'])
+  assert.deepEqual(lives.at(-1), { reason: 'resubscribed', resumed: false })
+
+  // Dropped again, and the stream ends before the retry: the reconnect resends
+  // it, and a replay cannot cover the time it was not installed.
+  live.push('event: error\ndata: ' + JSON.stringify({ ...dropped, retry_after_ms: 10_000 }) + '\n\n')
+  await new Promise((r) => setTimeout(r, 10))
+  live.close()
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(streams, 2)
+  assert.deepEqual(subscribes, ['s1'], 'the reconnect replaced the pending retry')
+  assert.deepEqual(lives.at(-1), { reason: 'resubscribed', resumed: false })
   client.close()
 })
 
@@ -513,7 +643,7 @@ function pushStream() {
   const encoder = new TextEncoder()
   let ctrl!: ReadableStreamDefaultController<Uint8Array>
   const body = new ReadableStream<Uint8Array>({ start: (c) => void (ctrl = c) })
-  return { body, push: (s: string) => ctrl.enqueue(encoder.encode(s)) }
+  return { body, push: (s: string) => ctrl.enqueue(encoder.encode(s)), close: () => ctrl.close() }
 }
 
 test('a channel the server removes reports the error, refuses send, and can be rejoined', async () => {
