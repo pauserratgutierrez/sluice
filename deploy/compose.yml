@@ -272,8 +272,13 @@ services:
 
       SLUICE_CHANNELS: "room:public,notify:owner"
       SLUICE_HEARTBEAT: 20s
-      # Default false. Do not copy the RLS process's true: auth.sessions / auth.users
-      # are not in publication sluice_issuer, so a true here would not revoke.
+
+      # auth.sessions is in publication sluice_issuer for revocation only, and
+      # sluice_authz may read just its id column (issuer_fixtures.sql). No users
+      # table: bans are exercised by the RLS process.
+      SLUICE_REVOCATION_ENABLED: "true"
+      SLUICE_REVOCATION_SESSIONS_TABLE: auth.sessions
+      SLUICE_REVOCATION_SESSION_LOOKUP: "true"
     healthcheck:
       test: ["CMD", "/sluice", "-readycheck"]
       interval: 10s

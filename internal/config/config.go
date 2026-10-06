@@ -338,6 +338,18 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// RevocationTables are the tables published only so revocation can read their
+// changes from the slot. They are neither shapes nor holds.
+func (c *Config) RevocationTables() []string {
+	if !c.RevocationEnabled {
+		return nil
+	}
+	if c.UsersTable == "" {
+		return []string{c.SessionsTable}
+	}
+	return []string{c.SessionsTable, c.UsersTable}
+}
+
 // IssuerMode reports whether this process uses the HTTP issuer as the shape oracle.
 func (c *Config) IssuerMode() bool { return c.ShapeOracle == "issuer" }
 

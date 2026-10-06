@@ -1,9 +1,14 @@
 -- Issuer-oracle overlay fixtures.
 --
 -- Own publication, own tables. RLS off. Not added to publication `sluice`.
--- auth.sessions / auth.users stay off this publication: issuer startup validation
--- requires SELECT + (BYPASSRLS or RLS off) on every published table, and GRANT
--- BYPASSRLS to sluice_authz would poison the RLS process that shares the role.
+-- Issuer startup validation requires SELECT + (BYPASSRLS or RLS off) on every
+-- published shape and hold table, and GRANT BYPASSRLS to sluice_authz would
+-- poison the RLS process that shares the role.
+--
+-- auth.sessions is published here for session revocation only, which exempts
+-- it from that check. The session lookup reads its id column and nothing else,
+-- so sluice_authz gets SELECT (id) and no table SELECT: the issuer process
+-- starting at all is the test that this is enough.
 --
 -- Idempotent: safe to re-run after fixtures.sql.
 
@@ -44,11 +49,17 @@ CREATE INDEX iss_documents_project_id ON public.iss_documents (project_id);
 -- Snapshots and hold EXISTS run as sluice_authz with no SET ROLE.
 GRANT SELECT ON public.iss_project_members, public.iss_documents TO sluice_authz;
 
+GRANT SELECT (id) ON auth.sessions TO sluice_authz;
+-- GoTrue enables RLS on auth.sessions. The policy names sluice_authz only, a
+-- role the RLS process never impersonates.
+DROP POLICY IF EXISTS sluice_session_lookup ON auth.sessions;
+CREATE POLICY sluice_session_lookup ON auth.sessions FOR SELECT TO sluice_authz USING (true);
+
 DO $$
 DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
-    'public.iss_project_members', 'public.iss_documents'
+    'public.iss_project_members', 'public.iss_documents', 'auth.sessions'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_publication_tables

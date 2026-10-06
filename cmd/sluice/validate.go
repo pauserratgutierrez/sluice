@@ -167,14 +167,32 @@ func validate(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, log *
 	}
 
 	// ---- FATAL: session lookup without read access ------------------------
+	// The lookup reads only the id column, so that is the only grant it needs.
 	if cfg.SessionLookup {
-		var readable *bool
-		if err := pool.QueryRow(ctx,
-			`SELECT has_column_privilege(to_regclass($1), 'id', 'SELECT')`,
-			cfg.SessionsTable).Scan(&readable); err != nil || readable == nil || !*readable {
+		var readable, rlsHides bool
+		if err := pool.QueryRow(ctx, `
+			SELECT has_column_privilege(c.oid, 'id', 'SELECT'),
+			       c.relrowsecurity
+			       AND NOT (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname = current_user)
+			       AND NOT EXISTS (
+			         SELECT 1 FROM pg_policy p
+			          WHERE p.polrelid = c.oid AND p.polpermissive AND p.polcmd IN ('r', '*')
+			            AND (p.polroles = '{0}' OR
+			                 (SELECT oid FROM pg_roles WHERE rolname = current_user) = ANY (p.polroles)))
+			  FROM pg_class c WHERE c.oid = to_regclass($1)`,
+			cfg.SessionsTable).Scan(&readable, &rlsHides); err != nil || !readable {
 			return nil, fmt.Errorf("validate: SLUICE_REVOCATION_SESSION_LOOKUP=true needs the pool role "+
 				"to read the id column of %s: GRANT SELECT (id) ON %s TO <authz role>",
 				cfg.SessionsTable, cfg.SessionsTable)
+		}
+		if rlsHides {
+			warn(server.Diagnostic{Code: "session_lookup_rls", Severity: "high",
+				Relation: cfg.SessionsTable,
+				Reason: "row-level security is enabled on " + cfg.SessionsTable +
+					", the pool role does not bypass it, and no SELECT policy applies to it",
+				Impact: "the lookup sees no session, so every token with one is refused",
+				Remedy: "CREATE POLICY sluice_session_lookup ON " + cfg.SessionsTable +
+					" FOR SELECT TO <authz role> USING (true);"})
 		}
 	}
 
@@ -227,9 +245,14 @@ func validateIssuerPrivileges(ctx context.Context, pool *pgxpool.Pool, cfg *conf
 		return fmt.Errorf("validate: read BYPASSRLS for current_user: %w", err)
 	}
 
+	// The revocation tables are published only for their changes; the slot
+	// delivers those without any privilege, and nothing subscribes to them. The
+	// session lookup's own grant is checked separately.
 	rows, err := pool.Query(ctx, published+`
 		SELECT pub.nspname || '.' || pub.relname, pub.relrowsecurity, has_table_privilege(pub.oid, 'SELECT')
-		  FROM pub`, cfg.Publication)
+		  FROM pub
+		 WHERE pub.nspname || '.' || pub.relname <> ALL(coalesce($2::text[], '{}'))`,
+		cfg.Publication, cfg.RevocationTables())
 	if err != nil {
 		return fmt.Errorf("validate: inspect issuer table privileges: %w", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,6 +164,45 @@ func TestTruncateOfHoldTableCutsShape(t *testing.T) {
 	if e, ok := evs[0].Data.(event.Error); !ok || e.Code != "shape_not_authorized" || !strings.Contains(e.Message, "truncated") {
 		t.Fatalf("event = %+v, want shape_not_authorized naming the truncate", evs[0].Data)
 	}
+}
+
+// A table published only for revocation is refused as a shape, before any
+// oracle is asked: the pool role need not be able to read it.
+func TestShapeOnRevocationTableIsRefused(t *testing.T) {
+	orc := &countingOracle{slowOracle: slowOracle{stubOracle: stubOracle{name: oracle.NameIssuer}}}
+	s := testServer(t, orc)
+	sessions := docsRel()
+	sessions.OID, sessions.Schema, sessions.Name = 400, "identity", "session"
+	s.cat.PutForTest(docsRel(), sessions)
+	s.cfg.RevocationEnabled = true
+	s.cfg.SessionsTable = "identity.session"
+	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
+	id := authz.Identity{Sub: "u1", Role: "authenticated"}
+	st := s.hub.Open("n1.revocation-table", id)
+
+	results := s.applySubscriptions(context.Background(), st, id, []subSpec{
+		{Sub: "sessions", Shape: &shapeSpec{Schema: "identity", Table: "session", Filter: "project_id=eq.42"}},
+		{Sub: "docs", Shape: &shapeSpec{Table: "documents", Filter: "project_id=eq.42"}},
+	}, nil)
+	if r := results[0]; r.OK || r.Error == nil || r.Error.Code != "shape_not_authorized" {
+		t.Fatalf("shape on the sessions table = %+v, want shape_not_authorized", r)
+	}
+	if !results[1].OK {
+		t.Fatalf("other shapes are unaffected: %+v", results[1].Error)
+	}
+	if n := orc.asked.Load(); n != 1 {
+		t.Fatalf("the oracle was asked about %d shapes, want only the documents one", n)
+	}
+}
+
+type countingOracle struct {
+	slowOracle
+	asked atomic.Int32
+}
+
+func (o *countingOracle) Resolve(ctx context.Context, req oracle.Request) (*oracle.Grant, error) {
+	o.asked.Add(1)
+	return o.slowOracle.Resolve(ctx, req)
 }
 
 // With the lookup on, a token whose session row is gone cannot open a stream,

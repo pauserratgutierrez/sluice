@@ -19,6 +19,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 - `POST /token` in issuer mode drops a shape the issuer gives no verdict on with `issuer_unavailable` (it was `shape_not_authorized`), and counts it in `revoked_subscriptions`. A new token never keeps a grant made for the previous one.
 - The resume buffer grows with each table's traffic up to `SLUICE_RING_EVENTS`, instead of reserving every slot on the first change, and is bounded in bytes by `SLUICE_RING_MAX_BYTES` across every table, evicting the oldest change first.
 - The replication slot is created by the process that takes the reader lock, after taking it; a process standing by no longer creates it.
+- With `SLUICE_REVOCATION_ENABLED=true`, the revocation tables (`SLUICE_REVOCATION_SESSIONS_TABLE`, `SLUICE_REVOCATION_USERS_TABLE`) are exempt from issuer mode's startup check for `SELECT` on every published table: they are published only for their changes. A shape on one of them is refused with `shape_not_authorized`.
 - SDK: a subscription refused with a retryable error stays registered and is asked for again after `retry_after_ms`. A subscription error with `retry_after_ms` means the server removed it and the client subscribes again. The client no longer forgets a position on `resume_too_old`.
 - Harness: the Sluice containers' healthcheck is `-readycheck`.
 
@@ -45,7 +46,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ### For operators
 
-- With `SLUICE_REVOCATION_SESSION_LOOKUP=true`: `GRANT SELECT (id) ON <sessions table> TO <authz role>;`. Startup refuses without it. The `id` column must be `uuid` or text holding lowercase ids.
+- With `SLUICE_REVOCATION_SESSION_LOOKUP=true`: `GRANT SELECT (id) ON <sessions table> TO <authz role>;`. Startup refuses without it. No table `SELECT` is needed, in issuer mode either. The `id` column must be `uuid` or text holding lowercase ids. If the table has row-level security and the role does not bypass it, add a `SELECT` policy for the role; startup warns (`session_lookup_rls`) when none applies.
 - Health: use `sluice -readycheck` (`/readyz`) for a single-process deployment. Docker Compose does not restart unhealthy containers; Sluice exits on its own when its slot is gone, and needs a restart policy.
 - An invalidated slot now stops the process at startup until it is dropped, or until `SLUICE_SLOT_RECREATE=true` replaces it.
 - Size `SLUICE_MAX_STREAMS` to the memory limit (about 8 000 five-shape streams in 512 MB, measured with 0.4.0).

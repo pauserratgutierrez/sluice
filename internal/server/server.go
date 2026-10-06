@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -672,6 +673,13 @@ func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSp
 		p.res.Error = &event.Error{Code: "relation_not_published", Message: fmt.Sprintf(
 			"%s.%s is not in publication %q; add it with: ALTER PUBLICATION %s ADD TABLE %s.%s",
 			schema, sp.Table, s.cfg.Publication, s.cfg.Publication, schema, sp.Table)}
+		return p
+	}
+	// Published for revocation only: the pool role need not be able to read it,
+	// and session rows are not for streaming.
+	if slices.Contains(s.cfg.RevocationTables(), rel.FullName()) {
+		p.res.Error = &event.Error{Code: "shape_not_authorized", Message: fmt.Sprintf(
+			"%s is published for session revocation, not for subscriptions", rel.FullName())}
 		return p
 	}
 

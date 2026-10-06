@@ -169,6 +169,33 @@ func main() {
 		"a 503 from the issuer refuses the shape with a retryable issuer_unavailable after its Retry-After",
 		truncate(downRes, 240))
 
+	fmt.Println("\n-- the revocation table is not a shape --")
+	sessRes, err := subscribe(ctx, aliceTok, stream.id, compactJSON(`{
+		"sub":"sessions","shape":{"schema":"auth","table":"sessions","filter":"id=eq.00000000-0000-0000-0000-000000000000"}}`))
+	must(err, "subscribe to auth.sessions")
+	check(strings.Contains(sessRes, `"code":"shape_not_authorized"`) && strings.Contains(sessRes, "session revocation"),
+		"a shape on the table published for revocation is refused",
+		truncate(sessRes, 240))
+
+	fmt.Println("\n-- session revocation with only SELECT (id) on the sessions table --")
+	carolTok, carolID, err := signUp(ctx, fmt.Sprintf("issuer-carol-%d@example.test", time.Now().UnixNano()),
+		"sluice-issuer-smoke-3")
+	must(err, "sign up Carol through GoTrue")
+	carol, err := openStream(ctx, carolTok, `{"subscriptions":[]}`)
+	must(err, "open Carol's stream: the lookup finds her session")
+	if _, err := carol.next(15 * time.Second); err != nil {
+		fatal("Carol's ready event: %v", err)
+	}
+	mustExec(ctx, fmt.Sprintf(`delete from auth.sessions where user_id = '%s'`, carolID))
+	_, revoked := carol.waitFor(8*time.Second, func(e sseEvent) bool {
+		return e.Name == "error" && strings.Contains(string(e.Data), "session_revoked")
+	})
+	carol.Close()
+	check(revoked, "signing out closes the stream with session_revoked", "no session_revoked within 8s")
+	_, err = openStream(ctx, carolTok, `{"subscriptions":[]}`)
+	check(err != nil && strings.Contains(err.Error(), "401"),
+		"the signed-out token can no longer open a stream", fmt.Sprint(err))
+
 	fmt.Println("\n-- stub does not receive access_token --")
 	saw, n, err := stubSawAccessToken(ctx)
 	must(err, "read issuer-stub /debug")

@@ -188,3 +188,19 @@ func TestValidateSessionLookupNeedsRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRevocationTables(t *testing.T) {
+	c := baseValid()
+	c.SessionsTable = "identity.session"
+	if got := c.RevocationTables(); len(got) != 0 {
+		t.Fatalf("without revocation no table is revocation-only, got %v", got)
+	}
+	c.RevocationEnabled = true
+	if got := c.RevocationTables(); len(got) != 1 || got[0] != "identity.session" {
+		t.Fatalf("got %v, want the sessions table", got)
+	}
+	c.UsersTable = "auth.users"
+	if got := c.RevocationTables(); len(got) != 2 || got[1] != "auth.users" {
+		t.Fatalf("got %v, want the sessions and users tables", got)
+	}
+}
