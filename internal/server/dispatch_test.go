@@ -74,7 +74,7 @@ func changesOf(st *hub.Stream) []event.Change {
 func deliverUpdate(t *testing.T, transitions bool, columns []string) []event.Change {
 	t.Helper()
 	s := testServer(t, stubOracle{name: oracle.NameRLS})
-	st := s.hub.Open("n1.1", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.1", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	rel := docsRel()
 	f, err := shape.Parse("project_id=eq.42", rel)
 	if err != nil {
@@ -147,7 +147,7 @@ func TestProjectionIsSharedAcrossSubscribers(t *testing.T) {
 	ops, _ := shape.ParseOps(nil)
 	var streams []*hub.Stream
 	for i, cols := range [][]string{{"id", "title"}, {"id", "title"}, {"id"}} {
-		st := s.hub.Open(fmt.Sprintf("n1.%d", i), authz.Identity{Sub: "u1", Role: "authenticated"})
+		st := s.hub.Open(fmt.Sprintf("n1.%d", i), "", authz.Identity{Sub: "u1", Role: "authenticated"})
 		streams = append(streams, st)
 		if !s.reg.Add(&registry.Subscription{
 			Label: "docs", Sink: st, Relation: rel, Ops: ops, Filter: f, Columns: cols,

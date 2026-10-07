@@ -14,6 +14,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
+	"github.com/pauserratgutierrez/sluice/internal/requestid"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
@@ -25,7 +26,7 @@ func TestResumeIsDecidedInTheResult(t *testing.T) {
 	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 	s.hub.Rings().SetStart(0x100)
 	id := authz.Identity{Sub: "u1", Role: "authenticated"}
-	st := s.hub.Open("n1.resume", id)
+	st := s.hub.Open("n1.resume", "", id)
 
 	shapeOn := func(sub string) subSpec {
 		return subSpec{Sub: sub, Shape: &shapeSpec{Table: "documents", Filter: "project_id=eq.42"}}
@@ -84,7 +85,7 @@ func TestSubscribeIssuerUnavailableIsRetryable(t *testing.T) {
 		s.cat.PutForTest(docsRel())
 		s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 		id := authz.Identity{Sub: "u1", Role: "authenticated"}
-		st := s.hub.Open("n1.unavailable", id)
+		st := s.hub.Open("n1.unavailable", "", id)
 		res := s.applySubscriptions(context.Background(), st, id, []subSpec{{Sub: "docs",
 			Shape: &shapeSpec{Table: "documents", Filter: "project_id=eq.42"}}}, nil)[0]
 
@@ -119,12 +120,16 @@ func TestTokenIssuerUnavailableDropsShapeRetryably(t *testing.T) {
 		err:        &oracle.ErrUnavailable{Reason: "shape issuer unreachable", RetryAfter: 2 * time.Second},
 	}
 	s := testServer(t, orc)
-	st := s.hub.Open("n1.token-down", authz.Identity{Sub: "u1", Role: "authenticated"})
+	logs := logTo(s)
+	st := s.hub.Open("n1.token-down", "gw-open", authz.Identity{Sub: "u1", Role: "authenticated"})
 	sub := issuerLiveSub(t, s, st, f, []string{"id", "project_id"}, holdF)
 
-	if got := s.refreshIssuerShape(context.Background(), st, sub, st.Identity()); got != "unavailable" {
+	ctx := requestid.With(context.Background(), requestid.ID{Header: "X-Request-ID", Value: "gw-token"})
+	if got := s.refreshIssuerShape(ctx, st, sub, st.Identity()); got != "unavailable" {
 		t.Fatalf("outcome = %q, want unavailable", got)
 	}
+	logs.one(t, "subscription revoked", map[string]string{"level": "WARN", "request_id": "gw-token",
+		"stream_request_id": "gw-open", "sub": "docs", "table": "public.documents", "code": "issuer_unavailable"})
 	if s.reg.Get(st.StreamID(), "docs") != nil || s.holds.Count() != 0 {
 		t.Fatal("the shape and its hold must be dropped")
 	}
@@ -145,7 +150,7 @@ func TestTokenIssuerUnavailableDropsShapeRetryably(t *testing.T) {
 // shape held by a row of the truncated table.
 func TestTruncateOfHoldTableCutsShape(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.truncate", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.truncate", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	liveDocsHold(t, s, st, membersRel())
 
 	s.OnTruncate([]uint32{docsRel().OID})
@@ -178,7 +183,7 @@ func TestShapeOnRevocationTableIsRefused(t *testing.T) {
 	s.cfg.SessionsTable = "identity.session"
 	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 	id := authz.Identity{Sub: "u1", Role: "authenticated"}
-	st := s.hub.Open("n1.revocation-table", id)
+	st := s.hub.Open("n1.revocation-table", "", id)
 
 	results := s.applySubscriptions(context.Background(), st, id, []subSpec{
 		{Sub: "sessions", Shape: &shapeSpec{Schema: "identity", Table: "session", Filter: "project_id=eq.42"}},

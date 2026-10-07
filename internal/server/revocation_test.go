@@ -61,7 +61,7 @@ func updateUser(t *testing.T, s *Server, users *pgoutput.Relation, bannedUntil t
 func TestExpiredBanIsNotABan(t *testing.T) {
 	s, users := revocationServer(t)
 	id := authz.Identity{Sub: bannedUser, Role: "authenticated"}
-	st := s.hub.Open("n1.1", id)
+	st := s.hub.Open("n1.1", "", id)
 
 	updateUser(t, s, users, time.Now().Add(-time.Hour))
 
@@ -76,7 +76,7 @@ func TestExpiredBanIsNotABan(t *testing.T) {
 func TestBanLastsUntilItIsLifted(t *testing.T) {
 	s, users := revocationServer(t)
 	id := authz.Identity{Sub: bannedUser, Role: "authenticated"}
-	st := s.hub.Open("n1.1", id)
+	st := s.hub.Open("n1.1", "", id)
 
 	updateUser(t, s, users, time.Now().Add(time.Hour))
 	if code := st.CloseCode(); code != "user_banned" {
@@ -181,7 +181,7 @@ func TestSessionRevocationBySidClaim(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return s.hub.Open("n1."+sid, id), tok
+		return s.hub.Open("n1."+sid, "", id), tok
 	}
 	gone, tok := open(signedOut)
 	kept, _ := open(other)

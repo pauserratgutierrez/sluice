@@ -43,6 +43,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/reader"
 	"github.com/pauserratgutierrez/sluice/internal/registry"
+	"github.com/pauserratgutierrez/sluice/internal/requestid"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 	"github.com/pauserratgutierrez/sluice/internal/timer"
 )
@@ -77,6 +78,9 @@ type Server struct {
 	refreshAt atomic.Int64
 	// draining is set once shutdown begins; see Drain.
 	draining atomic.Bool
+	// shutdownCause says why the process is stopping when that is not a
+	// signal; see DrainFor.
+	shutdownCause atomic.Pointer[string]
 	// authzVer is the catalog.AuthzVersion the live decisions were resolved
 	// against. See RefreshLeases.
 	authzVer atomic.Uint64
@@ -186,7 +190,7 @@ func (s *Server) Handler() http.Handler {
 			"error": "not_found", "message": "no such endpoint",
 		})
 	})
-	return mux
+	return s.withRequestID(mux)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +239,10 @@ type subResult struct {
 	// shape's table: true when every change since it is being replayed, false
 	// when the buffer does not reach back that far.
 	Resumed *bool `json:"resumed,omitempty"`
+
+	// warn marks a refusal that is not the caller's doing (an issuer or hook
+	// that gave no verdict, a node-wide limit), so it is logged as a warning.
+	warn bool
 }
 
 // ---------------------------------------------------------------------------
@@ -244,16 +252,16 @@ type subResult struct {
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	if s.draining.Load() {
-		writeErr(w, http.StatusServiceUnavailable, "server_shutdown",
+		s.refuse(w, r, http.StatusServiceUnavailable, "server_shutdown",
 			"this node is shutting down; reconnect to another or retry shortly")
 		return
 	}
 	if s.hub.Count() >= s.cfg.MaxStreams {
-		writeErr(w, http.StatusServiceUnavailable, "too_many_streams",
+		s.refuse(w, r, http.StatusServiceUnavailable, "too_many_streams",
 			"this node is at its configured stream limit")
 		return
 	}
@@ -266,7 +274,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	var req streamReq
 	if r.Body != nil {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 			return
 		}
 	}
@@ -275,20 +283,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// must reach that process.
 	streamID := fmt.Sprintf("%s.%d-%d", s.cfg.NodeID, time.Now().UnixNano(), s.streamSeq.Add(1))
 
-	st := s.hub.Open(streamID, id)
+	st := s.hub.Open(streamID, requestid.From(r.Context()).Value, id)
 	if s.draining.Load() {
 		// Drain may have listed the open streams before this one was added.
 		st.CloseWith("server_shutdown")
 	}
 	metrics.Streams.Set(float64(s.hub.Count()))
+	var writeFailure error
 	defer func() {
 		s.holds.RemoveStream(streamID)
 		for _, sub := range s.reg.RemoveStream(streamID) {
 			s.decSubMetric(sub)
 		}
 		s.hub.Close(streamID, cmp.Or(st.CloseCode(), "client_closed"))
-		metrics.StreamClosed.WithLabelValues(cmp.Or(st.CloseCode(), "client_closed")).Inc()
+		code := cmp.Or(st.CloseCode(), "client_closed")
+		metrics.StreamClosed.WithLabelValues(code).Inc()
 		metrics.Streams.Set(float64(s.hub.Count()))
+		// A client going away is how a stream normally ends. Any other ending
+		// is logged under the ID of the request that opened the stream.
+		if code != "client_closed" {
+			s.logStreamEnd(r.Context(), st, code, writeFailure)
+		}
 	}()
 
 	// SSE headers. X-Accel-Buffering: no stops nginx-style proxies from
@@ -335,6 +350,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-st.Ready():
 			batch = st.Take(batch)
 			if err := s.writeEvents(w, rc, batch); err != nil {
+				writeFailure = err
 				st.CloseWith("write_failed")
 				return
 			}
@@ -398,6 +414,14 @@ func (s *Server) Drain() {
 	for _, st := range s.hub.Streams() {
 		st.CloseWith("server_shutdown")
 	}
+}
+
+// DrainFor is Drain when the process stops for a reason other than a signal.
+// Clients still get server_shutdown; the cause is in the line logged for each
+// stream.
+func (s *Server) DrainFor(cause string) {
+	s.shutdownCause.Store(&cause)
+	s.Drain()
 }
 
 // tick runs once per heartbeat period per stream, off the writer goroutine.
@@ -475,12 +499,12 @@ func writeFrame(w io.Writer, ev event.Event) error {
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	var req subscribeReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	st, ok := s.resolveStream(w, r, req.StreamID, id)
@@ -488,7 +512,7 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !st.Allow("subscribe", s.cfg.SubscribeRate, time.Second) {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+		s.refuseStream(w, r, st, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
 			"this stream may issue at most %d subscribe requests per second", s.cfg.SubscribeRate))
 		return
 	}
@@ -518,7 +542,7 @@ func (s *Server) liveFrom() string {
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	var req struct {
@@ -526,7 +550,7 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		Subs     []string `json:"subs"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	st, ok := s.resolveStream(w, r, req.StreamID, id)
@@ -601,7 +625,7 @@ func (s *Server) applySubscriptions(
 				shapes++
 			}
 		case spec.Channel != "":
-			res := s.subscribeChannel(st, id, spec)
+			res := s.subscribeChannel(ctx, st, id, spec)
 			out = append(out, res)
 			if res.OK {
 				existing++
@@ -611,6 +635,7 @@ func (s *Server) applySubscriptions(
 				Code: "invalid_subscription", Message: "provide either `shape` or `channel`"}})
 		}
 	}
+	s.logRefusals(ctx, st, specs, out)
 	return out
 }
 
@@ -704,6 +729,7 @@ func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSp
 
 	if s.oracle == nil {
 		p.res.Error = &event.Error{Code: "internal", Message: "shape oracle is not configured"}
+		p.res.warn = true
 		return p
 	}
 
@@ -842,6 +868,7 @@ func (s *Server) subscribeShape(
 			"this node already has %d unindexed subscriptions, the configured maximum; "+
 				"filter on an indexed column with an equality, or index the filtered column",
 			s.cfg.UnindexedMax)}
+		res.warn = true
 		return res
 	}
 
@@ -949,7 +976,7 @@ func (s *Server) replay(sub *registry.Subscription, entries []hub.RingEntry) {
 	}
 }
 
-func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpec) subResult {
+func (s *Server) subscribeChannel(ctx context.Context, st *hub.Stream, id authz.Identity, spec subSpec) subResult {
 	res := subResult{Sub: spec.Sub}
 	ch, ok := s.cfg.Channel(spec.Channel)
 	if !ok {
@@ -970,9 +997,13 @@ func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpe
 			return res
 		}
 	case config.ChannelHook:
-		v := s.hooks.Authorize(s.ctx, ch, id, spec.Channel, false)
+		// Asked under the server's context, not the request's: the verdict is
+		// cached for the session, so the caller going away must not leave a
+		// failed one behind. The call still carries the request's ID.
+		v := s.hooks.Authorize(requestid.With(s.ctx, requestid.From(ctx)), ch, id, spec.Channel, false)
 		if !v.allowed() {
 			res.Error = &event.Error{Code: "channel_not_authorized", Message: v.reason}
+			res.warn = v.outcome == hookUnavailable
 			return res
 		}
 		recheckAt = v.expires
@@ -999,7 +1030,7 @@ func (s *Server) subscribeChannel(st *hub.Stream, id authz.Identity, spec subSpe
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	var req struct {
@@ -1010,11 +1041,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		Self     bool            `json:"self"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, int64(s.cfg.MaxPayloadBytes)+4096)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	if len(req.Payload) > s.cfg.MaxPayloadBytes {
-		writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf(
+		s.refuse(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf(
 			"payload is %d bytes, limit is %d", len(req.Payload), s.cfg.MaxPayloadBytes))
 		return
 	}
@@ -1025,13 +1056,14 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if _, subscribed := st.ChannelLabel(req.Channel); !subscribed {
 		// Publishing to a channel you have not joined would bypass the subscribe-time
 		// authorization check, so it is refused rather than re-checked here.
-		writeErr(w, http.StatusForbidden, "channel_not_subscribed",
-			"subscribe to a channel before publishing to it")
+		s.refuseStream(w, r, st, http.StatusForbidden, "channel_not_subscribed",
+			"subscribe to a channel before publishing to it", "channel", truncate(req.Channel, maxLogged))
 		return
 	}
 	if !st.Allow("publish", s.cfg.PublishRate, time.Second) {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
-			"this stream may publish at most %d messages per second", s.cfg.PublishRate))
+		s.refuseStream(w, r, st, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may publish at most %d messages per second", s.cfg.PublishRate),
+			"channel", truncate(req.Channel, maxLogged))
 		return
 	}
 	n := s.hub.PublishBroadcast(req.Channel, cmp.Or(req.Event, "message"),
@@ -1052,7 +1084,7 @@ func namespaceOf(channel string) string {
 func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	var req struct {
@@ -1063,43 +1095,45 @@ func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
 		Meta     json.RawMessage `json:"meta"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	st, ok := s.resolveStream(w, r, req.StreamID, id)
 	if !ok {
 		return
 	}
+	channel := truncate(req.Channel, maxLogged)
 	if _, subscribed := st.ChannelLabel(req.Channel); !subscribed {
-		writeErr(w, http.StatusForbidden, "channel_not_subscribed",
-			"subscribe to a channel before tracking presence on it")
+		s.refuseStream(w, r, st, http.StatusForbidden, "channel_not_subscribed",
+			"subscribe to a channel before tracking presence on it", "channel", channel)
 		return
 	}
 	// A presence key is the caller's subject, so a roster can only ever list
 	// identities the JWT proves. A token without a subject has nothing to track.
 	if id.Sub == "" || cmp.Or(req.Key, id.Sub) != id.Sub {
-		writeErr(w, http.StatusForbidden, "presence_key_not_allowed",
-			"presence requires a token with a sub, and the key must equal it")
+		s.refuseStream(w, r, st, http.StatusForbidden, "presence_key_not_allowed",
+			"presence requires a token with a sub, and the key must equal it", "channel", channel)
 		return
 	}
 	key := id.Sub
 	if !st.Allow("presence", s.cfg.PresenceRate, s.cfg.PresenceWindow) {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
-			"this stream may send at most %d presence updates per %s", s.cfg.PresenceRate, s.cfg.PresenceWindow))
+		s.refuseStream(w, r, st, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf(
+			"this stream may send at most %d presence updates per %s", s.cfg.PresenceRate, s.cfg.PresenceWindow),
+			"channel", channel)
 		return
 	}
 
 	switch req.Action {
 	case "track", "update", "":
 		if _, ok := s.hub.Presence().Track(req.Channel, key, st.StreamID(), req.Meta, s.cfg.PresenceMaxKeys); !ok {
-			writeErr(w, http.StatusTooManyRequests, "presence_too_many_keys", fmt.Sprintf(
-				"channel %q is at its %d-key limit", req.Channel, s.cfg.PresenceMaxKeys))
+			s.refuseStream(w, r, st, http.StatusTooManyRequests, "presence_too_many_keys", fmt.Sprintf(
+				"channel %q is at its %d-key limit", req.Channel, s.cfg.PresenceMaxKeys), "channel", channel)
 			return
 		}
 	case "untrack":
 		s.hub.Presence().UntrackKey(req.Channel, key, st.StreamID())
 	default:
-		writeErr(w, http.StatusBadRequest, "bad_request", "action must be track, update or untrack")
+		s.refuseStream(w, r, st, http.StatusBadRequest, "bad_request", "action must be track, update or untrack")
 		return
 	}
 	metrics.PresenceUpdates.WithLabelValues(namespaceOf(req.Channel), cmp.Or(req.Action, "track")).Inc()
@@ -1114,12 +1148,12 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	newID, err := s.verifyToken(r.Context(), "Bearer "+req.AccessToken)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	if !s.checkSession(w, r, newID) {
@@ -1127,12 +1161,13 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 	st, ok := s.hub.Get(req.StreamID)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "unknown_stream", "no such stream on this node")
+		s.refuse(w, r, http.StatusNotFound, "unknown_stream", "no such stream on this node",
+			"stream_id", truncate(req.StreamID, maxLogged))
 		return
 	}
 	// A stream may not change identity mid-flight.
 	if cur := st.Identity(); cur.Sub != "" && cur.Sub != newID.Sub {
-		writeErr(w, http.StatusForbidden, "subject_mismatch",
+		s.refuseStream(w, r, st, http.StatusForbidden, "subject_mismatch",
 			"the refreshed token names a different subject")
 		return
 	}
@@ -1152,7 +1187,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		held, err := s.oracle.LeaseTick(r.Context(), sub.Decision, sub.Relation, newID, eqs)
 		if err != nil || !held {
 			metrics.AuthzLeaseRefreshes.WithLabelValues("revoked").Inc()
-			s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
+			s.revokeShape(r.Context(), st, sub.Label, false, event.Error{Code: "shape_not_authorized",
 				Message: "the refreshed token no longer grants access to this shape"})
 			revoked++
 			continue
@@ -1166,13 +1201,13 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleJWKSRefresh(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil || id.Role != "service_role" {
-		writeErr(w, http.StatusForbidden, "forbidden", "service_role required")
+		s.refuse(w, r, http.StatusForbidden, "forbidden", "service_role required")
 		return
 	}
 	if err := s.verify.Refresh(r.Context()); err != nil {
 		var warn *auth.WarnSymmetricKey
 		if !errors.As(err, &warn) {
-			writeErr(w, http.StatusBadGateway, "jwks_refresh_failed", err.Error())
+			s.refuse(w, r, http.StatusBadGateway, "jwks_refresh_failed", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warning": warn.Error()})
@@ -1347,24 +1382,25 @@ func (s *Server) verifyToken(ctx context.Context, bearer string) (authz.Identity
 func (s *Server) resolveStream(w http.ResponseWriter, r *http.Request, bodyID string, id authz.Identity) (*hub.Stream, bool) {
 	headerID := r.Header.Get("Sluice-Stream-Id")
 	if headerID != "" && bodyID != "" && headerID != bodyID {
-		writeErr(w, http.StatusBadRequest, "stream_id_mismatch",
+		s.refuse(w, r, http.StatusBadRequest, "stream_id_mismatch",
 			"Sluice-Stream-Id does not match the stream_id in the body")
 		return nil, false
 	}
 	streamID := cmp.Or(bodyID, headerID)
 	if streamID == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "stream_id is required")
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", "stream_id is required")
 		return nil, false
 	}
 	st, ok := s.hub.Get(streamID)
 	if !ok {
 		// In a multi-node deployment this is where the request would be forwarded
 		// to the owning node, using the node prefix in the stream id.
-		writeErr(w, http.StatusNotFound, "unknown_stream", "no such stream on this node")
+		s.refuse(w, r, http.StatusNotFound, "unknown_stream", "no such stream on this node",
+			"stream_id", truncate(streamID, maxLogged))
 		return nil, false
 	}
 	if cur := st.Identity(); cur.Sub != id.Sub || cur.Role != id.Role {
-		writeErr(w, http.StatusForbidden, "forbidden", "this token does not own that stream")
+		s.refuseStream(w, r, st, http.StatusForbidden, "forbidden", "this token does not own that stream")
 		return nil, false
 	}
 	return st, true
@@ -1447,11 +1483,13 @@ func (s *Server) mapOracleErr(res *subResult, err error) {
 		metrics.AuthzResolutions.WithLabelValues("-", "unavailable").Inc()
 		e := issuerUnavailable(unavailable)
 		res.Error = &e
+		res.warn = true
 	case errors.As(err, &tierC):
 		metrics.AuthzResolutions.WithLabelValues("C", "refused").Inc()
 		res.Error = &event.Error{Code: "policy_requires_impersonation", Message: tierC.Reason}
 	default:
 		res.Error = &event.Error{Code: "internal", Message: err.Error()}
+		res.warn = true
 	}
 }
 
@@ -1492,11 +1530,11 @@ func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *re
 	})
 	var unavailable *oracle.ErrUnavailable
 	if errors.As(err, &unavailable) {
-		s.dropShape(st, sub.Label, issuerUnavailable(unavailable))
+		s.revokeShape(ctx, st, sub.Label, true, issuerUnavailable(unavailable))
 		return "unavailable"
 	}
 	if err != nil || grant == nil {
-		s.dropShape(st, sub.Label, event.Error{Code: "shape_not_authorized",
+		s.revokeShape(ctx, st, sub.Label, false, event.Error{Code: "shape_not_authorized",
 			Message: "the refreshed token no longer grants access to this shape"})
 		return "revoked"
 	}
@@ -1512,7 +1550,7 @@ func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *re
 // cut during the issuer round-trip is not resurrected.
 func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label string, grant *oracle.Grant) bool {
 	if grant == nil || grant.Filter == nil || len(grant.Columns) == 0 || len(grant.Holds) == 0 {
-		s.dropShape(st, label, event.Error{Code: "shape_not_authorized",
+		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized",
 			Message: "the refreshed token no longer grants access to this shape"})
 		return false
 	}
@@ -1522,7 +1560,7 @@ func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label str
 	}
 	s.holds.Replace(st.StreamID(), label, grant.Holds)
 	if err := s.verifyHolds(ctx, grant.Holds); err != nil {
-		s.dropShape(st, label, event.Error{Code: "shape_not_authorized", Message: err.Error()})
+		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
 		return false
 	}
 	live := s.reg.Get(st.StreamID(), label)
@@ -1607,6 +1645,17 @@ func (s *Server) dropShape(st *hub.Stream, label string, err event.Error) {
 	hub.SendError(st, err)
 }
 
+// revokeShape drops a shape that a request's re-check no longer allows, and
+// logs it. warn is set when no verdict was given.
+func (s *Server) revokeShape(ctx context.Context, st *hub.Stream, label string, warn bool, err event.Error) {
+	spec := subSpec{Sub: label}
+	if sub := s.reg.Get(st.StreamID(), label); sub != nil {
+		spec.Shape = &shapeSpec{Schema: sub.Relation.Schema, Table: sub.Relation.Name}
+	}
+	s.dropShape(st, label, err)
+	s.logSub(ctx, "subscription revoked", st, spec, warn, err)
+}
+
 func (s *Server) authorizeAdmin(r *http.Request) bool {
 	header := r.Header.Get("Authorization")
 	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
@@ -1622,7 +1671,7 @@ func (s *Server) authorizeAdmin(r *http.Request) bool {
 // matches. It is not the hot path.
 func (s *Server) handleAdminShapesDrop(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeAdmin(r) {
-		writeErr(w, http.StatusForbidden, "forbidden", "service_role or the issuer bearer is required")
+		s.refuse(w, r, http.StatusForbidden, "forbidden", "service_role or the issuer bearer is required")
 		return
 	}
 	var req struct {
@@ -1635,12 +1684,12 @@ func (s *Server) handleAdminShapesDrop(w http.ResponseWriter, r *http.Request) {
 		Equalities map[string]string `json:"equalities"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	schema := cmp.Or(req.Schema, "public")
 	if req.Table == "" || len(req.Equalities) == 0 {
-		writeErr(w, http.StatusBadRequest, "bad_request", "table and equalities are required")
+		s.refuse(w, r, http.StatusBadRequest, "bad_request", "table and equalities are required")
 		return
 	}
 	dropped := 0

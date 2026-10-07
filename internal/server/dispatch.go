@@ -229,7 +229,7 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	// Session revocation rides the same slot, so a sign-out reaches Sluice in
 	// milliseconds with no polling and no extra query.
 	if s.cfg.RevocationEnabled {
-		s.handleRevocation(m, rel, op)
+		s.handleRevocation(m, rel, op, commitLSN)
 	}
 
 	start := time.Now()
@@ -598,7 +598,11 @@ func (s *Server) noteUnknown(rel *pgoutput.Relation, op string) {
 //
 // The relation is matched by OID, resolved once per Relation message, so the
 // per-change cost is an integer comparison rather than two string comparisons.
-func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, op string) {
+//
+// No request asked for a revocation, so its log line has no request ID: it
+// names the commit, and the session when there is one. Each stream it closes
+// logs its own line under the ID of the request that opened it.
+func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, op string, commitLSN uint64) {
 	switch rel.OID {
 	case s.sessionsOID.Load():
 		if op != "DELETE" {
@@ -606,7 +610,10 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 		}
 		if v, ok := (tupleRow{rel: rel, t: m.Old}).Column("id"); ok {
 			s.revoker.RevokeSession(v.String())
-			s.closeStreamsForSession(v.String())
+			if n := s.closeStreamsForSession(v.String()); n > 0 {
+				s.log.Info("session revoked; its streams were closed",
+					"session_id", strings.ToLower(v.String()), "streams", n, "commit_lsn", reader.FormatLSN(commitLSN))
+			}
 		}
 	case s.usersOID.Load():
 		if op != "UPDATE" {
@@ -627,7 +634,10 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 			return
 		}
 		s.revoker.BanUser(idv.String(), until)
-		s.closeStreamsForUser(idv.String())
+		if n := s.closeStreamsForUser(idv.String()); n > 0 {
+			s.log.Info("user banned; their streams were closed",
+				"streams", n, "commit_lsn", reader.FormatLSN(commitLSN))
+		}
 	}
 }
 
@@ -660,11 +670,13 @@ func banExpiry(v expr.Value, now time.Time) (time.Time, bool) {
 	}
 }
 
-func (s *Server) closeStreamsForSession(sessionID string) {
+// closeStreamsForSession closes the session's streams and returns how many.
+func (s *Server) closeStreamsForSession(sessionID string) int {
 	if sessionID == "" {
-		return
+		return 0
 	}
 	sessionID = strings.ToLower(sessionID)
+	n := 0
 	for _, st := range s.hub.Streams() {
 		if st.Identity().SessionID != sessionID {
 			continue
@@ -673,14 +685,18 @@ func (s *Server) closeStreamsForSession(sessionID string) {
 		hub.SendError(st, event.Error{Code: "session_revoked",
 			Message: "the session backing this stream was signed out"})
 		s.hub.Close(st.StreamID(), "session_revoked")
+		n++
 	}
+	return n
 }
 
-func (s *Server) closeStreamsForUser(userID string) {
+// closeStreamsForUser closes the user's streams and returns how many.
+func (s *Server) closeStreamsForUser(userID string) int {
 	userID = strings.ToLower(userID)
 	if userID == "" {
-		return
+		return 0
 	}
+	n := 0
 	for _, st := range s.hub.Streams() {
 		if strings.ToLower(st.Identity().Sub) != userID {
 			continue
@@ -689,7 +705,9 @@ func (s *Server) closeStreamsForUser(userID string) {
 		hub.SendError(st, event.Error{Code: "user_banned",
 			Message: "this user has been banned"})
 		s.hub.Close(st.StreamID(), "user_banned")
+		n++
 	}
+	return n
 }
 
 // project builds the emitted record from exactly the subscription's columns and

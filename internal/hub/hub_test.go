@@ -25,7 +25,7 @@ func TestBackpressurePolicyPerKind(t *testing.T) {
 		// A silently truncated change stream is worse than a closed one: the
 		// client would believe it has a complete view when it does not.
 		h := newHub(2)
-		s := h.Open("s", authz.Identity{})
+		s := h.Open("s", "", authz.Identity{})
 		for i := 0; i < 2; i++ {
 			if !s.Send(event.Event{Kind: event.KindChange}) {
 				t.Fatalf("send %d should fit in the queue", i)
@@ -43,7 +43,7 @@ func TestBackpressurePolicyPerKind(t *testing.T) {
 		// Broadcast is explicitly best-effort, so losing one must not take the
 		// change stream down with it.
 		h := newHub(1)
-		s := h.Open("s", authz.Identity{})
+		s := h.Open("s", "", authz.Identity{})
 		s.Send(event.Event{Kind: event.KindBroadcast})
 		if s.Send(event.Event{Kind: event.KindBroadcast}) {
 			t.Fatal("overflowing broadcast should be dropped")
@@ -57,7 +57,7 @@ func TestBackpressurePolicyPerKind(t *testing.T) {
 		// Making room by taking something off the queue would reorder it: a
 		// change put back at the tail would arrive after later changes.
 		h := newHub(2)
-		s := h.Open("s", authz.Identity{})
+		s := h.Open("s", "", authz.Identity{})
 		s.Send(event.Event{Kind: event.KindChange, Data: "first"})
 		s.Send(event.Event{Kind: event.KindChange, Data: "second"})
 		if s.Send(event.Event{Kind: event.KindPresence, Data: "presence"}) {
@@ -75,7 +75,7 @@ func TestBackpressurePolicyPerKind(t *testing.T) {
 
 func TestQueueHoldsNothingUntilUsed(t *testing.T) {
 	h := newHub(256)
-	s := h.Open("s", authz.Identity{})
+	s := h.Open("s", "", authz.Identity{})
 	if s.queue != nil {
 		t.Fatal("an idle stream must not hold a queue buffer")
 	}
@@ -100,7 +100,7 @@ func TestQueueHoldsNothingUntilUsed(t *testing.T) {
 // queue to live changes, which never wait.
 func TestBackfillWaitsForRoom(t *testing.T) {
 	h := newHub(4)
-	s := h.Open("s", authz.Identity{})
+	s := h.Open("s", "", authz.Identity{})
 	ctx := t.Context()
 
 	done := make(chan struct{})
@@ -139,7 +139,7 @@ func TestBackfillWaitsForRoom(t *testing.T) {
 
 func TestBackfillStopsWithTheStream(t *testing.T) {
 	h := newHub(2)
-	s := h.Open("s", authz.Identity{})
+	s := h.Open("s", "", authz.Identity{})
 	if !s.SendBackfill(t.Context(), event.Event{Kind: event.KindChange}) {
 		t.Fatal("the first backfill must fit")
 	}
@@ -161,7 +161,7 @@ func TestBackfillStopsWithTheStream(t *testing.T) {
 // channel's fan-out set, where it would stay forever.
 func TestJoinAfterCloseIsRefused(t *testing.T) {
 	h := newHub(4)
-	s := h.Open("s", authz.Identity{})
+	s := h.Open("s", "", authz.Identity{})
 	h.Close("s", "client_closed")
 	if h.JoinChannel("room:1", s, "r", time.Time{}) {
 		t.Fatal("joining a channel on a closed stream must fail")
@@ -173,7 +173,7 @@ func TestJoinAfterCloseIsRefused(t *testing.T) {
 
 func TestSendAfterCloseIsRejected(t *testing.T) {
 	h := newHub(4)
-	s := h.Open("s", authz.Identity{})
+	s := h.Open("s", "", authz.Identity{})
 	s.CloseWith("test")
 	if s.Send(event.Event{Kind: event.KindChange}) {
 		t.Fatal("a closed stream must not accept events")
@@ -187,8 +187,8 @@ func TestSendAfterCloseIsRejected(t *testing.T) {
 
 func TestChannelFanoutAndSelf(t *testing.T) {
 	h := newHub(8)
-	a := h.Open("a", authz.Identity{Sub: "ua"})
-	b := h.Open("b", authz.Identity{Sub: "ub"})
+	a := h.Open("a", "", authz.Identity{Sub: "ua"})
+	b := h.Open("b", "", authz.Identity{Sub: "ub"})
 	h.JoinChannel("room:1", a, "sub-a", time.Time{})
 	h.JoinChannel("room:1", b, "sub-b", time.Time{})
 
@@ -218,7 +218,7 @@ func TestChannelFanoutAndSelf(t *testing.T) {
 // newer join of the same channel alone.
 func TestChannelRecheckIsPerJoin(t *testing.T) {
 	h := newHub(8)
-	s := h.Open("a", authz.Identity{Sub: "ua"})
+	s := h.Open("a", "", authz.Identity{Sub: "ua"})
 	t0 := time.Now()
 	h.JoinChannel("chat:1", s, "old", t0)
 	if due := s.DueChannels(t0); len(due) != 1 || due[0].Label != "old" {
@@ -247,7 +247,7 @@ func TestCloseRemovesChannelAndPresence(t *testing.T) {
 	go h.Presence().Run()
 	defer h.Presence().Stop()
 
-	s := h.Open("s", authz.Identity{Sub: "u1"})
+	s := h.Open("s", "", authz.Identity{Sub: "u1"})
 	h.JoinChannel("room:1", s, "r", time.Time{})
 	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"n":1}`), 0)
 
@@ -272,7 +272,7 @@ func TestPresenceStateAndDiff(t *testing.T) {
 	go h.Presence().Run()
 	defer h.Presence().Stop()
 
-	s := h.Open("s", authz.Identity{Sub: "u1"})
+	s := h.Open("s", "", authz.Identity{Sub: "u1"})
 	h.JoinChannel("room:1", s, "r", time.Time{})
 
 	h.Presence().Track("room:1", "u1", "s", json.RawMessage(`{"name":"a"}`), 0)
@@ -486,7 +486,7 @@ func TestConcurrentStreamsAndBroadcast(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < n; i++ {
-		s := h.Open(fmt.Sprintf("s%d", i), authz.Identity{Sub: fmt.Sprintf("u%d", i)})
+		s := h.Open(fmt.Sprintf("s%d", i), "", authz.Identity{Sub: fmt.Sprintf("u%d", i)})
 		h.JoinChannel("room:1", s, "r", time.Time{})
 		wg.Add(1)
 		go func(s *Stream) {

@@ -94,16 +94,15 @@ func (s *Server) checkSession(w http.ResponseWriter, r *http.Request, id authz.I
 	}
 	ok, err := s.sessions.check(r.Context(), id.SessionID)
 	if err != nil {
-		s.log.Warn("session lookup failed", "err", err)
-		writeErr(w, http.StatusServiceUnavailable, "session_check_unavailable",
-			"the session behind this token could not be checked; retry shortly")
+		s.refuse(w, r, http.StatusServiceUnavailable, "session_check_unavailable",
+			"the session behind this token could not be checked; retry shortly", "err", err)
 		return false
 	}
 	if !ok {
 		if s.revoker != nil {
 			s.revoker.RevokeSession(id.SessionID)
 		}
-		writeErr(w, http.StatusUnauthorized, "unauthorized", errSessionRevoked.Error())
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", errSessionRevoked.Error())
 		return false
 	}
 	return true

@@ -83,8 +83,8 @@ var streamSeq atomic.Int32
 
 func joinChat(t *testing.T, s *Server, id authz.Identity) (*hub.Stream, subResult) {
 	t.Helper()
-	st := s.hub.Open("n1.hook-"+string(rune('a'+streamSeq.Add(1))), id)
-	return st, s.subscribeChannel(st, id, subSpec{Sub: "typing", Channel: chatChannel})
+	st := s.hub.Open("n1.hook-"+string(rune('a'+streamSeq.Add(1))), "", id)
+	return st, s.subscribeChannel(context.Background(), st, id, subSpec{Sub: "typing", Channel: chatChannel})
 }
 
 // events drains what a stream has been sent so far.

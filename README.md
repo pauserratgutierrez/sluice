@@ -120,7 +120,7 @@ Tier C evaluates the policy under the caller's role and claims against the WAL t
 
 ### Issuer oracle
 
-`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded). Redirects are not followed.
+`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded) and the client request's ID in `SLUICE_REQUEST_ID_HEADER` (see [Logs](#logs)). Redirects are not followed.
 
 Only an allow grants. `"allow": false`, a redirect or a `4xx` other than `408` and `429` denies, with `shape_not_authorized`. No verdict at all — unreachable, a timeout (`SLUICE_ISSUER_TIMEOUT`), a `5xx`, `408` or `429`, or an unreadable body — refuses the shape with `issuer_unavailable`, which is retryable: `retry_after_ms` is the issuer's `Retry-After` (seconds or an HTTP date, at most 60 s) or, without one, a delay spread between 1 and 5 s. The SDK asks again after it on its own.
 
@@ -350,7 +350,7 @@ A channel is `namespace:name`; the namespace is everything before the first `:`.
 | `owner` | a token whose `sub` the channel name ends with, after a `:` (`notify:<sub>`) |
 | `hook` | whoever your endpoint allows |
 
-**Hook.** Sluice POSTs `{ "action": "subscribe", "channel", "namespace", "role", "sub", "session_id", "claims" }` to the namespace's URL, with `Authorization: Bearer <SLUICE_CHANNEL_HOOK_BEARER>` when that variable is set. Redirects are not followed. The verdict is cached per URL, channel, role, sub and session, so while it is valid it also answers new joins by the same session, on any of its streams.
+**Hook.** Sluice POSTs `{ "action": "subscribe", "channel", "namespace", "role", "sub", "session_id", "claims" }` to the namespace's URL, with `Authorization: Bearer <SLUICE_CHANNEL_HOOK_BEARER>` when that variable is set, and the client request's ID in `SLUICE_REQUEST_ID_HEADER` when a request asked (a join, `POST /token`; a re-check on the tick sends none). Redirects are not followed. The verdict is cached per URL, channel, role, sub and session, so while it is valid it also answers new joins by the same session, on any of its streams.
 
 | Response | Verdict | Valid for |
 | --- | --- | --- |
@@ -477,7 +477,25 @@ The slot, warning and resume buffer metrics refresh every `SLUICE_CATALOG_REFRES
 - **A table leaves the publication:** its shapes are dropped with `relation_unpublished`.
 - **A table's definition changes:** its subscriptions get `schema_changed`; dropped columns disappear from events, and new columns are not added until the client resubscribes.
 
-**Logs** are `log/slog`, JSON by default (`SLUICE_LOG_FORMAT=text` for text). Sluice does not log tokens, claims or row data.
+### Logs
+
+Logs are `log/slog`, JSON by default (`SLUICE_LOG_FORMAT=text` for text).
+
+Every HTTP request has an ID: the value of the `SLUICE_REQUEST_ID_HEADER` header (`X-Request-ID`) when it is 1 to 128 visible ASCII characters, else a new UUID. Every line about the request carries it as `request_id`, after `time`, `level` and `msg`, and Sluice sends it in the same header to the issuer and hooks on the calls it makes for that request. Responses and events never carry it. Behind a gateway that sets the header on every request, and overwrites any value a client sent, one ID follows a request through the gateway, Sluice, the issuer and the hooks. Without such a gateway the client chooses its ID, so it is a label for logs and never an input to a decision.
+
+| `msg` | Level | Logged when |
+| --- | --- | --- |
+| `request refused` | info; warn for a `5xx` other than `server_shutdown` | any error response: `path`, `status`, `code`, `reason` |
+| `subscription refused` | info; warn when the issuer or hook gave no verdict, or a node-wide limit refused it | a shape or channel of `/stream` or `/subscribe` is refused: `sub`, `table` or `channel`, `code`, `reason`. At most 20 per request, then one `more subscriptions refused` with `count` |
+| `subscription revoked` | info; warn for `issuer_unavailable` | `POST /token` drops a shape or hook channel |
+| `channel hook re-check got no verdict; …` | warn | on `POST /token`; the stream keeps the channel |
+| `stream ended` | info | the server ended a stream: `code` is `session_revoked`, `user_banned`, `token_expired`, `stream_lagging`, `write_failed` (with `err`) or `server_shutdown`, with `cause: replication_stopped` when the slot was lost. A client disconnecting is not logged |
+
+A stream outlives the request that opened it and keeps that request's ID. `stream ended` carries it as `request_id`. A line about a later request on the stream carries that request's `request_id`, the `stream_id`, and the opener's ID as `stream_request_id`.
+
+Work that no request started has no request ID, and Sluice does not make one up. Hook re-checks on the tick send none. A revocation read from the slot logs `session revoked; its streams were closed` (`session_id`, `streams`, `commit_lsn`) or `user banned; their streams were closed` (`streams`, `commit_lsn`), and each stream it closes logs its own `stream ended`.
+
+Sluice does not log tokens, bearer secrets, claims, payloads, presence `meta` or row data. Lines name what a request asked for (a table, a channel, a subscription label, a stream id) and a revoked session's id. Strings the client chose are cut to 256 bytes.
 
 ## Security model
 
@@ -489,6 +507,7 @@ The slot, warning and resume buffer metrics refresh every `SLUICE_CATALOG_REFRES
 - **Shared secrets.** `SLUICE_ISSUER_BEARER` authenticates Sluice to the issuer, `SLUICE_CHANNEL_HOOK_BEARER` to hook endpoints. Neither is a user credential, and neither client follows redirects, so neither secret is resent elsewhere.
 - **What `sluice_repl` sees.** Everything published, regardless of RLS. `REPLICA IDENTITY FULL` also puts every old column in the stream Sluice reads, so keep replica identities narrow where you can.
 - **Unauthenticated endpoints.** `/healthz`, `/readyz` and `/metrics` (which exposes table and namespace names); restrict them at the gateway if that matters.
+- **Request IDs** are log labels. Nothing is decided on them, they are never read from a credential header, and they are sent only to the issuer and hooks. Unless the gateway overwrites the header, the client chooses its own (see [Logs](#logs)).
 
 ## Configuration reference
 
@@ -503,6 +522,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_NODE_ID` | hostname | prefixes stream ids |
 | `SLUICE_SHUTDOWN_GRACE` | `15s` | for requests in flight; streams end at once |
 | `SLUICE_RECONNECT_SPREAD` | `10s` | window the `retry_after_ms` of `server_shutdown` is drawn from; `0` sends none |
+| `SLUICE_REQUEST_ID_HEADER` | `X-Request-ID` | header a request's ID is read from, logged as `request_id` and sent to the issuer and hooks; not `Authorization`, `Proxy-Authorization` or `Cookie` |
 | `SLUICE_DB_REPL_URL` | required | must include `replication=database` |
 | `SLUICE_DB_AUTHZ_URL` | required | must not |
 | `SLUICE_DB_POOL_MAX_CONNS` / `_MIN_CONNS` | `8` / `2` | the reading process keeps one for its lock |
@@ -610,7 +630,8 @@ internal/hold       issuer hold watches
 internal/shape      filter grammar, narrowing, routing key
 internal/registry   the subscription routing index
 internal/hub        streams, channels, presence, resume buffer, rate limits
-internal/server     HTTP surface, dispatch, snapshots, hooks, diagnostics
+internal/server     HTTP surface, dispatch, snapshots, hooks, diagnostics, request logs
+internal/requestid  request IDs: read, generated, forwarded
 internal/auth       JWT verification and revocation
 internal/timer      the shared heartbeat wheel
 internal/metrics    Prometheus collectors

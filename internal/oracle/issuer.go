@@ -16,6 +16,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/config"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
 	"github.com/pauserratgutierrez/sluice/internal/hold"
+	"github.com/pauserratgutierrez/sluice/internal/requestid"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
@@ -322,6 +323,7 @@ func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPRespons
 	if err != nil {
 		return nil, &ErrDenied{Reason: "invalid shape-issuer URL"}
 	}
+	requestid.From(ctx).Set(httpReq.Header)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+i.bearer)
 

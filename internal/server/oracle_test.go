@@ -124,7 +124,7 @@ func TestRLSReadyKeepsTierOmitsOracle(t *testing.T) {
 
 func TestPublicationDropRemovesShapeAndHold(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.1", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.1", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	rel := docsRel()
 	f, err := shape.Parse("project_id=eq.42", rel)
 	if err != nil {
@@ -199,7 +199,7 @@ func liveDocsHold(t *testing.T, s *Server, st *hub.Stream, holdRel *catalog.Rela
 
 func TestHoldReplicaIdentityWeakenedCutsShape(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.ri-weak", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.ri-weak", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	good := membersRel()
 	s.cat.PutForTest(docsRel(), good)
 	liveDocsHold(t, s, st, good)
@@ -231,7 +231,7 @@ func TestHoldReplicaIdentityWeakenedCutsShape(t *testing.T) {
 
 func TestHoldReplicaIdentityStillCoveringKeepsShape(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.ri-ok", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.ri-ok", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	joined := membersRel()
 	s.cat.PutForTest(docsRel(), joined)
 	liveDocsHold(t, s, st, joined)
@@ -260,7 +260,7 @@ func TestHoldReplicaIdentityStillCoveringKeepsShape(t *testing.T) {
 
 func TestHoldCutDoesNotCloseStream(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.2", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.2", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	rel := docsRel()
 	f, _ := shape.Parse("project_id=eq.42", rel)
 	sub := &registry.Subscription{
@@ -280,7 +280,7 @@ func TestHoldCutDoesNotCloseStream(t *testing.T) {
 
 func TestAdminShapesDropUsesIssuerBearer(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	st := s.hub.Open("n1.3", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.3", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	rel := docsRel()
 	f, _ := shape.Parse("project_id=eq.42", rel)
 	s.reg.Add(&registry.Subscription{
@@ -409,7 +409,7 @@ func TestTokenRefreshConcurrentHoldKickDoesNotLeaveShape(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		s := testServer(t, stubOracle{name: oracle.NameIssuer})
 		s.holdExists = func(context.Context, []hold.Spec) error { return nil }
-		st := s.hub.Open("n1.token-kick", authz.Identity{Sub: "u1", Role: "authenticated"})
+		st := s.hub.Open("n1.token-kick", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 		issuerLiveSub(t, s, st, wide, grant.Columns, holdF)
 
 		var wg sync.WaitGroup
@@ -454,7 +454,7 @@ func TestTokenRefreshAppliesNarrowerGrant(t *testing.T) {
 	}
 	s := testServer(t, orc)
 	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
-	st := s.hub.Open("n1.token-narrow", authz.Identity{Sub: "u1", Role: "authenticated"})
+	st := s.hub.Open("n1.token-narrow", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	sub := issuerLiveSub(t, s, st, wide, []string{"id", "project_id", "title"}, holdF)
 
 	if s.refreshIssuerShape(context.Background(), st, sub, st.Identity()) != "held" {

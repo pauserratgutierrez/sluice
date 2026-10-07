@@ -30,6 +30,9 @@ import (
 type Stream struct {
 	id       string
 	identity atomic.Pointer[authz.Identity]
+	// requestID is the ID of the request that opened the stream. The stream
+	// outlives that request, so its log lines carry it.
+	requestID string
 
 	// The queue grows as events arrive, up to limit, so an idle stream holds no
 	// buffer. A preallocated channel of the same capacity cost every stream
@@ -67,6 +70,9 @@ type DueChannel struct {
 }
 
 func (s *Stream) StreamID() string { return s.id }
+
+// RequestID is the ID of the request that opened the stream.
+func (s *Stream) RequestID() string { return s.requestID }
 
 func (s *Stream) Identity() authz.Identity {
 	if p := s.identity.Load(); p != nil {
@@ -256,16 +262,17 @@ func New(queueSize, ringEvents, ringMaxBytes int, ringMaxAge, presenceTick time.
 func (h *Hub) Rings() *Rings       { return h.rings }
 func (h *Hub) Presence() *Presence { return h.presence }
 
-// Open registers a new stream.
-func (h *Hub) Open(id string, identity authz.Identity) *Stream {
+// Open registers a new stream, opened by the request with the given ID.
+func (h *Hub) Open(id, requestID string, identity authz.Identity) *Stream {
 	s := &Stream{
-		id:       id,
-		limit:    max(1, h.queueSize),
-		ready:    make(chan struct{}, 1),
-		room:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		created:  time.Now(),
-		channels: map[string]channelJoin{},
+		id:        id,
+		requestID: requestID,
+		limit:     max(1, h.queueSize),
+		ready:     make(chan struct{}, 1),
+		room:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		created:   time.Now(),
+		channels:  map[string]channelJoin{},
 	}
 	s.identity.Store(&identity)
 	h.mu.Lock()

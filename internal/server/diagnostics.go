@@ -31,7 +31,7 @@ type Diagnostic struct {
 func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	id, err := s.identify(r)
 	if err != nil || id.Role != "service_role" {
-		writeErr(w, http.StatusForbidden, "forbidden", "service_role required")
+		s.refuse(w, r, http.StatusForbidden, "forbidden", "service_role required")
 		return
 	}
 

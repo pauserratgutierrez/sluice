@@ -50,7 +50,7 @@ func TestShapesResolveConcurrentlyAndInstallInOrder(t *testing.T) {
 	s.cfg.MaxShapesPerStream = 3
 	s.cfg.MaxSubsPerStream = 10
 	id := authz.Identity{Sub: "u1", Role: "authenticated"}
-	st := s.hub.Open("n1.1", id)
+	st := s.hub.Open("n1.1", "", id)
 
 	var specs []subSpec
 	for i := 1; i <= 5; i++ {

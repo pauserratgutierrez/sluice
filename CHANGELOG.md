@@ -2,6 +2,35 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.8.0
+
+Request IDs: Sluice joins the trace of the requests it serves.
+
+### Added
+
+- Every HTTP request has an ID: the value of `SLUICE_REQUEST_ID_HEADER` (default `X-Request-ID`) when it is 1 to 128 visible ASCII characters, else a new UUID. It is sent in the same header to the shape issuer and to channel hooks on the calls made for the request, and logged as `request_id` on every line about the request. Responses and events do not carry it.
+- Log lines for requests, each with `request_id`: `request refused` for every error response, `subscription refused` for each refused shape or channel (at most 20 per request, then `more subscriptions refused`), and `subscription revoked` for each shape or hook channel `POST /token` drops. Refusals that are not the caller's doing (no verdict from the issuer or a hook, a `5xx`, a node-wide limit) are warnings.
+- `stream ended`, when the server ends a stream (not when the client disconnects), under the ID of the request that opened it. A line about a later request on a stream adds `stream_id` and that ID as `stream_request_id`. A lost slot still ends streams with `server_shutdown`; their lines add `cause: replication_stopped`.
+- `session revoked; its streams were closed` and `user banned; their streams were closed`, with `commit_lsn`, when a revocation read from the slot closes streams. They have no request ID.
+- `SLUICE_REQUEST_ID_HEADER`. Startup refuses `Authorization`, `Proxy-Authorization` and `Cookie`.
+
+### Changed
+
+- `session lookup failed` is now `request refused` with `code: session_check_unavailable`, the error in `err`.
+
+### For issuers and hook endpoints
+
+- Calls made for a request (a subscribe, a join, `POST /token`) carry its ID in `SLUICE_REQUEST_ID_HEADER`; log it to join Sluice's lines. Hook re-checks on the `SLUICE_CATALOG_REFRESH` tick serve no request and carry none. Treat it as a label only: unless a gateway overwrites the header, the client chose it.
+
+### For operators
+
+- Set the header at the gateway on every request, overwriting any value a client sent, and log it there: one ID then follows a request through the gateway, Sluice, the issuer and the hooks.
+- More lines: one per refused request and refused subscription, and one per stream when the process stops.
+
+### For clients
+
+- Nothing changes: requests, responses and events are the same.
+
 ## 0.7.0
 
 ### Fixed

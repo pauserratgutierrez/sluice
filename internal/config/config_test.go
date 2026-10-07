@@ -18,6 +18,7 @@ func baseValid() *Config {
 		MessagePrefix:   "sluice:",
 		ShapeOracle:     "rls",
 		JWTRequireRole:  true,
+		RequestIDHeader: "X-Request-ID",
 	}
 }
 
@@ -186,6 +187,41 @@ func TestValidateSessionLookupNeedsRevocation(t *testing.T) {
 	c.RevocationEnabled = true
 	if err := c.validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadRequestIDHeader(t *testing.T) {
+	setRequired(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestIDHeader != "X-Request-ID" {
+		t.Errorf("RequestIDHeader = %q, want X-Request-ID", c.RequestIDHeader)
+	}
+	t.Setenv("SLUICE_REQUEST_ID_HEADER", "X-Correlation-ID")
+	if c, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestIDHeader != "X-Correlation-ID" {
+		t.Errorf("RequestIDHeader = %q, want X-Correlation-ID", c.RequestIDHeader)
+	}
+}
+
+// The ID is logged and forwarded, so it can never be read from a credential.
+func TestValidateRequestIDHeader(t *testing.T) {
+	c := baseValid()
+	for _, h := range []string{"Authorization", "cookie", "Proxy-Authorization", "X Request ID", "X-Request-ID:"} {
+		c.RequestIDHeader = h
+		if err := c.validate(); err == nil {
+			t.Errorf("SLUICE_REQUEST_ID_HEADER=%q was accepted", h)
+		}
+	}
+	for _, h := range []string{"X-Request-ID", "x-correlation-id", "Request-Id"} {
+		c.RequestIDHeader = h
+		if err := c.validate(); err != nil {
+			t.Errorf("SLUICE_REQUEST_ID_HEADER=%q: %v", h, err)
+		}
 	}
 }
 

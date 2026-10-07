@@ -301,6 +301,9 @@ func run() error {
 	case err := <-readerDone:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("reader stopped", "err", err)
+			// The reader stops for good when the slot is lost. Clients get
+			// server_shutdown as on any stop; each stream's line says why.
+			srv.DrainFor("replication_stopped")
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Shutdown)
 			defer cancel()
 			_ = httpSrv.Shutdown(shutdownCtx)

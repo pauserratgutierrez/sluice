@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"math/rand/v2"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
+	"github.com/pauserratgutierrez/sluice/internal/requestid"
 )
 
 // Hook authorization is the escape hatch for business rules Sluice cannot know.
@@ -258,8 +260,15 @@ func (s *Server) recheckStreamHooks(ctx context.Context, st *hub.Stream, id auth
 	now := time.Now()
 	boundedEach(len(joins), hookRecheckConcurrency, func(i int) {
 		j := joins[i]
-		if s.applyHookVerdict(j, s.hooks.Authorize(ctx, j.ch, id, j.channel, true), now) {
+		v := s.hooks.Authorize(ctx, j.ch, id, j.channel, true)
+		switch {
+		case s.applyHookVerdict(j, v, now):
 			revoked.Add(1)
+			s.logSub(ctx, "subscription revoked", st, subSpec{Sub: j.label, Channel: j.channel}, false,
+				event.Error{Code: "channel_not_authorized", Message: v.reason})
+		case v.outcome == hookUnavailable:
+			s.logRequest(ctx, slog.LevelWarn, "channel hook re-check got no verdict; the stream keeps the channel until the next tick",
+				st, "sub", truncate(j.label, maxLogged), "channel", truncate(j.channel, maxLogged), "reason", v.reason)
 		}
 	})
 	return int(revoked.Load())
@@ -324,6 +333,7 @@ func (h *hookCache) ask(ctx context.Context, ch config.Channel, id authz.Identit
 	if err != nil {
 		return hookUnavailable, "invalid hook URL", hookRetryTTL
 	}
+	requestid.From(ctx).Set(req.Header)
 	req.Header.Set("Content-Type", "application/json")
 	if h.bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+h.bearer)

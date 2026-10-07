@@ -38,6 +38,9 @@ type Config struct {
 	LogFormat  string
 	NodeID     string
 	Shutdown   time.Duration
+	// RequestIDHeader names the header a request's ID is read from and sent
+	// in to the issuer and hooks; see package requestid.
+	RequestIDHeader string
 
 	ReplURL      string
 	AuthzURL     string
@@ -140,6 +143,8 @@ func Load() (*Config, error) {
 		LogFormat:  env("SLUICE_LOG_FORMAT", "json"),
 		NodeID:     env("SLUICE_NODE_ID", defaultNodeID()),
 		Shutdown:   envDur("SLUICE_SHUTDOWN_GRACE", 15*time.Second),
+
+		RequestIDHeader: env("SLUICE_REQUEST_ID_HEADER", "X-Request-ID"),
 
 		ReplURL:      env("SLUICE_DB_REPL_URL", ""),
 		AuthzURL:     env("SLUICE_DB_AUTHZ_URL", ""),
@@ -335,7 +340,32 @@ func (c *Config) validate() error {
 		return fmt.Errorf("SLUICE_JWT_REQUIRE_ROLE=false needs SLUICE_SHAPE_ORACLE=issuer: " +
 			"the rls oracle runs snapshots and probes under SET LOCAL ROLE, which needs the token's role")
 	}
+	if !validHeaderName(c.RequestIDHeader) {
+		return fmt.Errorf("SLUICE_REQUEST_ID_HEADER %q is not a header name", c.RequestIDHeader)
+	}
+	switch strings.ToLower(c.RequestIDHeader) {
+	case "authorization", "proxy-authorization", "cookie":
+		// The ID is logged on every line about a request and sent to the
+		// issuer and hooks, so it must never be read from a credential.
+		return fmt.Errorf("SLUICE_REQUEST_ID_HEADER must not name a credential header, got %q", c.RequestIDHeader)
+	}
 	return nil
+}
+
+// validHeaderName reports whether s is an HTTP field name (RFC 9110 token).
+func validHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // RevocationTables are the tables published only so revocation can read their
