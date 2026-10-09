@@ -37,6 +37,13 @@ func Main() error {
 	}
 	s := newServer(bearer, lat, envInt("LOAD_ISSUER_CONCURRENCY", 0), envInt("LOAD_ISSUER_QUEUE_MAX", 0),
 		envInt("LOAD_HOOK_TTL", 0))
+	switch order := envOr("LOAD_HOLD_ORDER", "user-first"); order {
+	case "user-first":
+	case "room-first":
+		s.roomFirst = true
+	default:
+		return fmt.Errorf("issuer: LOAD_HOLD_ORDER is %q, want user-first or room-first", order)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("POST /shapes", s.shapes)
@@ -66,6 +73,11 @@ type server struct {
 	queueMax int
 	gate     chan struct{}
 	hookTTL  int
+	// roomFirst writes membership holds as room_id=eq.R,user_id=eq.U. Sluice
+	// 0.8.1 indexes a hold by the first of its equally good columns (0.8.0 by
+	// either, at random), so this order puts every member of a room in one
+	// list; the default, user first, gives each member a list of their own.
+	roomFirst bool
 
 	mu      sync.RWMutex
 	members map[string]struct{}       // project memberships (issuer, kick)
@@ -254,7 +266,7 @@ func (s *server) decide(req issuerRequest) map[string]any {
 			return deny
 		}
 		return grant("room_messages", fmt.Sprintf("room_id=eq.%d", room), nil,
-			"room_members", fmt.Sprintf("room_id=eq.%d,user_id=eq.%s", room, sub))
+			"room_members", s.memberHold(room, sub))
 	case "room_members", "notifications":
 		// A member's own rows: their memberships, their notifications. The
 		// grant is held by their membership of the first room they joined.
@@ -268,9 +280,17 @@ func (s *server) decide(req issuerRequest) map[string]any {
 			return deny
 		}
 		return grant(req.Requested.Table, "user_id=eq."+sub, nil,
-			"room_members", fmt.Sprintf("room_id=eq.%d,user_id=eq.%s", room, sub))
+			"room_members", s.memberHold(room, sub))
 	}
 	return deny
+}
+
+// memberHold is the hold filter for sub's membership of room.
+func (s *server) memberHold(room int64, sub string) string {
+	if s.roomFirst {
+		return fmt.Sprintf("room_id=eq.%d,user_id=eq.%s", room, sub)
+	}
+	return fmt.Sprintf("user_id=eq.%s,room_id=eq.%d", sub, room)
 }
 
 func grant(table, filter string, cols []string, holdTable, holdFilter string) map[string]any {

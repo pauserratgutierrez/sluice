@@ -65,6 +65,7 @@ x-runner-env: &runner-env
   LOAD_CHANNEL: ${LOAD_CHANNEL:-room:load}
   LOAD_SAMPLE_EVERY: ${LOAD_SAMPLE_EVERY:-}
   LOAD_IDLE_SHAPES: ${LOAD_IDLE_SHAPES:-}
+  HOST_POWER_PLAN: ${HOST_POWER_PLAN:-}
 
 # The knobs of the production-shaped profiles. Empty means the runner's
 # default (README.md lists them).
@@ -110,6 +111,21 @@ x-rooms-env: &rooms-env
   LOAD_PROXY_DOWN: ${LOAD_PROXY_DOWN:-}
   LOAD_CALIBRATE_WINDOWS: ${LOAD_CALIBRATE_WINDOWS:-}
   LOAD_CALIBRATE_WINDOW: ${LOAD_CALIBRATE_WINDOW:-}
+  LOAD_RAMP_STEP: ${LOAD_RAMP_STEP:-}
+  LOAD_RAMP_ARRIVAL: ${LOAD_RAMP_ARRIVAL:-}
+  LOAD_RAMP_SETTLE: ${LOAD_RAMP_SETTLE:-}
+  LOAD_RAMP_HOLD: ${LOAD_RAMP_HOLD:-}
+  LOAD_RAMP_AFTER_FAIL: ${LOAD_RAMP_AFTER_FAIL:-}
+  LOAD_PROBE_EVERY: ${LOAD_PROBE_EVERY:-}
+  LOAD_PROBE_AGES: ${LOAD_PROBE_AGES:-}
+  LOAD_ISSUER_NAME: ${LOAD_ISSUER_NAME:-}
+  LOAD_PPROF_AT: ${LOAD_PPROF_AT:-}
+  LOAD_PPROF_SECONDS: ${LOAD_PPROF_SECONDS:-}
+  HOST_POWER_PLAN: ${HOST_POWER_PLAN:-}
+  POSTGRES_SYNCHRONOUS_COMMIT: ${POSTGRES_SYNCHRONOUS_COMMIT:-on}
+  SLUICE_GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
+  SLUICE_RING_EVENTS: ${SLUICE_RING_EVENTS:-4096}
+  SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-60s}
   LOAD_SLOT: load_rooms
   # Recorded in the report; the containers' limits are set below.
   SLUICE_CPUS: ${SLUICE_CPUS:-1}
@@ -124,6 +140,7 @@ x-rooms-env: &rooms-env
   LOAD_ISSUER_LATENCY: ${LOAD_ISSUER_LATENCY:-5ms-20ms}
   LOAD_ISSUER_CONCURRENCY: ${LOAD_ISSUER_CONCURRENCY:-32}
   LOAD_HOOK_TTL: ${LOAD_HOOK_TTL:-0}
+  LOAD_HOLD_ORDER: ${LOAD_HOLD_ORDER:-user-first}
   SLUICE_METRICS_URL: http://sluice-rooms:4000/metrics
 
 x-runner: &runner
@@ -142,7 +159,7 @@ x-runner: &runner
     net.core.somaxconn: 65535
   volumes:
     - keys_data:/keys:ro
-    - ./results:/results
+    - ${RESULTS_DIR:-./results}:/results
   env_file:
     - path: .env
       required: false
@@ -178,7 +195,7 @@ x-runner-rooms: &runner-rooms
     sluice-rooms: { condition: service_healthy }
   volumes:
     - keys_data:/keys:ro
-    - ./results:/results
+    - ${RESULTS_DIR:-./results}:/results
     - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
   networks: [loadtest]
 
@@ -238,7 +255,7 @@ x-sluice: &sluice
 services:
   db:
     image: ${POSTGRES_IMAGE:-postgres:18.6-trixie}
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate]
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate, ramp]
     restart: unless-stopped
     logging: *default-logging
     security_opt: ["no-new-privileges:true"]
@@ -283,7 +300,7 @@ services:
 
   jwks:
     <<: *loadtest
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate]
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate, ramp]
     command: ["jwks"]
     restart: unless-stopped
     user: "0:0"
@@ -308,7 +325,7 @@ services:
   # the rest queued.
   issuer:
     <<: *loadtest
-    profiles: [issuer, kick, rooms, bigtxn, reconnect, calibrate]
+    profiles: [issuer, kick, rooms, bigtxn, reconnect, calibrate, ramp]
     command: ["issuer"]
     restart: unless-stopped
     user: "65532:65532"
@@ -325,6 +342,7 @@ services:
       LOAD_ISSUER_CONCURRENCY: ${LOAD_ISSUER_CONCURRENCY:-32}
       LOAD_ISSUER_QUEUE_MAX: ${LOAD_ISSUER_QUEUE_MAX:-0}
       LOAD_HOOK_TTL: ${LOAD_HOOK_TTL:-0}
+      LOAD_HOLD_ORDER: ${LOAD_HOLD_ORDER:-user-first}
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -367,7 +385,7 @@ services:
   # own defaults everywhere else, overridable with the same variable names.
   sluice-rooms:
     <<: *sluice
-    profiles: [rooms, bigtxn, reconnect, calibrate]
+    profiles: [rooms, bigtxn, reconnect, calibrate, ramp]
     depends_on:
       db: { condition: service_healthy }
       jwks: { condition: service_healthy }
@@ -407,6 +425,8 @@ services:
       SLUICE_DIAGNOSTICS_ENABLED: "true"
       GOMEMLIMIT: ${SLUICE_GOMEMLIMIT:-}
       GOGC: ${SLUICE_GOGC:-}
+      GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
+      SLUICE_PPROF_ADDR: ${SLUICE_PPROF_ADDR:-}
     healthcheck:
       test: ["CMD", "/sluice", "-readycheck"]
       interval: 2s
@@ -558,6 +578,14 @@ services:
     environment:
       <<: *rooms-env
       LOAD_SCENARIO: calibrate
+      SLUICE_URL: http://sluice-rooms:4000/sluice/v1
+
+  runner-ramp:
+    <<: *runner-rooms
+    profiles: [ramp]
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: ramp
       SLUICE_URL: http://sluice-rooms:4000/sluice/v1
 
 volumes:

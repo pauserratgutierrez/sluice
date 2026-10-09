@@ -71,7 +71,32 @@ type roomsConfig struct {
 	CalWindows int           `json:"calibrate_windows,omitempty"`
 	CalWindow  time.Duration `json:"calibrate_window,omitempty"`
 
+	// ramp: rooms join in steps of about RampStep streams; each step is
+	// judged on a window of RampHold after it settles.
+	RampStep      int           `json:"ramp_step_streams,omitempty"`
+	RampArrival   time.Duration `json:"ramp_arrival,omitempty"`
+	RampSettle    time.Duration `json:"ramp_settle,omitempty"`
+	RampHold      time.Duration `json:"ramp_hold,omitempty"`
+	RampAfterFail int           `json:"ramp_after_fail,omitempty"`
+
+	// The resume-buffer probe: every ProbeEvery, a short stream per age in
+	// ProbeAges asks to resume each table from that far back.
+	ProbeEvery time.Duration   `json:"probe_every,omitempty"`
+	ProbeAges  []time.Duration `json:"probe_ages,omitempty"`
+	RingEvents int             `json:"ring_events,omitempty"`
+	RingMaxAge time.Duration   `json:"ring_max_age,omitempty"`
+	// ProbeDerivedWindow is how far back the derived coverage averages each
+	// table's change rate. Reports written before it existed derived it from
+	// the last sampling interval alone.
+	ProbeDerivedWindow time.Duration `json:"probe_derived_window,omitempty"`
+
 	DockerSocket string `json:"-"`
+
+	// Profiles of a Sluice built with pprof: when, how long, and where.
+	PprofAt      time.Duration   `json:"pprof_at,omitempty"`
+	PprofSeconds time.Duration   `json:"pprof_seconds,omitempty"`
+	PprofURL     string          `json:"pprof_url,omitempty"`
+	PprofHeapAt  []time.Duration `json:"pprof_heap_at,omitempty"`
 }
 
 func (c roomsConfig) streams() int {
@@ -114,7 +139,7 @@ func (c roomsConfig) expectedRates() (changes, messages, members, typing float64
 			members += r * float64(k.Streams) / per
 		}
 		if c.TypingEnabled && c.TypingEvery > 0 && k.Streams > 1 {
-			typing += r * k.Typing * float64(k.Streams-1) / c.TypingEvery.Seconds()
+			typing += float64(typistsUpTo(k.Typing, k.Count)) * float64(k.Streams-1) / c.TypingEvery.Seconds()
 		}
 	}
 	return changes, messages, members, typing
@@ -146,6 +171,27 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 		SlotLagMax:  int64(envInt("LOAD_SLOT_LAG_MAX_MB", 64)) << 20,
 
 		DockerSocket: envOr("LOAD_DOCKER_SOCKET", "/var/run/docker.sock"),
+
+		ProbeEvery: envDur("LOAD_PROBE_EVERY", 2*time.Minute),
+		RingEvents: envInt("SLUICE_RING_EVENTS", 4096),
+		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", time.Minute),
+
+		ProbeDerivedWindow: time.Minute,
+
+		PprofAt:      envDur("LOAD_PPROF_AT", 0),
+		PprofSeconds: envDur("LOAD_PPROF_SECONDS", time.Minute),
+		PprofURL:     envOr("LOAD_PPROF_URL", "http://sluice-rooms:6060/debug/pprof"),
+	}
+	ages, err := parseDurations(envOr("LOAD_PROBE_AGES", "500ms,1s,2s,3s,5s,7500ms,10s,15s,20s,30s,45s,60s,90s"))
+	if err != nil {
+		return c, fmt.Errorf("LOAD_PROBE_AGES: %w", err)
+	}
+	c.ProbeAges = ages
+	if c.PprofAt > 0 {
+		// What the GC finds live early and late in the steady phase.
+		if c.PprofHeapAt, err = parseDurations(envOr("LOAD_PPROF_HEAP_AT", "2m,9m")); err != nil {
+			return c, fmt.Errorf("LOAD_PPROF_HEAP_AT: %w", err)
+		}
 	}
 	switch c.ReplicaIdentity {
 	case "full", "pk":
@@ -221,6 +267,13 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 		if os.Getenv("LOAD_DURATION") == "" {
 			c.Duration = c.ReconnectAfter + time.Duration(c.ReconnectCount)*c.ReconnectEvery
 		}
+	case "ramp":
+		c.RampStep = max(1, envInt("LOAD_RAMP_STEP", 1000))
+		c.RampArrival = envDur("LOAD_RAMP_ARRIVAL", 20*time.Second)
+		c.RampSettle = envDur("LOAD_RAMP_SETTLE", 15*time.Second)
+		c.RampHold = envDur("LOAD_RAMP_HOLD", 90*time.Second)
+		c.RampAfterFail = envInt("LOAD_RAMP_AFTER_FAIL", 0)
+		c.ProbeEvery = envDur("LOAD_PROBE_EVERY", 0)
 	case "calibrate":
 		// A fixed load, so the CPU it costs compares between machines. Only
 		// the window length and count may change.
@@ -236,6 +289,7 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 		c.Seed = 1
 		c.CalWindows = max(1, envInt("LOAD_CALIBRATE_WINDOWS", 3))
 		c.CalWindow = envDur("LOAD_CALIBRATE_WINDOW", time.Minute)
+		c.ProbeEvery = 0
 		c.Duration = 10*time.Second + time.Duration(c.CalWindows)*c.CalWindow
 	}
 	return c, nil
@@ -310,4 +364,11 @@ func envBool(k string, d bool) bool {
 		}
 	}
 	return d
+}
+
+// typistsUpTo is how many typists the first n rooms of a class with an
+// average of k per room have between them: floor(k·n), so a class of R rooms
+// has floor(k·R) and they are spread evenly.
+func typistsUpTo(k float64, n int) int {
+	return int(math.Floor(k*float64(n) + 1e-9))
 }

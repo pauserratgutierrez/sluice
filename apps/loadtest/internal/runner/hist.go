@@ -121,10 +121,12 @@ const (
 	latPublish             // POST /publish round trip
 	latTxn                 // a message transaction in PostgreSQL
 	latReplayed            // a change replayed by a resume, from its commit
+	latWriteCommit         // a message: the runner's write to its commit (commit_time)
+	latCommitClient        // a message: its commit to the client
 	nLat
 )
 
-var latNames = [nLat]string{"message", "member", "typing", "notification", "open", "back", "token", "publish", "txn", "replayed"}
+var latNames = [nLat]string{"message", "member", "typing", "notification", "open", "back", "token", "publish", "txn", "replayed", "message_write_to_commit", "message_commit_to_client"}
 
 // deliveryKinds are the latencies of events Sluice delivers, which the pass
 // criteria apply to.

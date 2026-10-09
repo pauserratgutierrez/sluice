@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -23,28 +24,35 @@ type Point struct {
 	T     float64 `json:"t"` // seconds since the run started
 	Phase string  `json:"phase"`
 
-	Streams        float64 `json:"sluice_streams"`
-	LiveClients    int64   `json:"live_clients"`
-	SluiceCPU      float64 `json:"sluice_cpu_s"`
-	SluiceCores    float64 `json:"sluice_cores"`
-	RSSMiB         float64 `json:"rss_mib"`
-	GoMemMiB       float64 `json:"go_mem_mib"` // what GOMEMLIMIT bounds: sys - released
-	HeapLiveMiB    float64 `json:"heap_live_mib"`
-	GoMemLimitMiB  float64 `json:"gomemlimit_mib,omitempty"`
-	GoMaxProcs     float64 `json:"gomaxprocs,omitempty"`
-	Goroutines     float64 `json:"goroutines"`
-	GCCount        float64 `json:"gc_count"`
-	GCPauseSum     float64 `json:"gc_pause_s"`
-	GCPauseMaxMs   float64 `json:"gc_pause_max_ms"`
-	Lagging        float64 `json:"stream_lagging"`
-	Dropped        float64 `json:"dropped_events"`
-	Changes        float64 `json:"changes"`
-	ChangesPerSec  float64 `json:"changes_per_s"`
-	DispatchSum    float64 `json:"dispatch_s"`
-	DispatchCount  float64 `json:"dispatch_count"`
-	ResumeBufMiB   float64 `json:"resume_buffer_mib"`
-	HookRechecks   float64 `json:"hook_rechecks"`
-	SluiceRestarts int     `json:"sluice_restarts,omitempty"`
+	Streams     float64 `json:"sluice_streams"`
+	LiveClients int64   `json:"live_clients"`
+	SluiceCPU   float64 `json:"sluice_cpu_s"`
+	SluiceCores float64 `json:"sluice_cores"`
+	RSSMiB      float64 `json:"rss_mib"`
+	GoMemMiB    float64 `json:"go_mem_mib"` // what GOMEMLIMIT bounds: sys - released
+	HeapLiveMiB float64 `json:"heap_live_mib"`
+	// NextGCMiB is the heap goal set at the last GC. With GOGC=100 and
+	// GOMEMLIMIT far away it is about twice the heap the GC found live, so
+	// half of it estimates live memory, garbage excluded.
+	NextGCMiB     float64 `json:"next_gc_mib,omitempty"`
+	HeapAllocMiB  float64 `json:"heap_alloc_mib,omitempty"`
+	GoMemLimitMiB float64 `json:"gomemlimit_mib,omitempty"`
+	GoMaxProcs    float64 `json:"gomaxprocs,omitempty"`
+	Goroutines    float64 `json:"goroutines"`
+	GCCount       float64 `json:"gc_count"`
+	GCPauseSum    float64 `json:"gc_pause_s"`
+	GCPauseMaxMs  float64 `json:"gc_pause_max_ms"`
+	Lagging       float64 `json:"stream_lagging"`
+	Dropped       float64 `json:"dropped_events"`
+	Changes       float64 `json:"changes"`
+	ChangesPerSec float64 `json:"changes_per_s"`
+	// TableRates is changes decoded per second, per table.
+	TableRates     map[string]float64 `json:"table_changes_per_s,omitempty"`
+	DispatchSum    float64            `json:"dispatch_s"`
+	DispatchCount  float64            `json:"dispatch_count"`
+	ResumeBufMiB   float64            `json:"resume_buffer_mib"`
+	HookRechecks   float64            `json:"hook_rechecks"`
+	SluiceRestarts int                `json:"sluice_restarts,omitempty"`
 
 	// Replication, in bytes behind pg_current_wal_lsn(): what Sluice has not
 	// dispatched yet (backlog, from its live confirmed position), what the
@@ -93,6 +101,7 @@ type sampler struct {
 	points   []Point
 
 	prevEvents  int64
+	prevTables  map[string]float64
 	prevChanges float64
 	prevRunner  float64
 	prevIssuer  float64
@@ -179,7 +188,9 @@ func (s *sampler) sample(ctx context.Context, phase string) (Point, int) {
 		}
 		restarted := false
 		if t0 := m["process_start_time_seconds"]; t0 != 0 {
-			if s.procT0 != 0 && t0 != s.procT0 {
+			// The start time is derived from the boot time, which drifts under
+			// some hypervisors (WSL2): only a jump of seconds is a new process.
+			if s.procT0 != 0 && math.Abs(t0-s.procT0) > 2 {
 				restarted = true
 				s.restarts++
 			}
@@ -201,12 +212,24 @@ func (s *sampler) sample(ctx context.Context, phase string) (Point, int) {
 		p.RSSMiB = m["process_resident_memory_bytes"] / mib
 		p.GoMemMiB = (m["go_memstats_sys_bytes"] - m["go_memstats_heap_released_bytes"]) / mib
 		p.HeapLiveMiB = liveBytes(m) / mib
+		p.NextGCMiB = m["go_memstats_next_gc_bytes"] / mib
+		p.HeapAllocMiB = m["go_memstats_heap_alloc_bytes"] / mib
 		p.GoMemLimitMiB = m["go_gc_gomemlimit_bytes"] / mib
 		p.GoMaxProcs = m["go_sched_gomaxprocs_threads"]
 		p.Goroutines = m["go_goroutines"]
 		p.GCPauseMaxMs = m[`go_gc_duration_seconds{quantile="1"}`] * 1000
 		p.ResumeBufMiB = m["sluice_resume_buffer_bytes"] / mib
 		p.WALLagBytes = int64(m["sluice_wal_lag_bytes"])
+		tables := tableChanges(m)
+		if dt > 0 && s.prevTables != nil && !restarted {
+			p.TableRates = map[string]float64{}
+			for tb, n := range tables {
+				if d := n - s.prevTables[tb]; d >= 0 {
+					p.TableRates[tb] = d / dt
+				}
+			}
+		}
+		s.prevTables = tables
 	}
 	p.SluiceRestarts = s.restarts
 	p.SluiceCPU = s.acc["process_cpu_seconds_total"]
@@ -394,4 +417,30 @@ func parseLSN(s string) (uint64, error) {
 		return 0, err
 	}
 	return h<<32 | l, nil
+}
+
+// tableChanges sums sluice_changes_total by schema.table.
+func tableChanges(m map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range m {
+		labels, ok := strings.CutPrefix(k, "sluice_changes_total{")
+		if !ok {
+			continue
+		}
+		schema, table := labelValue(labels, "schema"), labelValue(labels, "table")
+		if table != "" {
+			out[schema+"."+table] += v
+		}
+	}
+	return out
+}
+
+// labelValue reads one label of a Prometheus series' label set.
+func labelValue(labels, name string) string {
+	_, rest, ok := strings.Cut(labels, name+`="`)
+	if !ok {
+		return ""
+	}
+	v, _, _ := strings.Cut(rest, `"`)
+	return v
 }

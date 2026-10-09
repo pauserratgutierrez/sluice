@@ -81,7 +81,12 @@ type rclient struct {
 	mu      sync.Mutex
 	subs    []subDef
 	resume  map[string]string
+	seen    map[string]time.Time // when each table's resume position was current
 	retries map[string]*time.Timer
+
+	// posAge is how old each table's position was when the last stream was
+	// requested (reader goroutine).
+	posAge map[string]time.Duration
 
 	// Reader-goroutine state.
 	attempt    int
@@ -130,10 +135,14 @@ func (c *rclient) openOnce(ctx context.Context) {
 		specs[i] = s.JSON
 	}
 	resume := make(map[string]string, len(c.resume))
+	posAge := make(map[string]time.Duration, len(c.resume))
+	now := time.Now()
 	for k, v := range c.resume {
 		resume[k] = v
+		posAge[k] = now.Sub(c.seen[k])
 	}
 	c.mu.Unlock()
+	c.posAge = posAge
 	body, _ := json.Marshal(map[string]any{"subscriptions": specs, "resume": resume})
 
 	first := c.readyN.Load() == 0
@@ -247,6 +256,7 @@ type wireChange struct {
 		CreatedAt     string `json:"created_at"`
 		LastMessageAt string `json:"last_message_at"`
 	} `json:"record"`
+	CommitTime string `json:"commit_time"`
 }
 
 func (c *rclient) handle(ev sse.Event, t0 time.Time) {
@@ -281,8 +291,17 @@ func (c *rclient) handle(ev sse.Event, t0 time.Time) {
 		c.mu.Unlock()
 		w := e.wave.Load()
 		full := true
+		agesSeen := map[string]bool{}
 		for _, res := range r.Subscriptions {
 			c.applyResult(res, r.WalLSN, w)
+			if w != nil && n > 1 && res.Resumed != nil {
+				if def, ok := c.findLocked(res.Sub); ok && def.Table != "" && !agesSeen[def.Table] {
+					agesSeen[def.Table] = true
+					if age, ok := c.posAge[def.Table]; ok {
+						w.addAge(def.Table, *res.Resumed, age)
+					}
+				}
+			}
 			if res.Resumed != nil && !*res.Resumed {
 				full = false
 			}
@@ -308,15 +327,22 @@ func (c *rclient) handle(ev sse.Event, t0 time.Time) {
 			return
 		}
 		if ch.CommitLSN != "" {
+			table := ch.Schema + "." + ch.Table
 			c.mu.Lock()
-			c.resume[ch.Schema+"."+ch.Table] = ch.CommitLSN
+			c.resume[table] = ch.CommitLSN
+			c.seen[table] = now
 			c.mu.Unlock()
+			e.trail.note(table, ch.CommitLSN, now)
 		}
 		switch ch.Sub {
 		case "msgs":
 			e.recv[latMessage].Add(1)
 			if t, err := time.Parse(time.RFC3339Nano, ch.Record.CreatedAt); err == nil {
 				c.recordChange(latMessage, now, t)
+				if ct, err := time.Parse(time.RFC3339Nano, ch.CommitTime); err == nil && !(c.readyN.Load() > 1 && t.UnixNano() < c.readyAt.Load()) {
+					e.lat.Record(latWriteCommit, ct.Sub(t))
+					e.lat.Record(latCommitClient, now.Sub(ct))
+				}
 			}
 			c.checkSeq(ch.Record.Seq)
 		case "me":
@@ -454,6 +480,7 @@ func (c *rclient) applyResult(res wireResult, walLSN string, w *waveStats) {
 	if walLSN != "" {
 		if _, has := c.resume[def.Table]; !has || (res.Resumed != nil && !*res.Resumed) {
 			c.resume[def.Table] = walLSN
+			c.seen[def.Table] = time.Now()
 		}
 	}
 }
@@ -659,4 +686,11 @@ func (c *rclient) recordChange(kind int, now, written time.Time) {
 		return
 	}
 	c.e.lat.Record(kind, now.Sub(written))
+}
+
+// findLocked is find for a caller that does not hold c.mu.
+func (c *rclient) findLocked(label string) (subDef, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.find(label)
 }

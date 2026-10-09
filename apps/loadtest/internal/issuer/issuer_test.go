@@ -41,9 +41,14 @@ func TestDecideRooms(t *testing.T) {
 
 	if g := s.decide(req("room_messages", "room_id=eq.3", "u1")); !allow(g) {
 		t.Fatalf("member denied: %v", g)
-	} else if h := g["holds"].([]map[string]any)[0]; h["filter"] != "room_id=eq.3,user_id=eq.u1" {
+	} else if h := g["holds"].([]map[string]any)[0]; h["filter"] != "user_id=eq.u1,room_id=eq.3" {
 		t.Fatalf("hold %v", h)
 	}
+	s.roomFirst = true
+	if g := s.decide(req("room_messages", "room_id=eq.3", "u1")); g["holds"].([]map[string]any)[0]["filter"] != "room_id=eq.3,user_id=eq.u1" {
+		t.Fatalf("room-first hold %v", g["holds"])
+	}
+	s.roomFirst = false
 	if allow(s.decide(req("room_messages", "room_id=eq.4", "u1"))) {
 		t.Fatal("non-member allowed")
 	}

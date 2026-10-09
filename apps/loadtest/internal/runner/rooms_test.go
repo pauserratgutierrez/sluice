@@ -65,7 +65,7 @@ func TestExpectedRates(t *testing.T) {
 	}
 	ch, msg, mem, typ := rc.expectedRates()
 	near := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
-	if !near(ch, 5*81/15.0) || !near(msg, 5*20/15.0) || !near(mem, 5*20/15.0) || !near(typ, 5*0.5*19/2) {
+	if !near(ch, 5*81/15.0) || !near(msg, 5*20/15.0) || !near(mem, 5*20/15.0) || !near(typ, 2*19/2.0) {
 		t.Fatalf("rates = %v %v %v %v", ch, msg, mem, typ)
 	}
 }
@@ -113,5 +113,76 @@ func TestUUIDFromIsDeterministic(t *testing.T) {
 	b := uuidFrom(rand.New(rand.NewPCG(1, 2)))
 	if a != b || len(a) != 36 || a[14] != '4' {
 		t.Fatalf("%s %s", a, b)
+	}
+}
+
+func TestLSNTrail(t *testing.T) {
+	var tr lsnTrail
+	t0 := time.Now().Add(-10 * time.Second)
+	tr.note("t", "0/10", t0)
+	tr.note("t", "0/20", t0.Add(2*time.Second))
+	tr.note("t", "0/30", t0.Add(4*time.Second))
+	if _, ok := tr.at("t", t0.Add(-time.Second)); ok {
+		t.Fatal("a time before the trail must not resolve")
+	}
+	if p, ok := tr.at("t", t0.Add(3*time.Second)); !ok || p.lsn != "0/20" {
+		t.Fatalf("at +3s = %+v, %v; want 0/20", p, ok)
+	}
+	if p, ok := tr.at("t", t0.Add(4*time.Second)); !ok || p.lsn != "0/30" {
+		t.Fatalf("at +4s = %+v, %v; want 0/30", p, ok)
+	}
+}
+
+func TestTableChanges(t *testing.T) {
+	m := parseProm(`sluice_changes_total{op="UPDATE",schema="public",table="room_members"} 100
+sluice_changes_total{op="INSERT",schema="public",table="room_members"} 5
+sluice_changes_total{op="INSERT",schema="public",table="room_messages"} 7
+`)
+	got := tableChanges(m)
+	if got["public.room_members"] != 105 || got["public.room_messages"] != 7 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestSummarizeProbes(t *testing.T) {
+	rounds := []ProbeRound{
+		{Phase: "steady", Tables: map[string]*ProbeTable{"a": {CoverS: 2}}, Derived: map[string]DerivedCoverage{"a": {ChangesPerSec: 2000, CoverS: 2.05}}},
+		{Phase: "steady", Tables: map[string]*ProbeTable{"a": {CoverS: 3}}, Derived: map[string]DerivedCoverage{"a": {ChangesPerSec: 1000, CoverS: 4.1}}},
+		{Phase: "steady", Tables: map[string]*ProbeTable{"a": {CoverS: 5}}},
+	}
+	s := summarizeProbes(rounds, "")
+	if s.Rounds != 3 || s.CoverMedianS["a"] != 3 || s.CoverMinS["a"] != 2 || s.RateMedian["a"] != 1500 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestTypistsUpTo(t *testing.T) {
+	// 0.3 of 50 rooms is 15 typists, despite 0.3*50 being 15.000000000000002
+	// and 0.24*380 being 91.19999999999999.
+	if n := typistsUpTo(0.3, 50); n != 15 {
+		t.Fatalf("0.3 × 50 = %d", n)
+	}
+	if n := typistsUpTo(0.24, 380); n != 91 {
+		t.Fatalf("0.24 × 380 = %d", n)
+	}
+	total := 0
+	for j := range 14 {
+		total += typistsUpTo(0.3, j+1) - typistsUpTo(0.3, j)
+	}
+	if total != 4 {
+		t.Fatalf("spread over 14 rooms: %d typists, want 4", total)
+	}
+}
+
+func TestLagSeconds(t *testing.T) {
+	pts := []LSNPoint{{T: 0, Current: 100}, {T: 1, Current: 200}, {T: 2, Current: 300}}
+	if s := lagSeconds(pts, 2, 150); s != 1.5 {
+		t.Fatalf("lag of 150 at t=2: %v, want 1.5", s)
+	}
+	if s := lagSeconds(pts, 2, 300); s != 0 {
+		t.Fatalf("caught up: %v", s)
+	}
+	if s := lagSeconds(pts, 2, 50); s != -1 {
+		t.Fatalf("before the readings: %v", s)
 	}
 }

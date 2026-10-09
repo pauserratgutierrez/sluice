@@ -37,7 +37,7 @@ import (
 
 func isRoomsScenario(s string) bool {
 	switch s {
-	case "rooms", "bigtxn", "reconnect", "calibrate":
+	case "rooms", "bigtxn", "reconnect", "calibrate", "ramp":
 		return true
 	}
 	return false
@@ -100,11 +100,18 @@ type engine struct {
 	started  time.Time
 	arrivalT time.Duration
 
-	windows []window
-	bigs    []BigTxnResult
-	pgInfo  map[string]string
-	waves   []WaveResult
-	cal     *CalibrationResult
+	windows  []window
+	bigs     []BigTxnResult
+	trail    lsnTrail
+	probeMu  sync.Mutex
+	probes   []ProbeRound
+	pgInfo   map[string]string
+	profiles []Profile
+	profMu   sync.Mutex
+	lsnMu    sync.Mutex
+	lsns     []LSNPoint
+	waves    []WaveResult
+	cal      *CalibrationResult
 }
 
 type counters struct {
@@ -176,9 +183,30 @@ type waveStats struct {
 	down     atomic.Int64
 	backN    atomic.Int64
 	mu       sync.Mutex
-	backAt   []time.Duration // from t0 to each stream's ready
-	downtime []time.Duration // from each stream's end to its ready
+	backAt   []time.Duration          // from t0 to each stream's ready
+	downtime []time.Duration          // from each stream's end to its ready
+	ages     map[string]*[2][]float64 // table -> [not resumed, resumed] position ages, s
 	counters counters
+}
+
+// addAge records how old a stream's position on a table was when it asked to
+// resume from it, by whether Sluice could.
+func (w *waveStats) addAge(table string, resumed bool, age time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ages == nil {
+		w.ages = map[string]*[2][]float64{}
+	}
+	a := w.ages[table]
+	if a == nil {
+		a = &[2][]float64{}
+		w.ages[table] = a
+	}
+	i := 0
+	if resumed {
+		i = 1
+	}
+	a[i] = append(a[i], age.Seconds())
 }
 
 func (w *waveStats) back(now, downAt time.Time) {
@@ -285,6 +313,11 @@ func runRooms(ctx context.Context, cfg Config, log *slog.Logger) error {
 	go e.secondTicker(e.clientsCtx)
 	go e.windowTicker(e.clientsCtx)
 
+	go e.lsnLoop(e.clientsCtx)
+	if cfg.Scenario == "ramp" {
+		return e.ramp(ctx)
+	}
+
 	// Arrival.
 	arrival := &LatSet{}
 	e.setPhase("arrival", arrival)
@@ -304,6 +337,16 @@ func runRooms(ctx context.Context, cfg Config, log *slog.Logger) error {
 	e.setPhase("steady", steady)
 	mSteady := e.mark(ctx, "steady")
 	e.startTraffic()
+	go e.probeLoop(e.clientsCtx)
+	profiled := make(chan struct{})
+	if rc.PprofAt > 0 {
+		go func() {
+			defer close(profiled)
+			e.captureProfiles(e.clientsCtx, mSteady.at)
+		}()
+	} else {
+		close(profiled)
+	}
 
 	switch cfg.Scenario {
 	case "bigtxn":
@@ -317,7 +360,12 @@ func runRooms(ctx context.Context, cfg Config, log *slog.Logger) error {
 		sleepCtx(ctx, rest)
 	}
 
-	// Stop writing, let what is in flight arrive, then close.
+	// Stop writing, let what is in flight arrive, then close. A profile still
+	// being taken finishes first.
+	select {
+	case <-profiled:
+	case <-time.After(rc.PprofSeconds + time.Minute):
+	}
 	e.trafficCancel()
 	sleepCtx(ctx, rc.Drain)
 	mEnd := e.mark(ctx, "end")
@@ -393,11 +441,11 @@ func (e *engine) setup(ctx context.Context) error {
 	var rows [][]any
 	var seed []map[string]any
 	for ci, k := range rc.Classes {
-		for range k.Count {
+		for j := range k.Count {
 			id++
 			r := &room{id: id, class: ci}
-			// Typists spread so the average per room is k.Typing.
-			typists := int(math.Floor(k.Typing*float64(id))) - int(math.Floor(k.Typing*float64(id-1)))
+			// Typists spread over the class so it has typistsOf(k) of them.
+			typists := typistsUpTo(k.Typing, j+1) - typistsUpTo(k.Typing, j)
 			if !rc.TypingEnabled {
 				typists = 0
 			}
@@ -411,7 +459,7 @@ func (e *engine) setup(ctx context.Context) error {
 						e: e, room: r, idx: j, userID: u, sessID: uuidFrom(rng),
 						typist: j < typists,
 						subs:   roomSubs(id, u, rc.Shapes),
-						resume: map[string]string{}, retries: map[string]*time.Timer{},
+						resume: map[string]string{}, seen: map[string]time.Time{}, retries: map[string]*time.Timer{},
 					}
 					r.clients = append(r.clients, c)
 					e.clients = append(e.clients, c)
@@ -965,6 +1013,24 @@ func (e *engine) reconnectWave(ctx context.Context, n int) WaveResult {
 		}
 	}
 	res.GapsAfterResume = mB.ctr["msg_gap_after_resume"] - mA.ctr["msg_gap_after_resume"]
+	w.mu.Lock()
+	if len(w.ages) > 0 {
+		res.ResumeByTable = map[string]ResumeAges{}
+		for tb, a := range w.ages {
+			ra := ResumeAges{Resumed: len(a[1]), NotResumed: len(a[0])}
+			if n := ra.Resumed + ra.NotResumed; n > 0 {
+				ra.PctResumed = 100 * float64(ra.Resumed) / float64(n)
+			}
+			if len(a[1]) > 0 {
+				ra.AgeP50Resumed, ra.AgeMaxResumed = median(a[1]), slices.Max(a[1])
+			}
+			if len(a[0]) > 0 {
+				ra.AgeP50Not, ra.AgeMinNot = median(a[0]), slices.Min(a[0])
+			}
+			res.ResumeByTable[tb] = ra
+		}
+	}
+	w.mu.Unlock()
 	res.GapsUnresumed = mB.ctr["msg_gap_unresumed"] - mA.ctr["msg_gap_unresumed"]
 	res.Latency = during.Summaries()
 	res.SluiceCPUSeconds = mB.point.SluiceCPU - mA.point.SluiceCPU

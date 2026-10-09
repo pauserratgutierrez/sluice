@@ -2,6 +2,13 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## Unreleased
+
+### Added
+
+- A build with the `pprof` tag (`go build -tags pprof ./cmd/sluice`) serves Go's profiling handlers on `SLUICE_PPROF_ADDR`, apart from the public listener. Release images are built without it and do not change.
+- Load test (`apps/loadtest`): production-shaped profiles — `rooms`, `bigtxn`, `reconnect`, `calibrate` and `ramp` — against an issuer-mode Sluice with hook channels, run with a production container's limits, with per-kind latency, CPU per change and per event, memory against `GOMEMLIMIT`, replication lag and resume-buffer coverage in every report.
+
 ## 0.8.2
 
 Issuer mode: `POST /token` no longer grows each shape's filter.

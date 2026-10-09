@@ -8,9 +8,9 @@
 #   -f        start from an empty database volume (after a schema change)
 #   VAR=value set any LOAD_* / SLUICE_* knob for this run
 #
-# The report lands in results/; Sluice's log of the run in results/logs/.
-# Works from Git Bash on Windows and from any Linux shell with Docker
-# Compose v2.
+# The report lands in results/ (RESULTS_DIR); Sluice's log of the run in
+# results/logs/. Works from Git Bash on Windows and from any Linux shell with
+# Docker Compose v2.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,6 +35,25 @@ shift
 for kv in "$@"; do
 	export "${kv?}"
 done
+export RESULTS_DIR="${RESULTS_DIR:-./results}"
+# Compose reads a bare relative path as the name of a volume.
+case "$RESULTS_DIR" in
+/* | ./* | ../* | [A-Za-z]:*) ;;
+*) RESULTS_DIR="./$RESULTS_DIR" ;;
+esac
+mkdir -p "$RESULTS_DIR"
+
+# The host's power plan goes into every report: on a laptop it moves the
+# numbers more than most knobs.
+if [ -z "${HOST_POWER_PLAN:-}" ]; then
+	if command -v powercfg >/dev/null 2>&1; then
+		HOST_POWER_PLAN=$(MSYS_NO_PATHCONV=1 powercfg /getactivescheme 2>/dev/null | tr -d '\r' |
+			sed -n 's/.*: *\([0-9a-fA-F-]*\) *(\(.*\)).*/\2 \1/p')
+	elif [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+		HOST_POWER_PLAN="governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+	fi
+	export HOST_POWER_PLAN
+fi
 
 if [ "$local_build" = 1 ]; then
 	docker build -t sluice:local ../..
@@ -50,7 +69,18 @@ fi
 # reconnect profile's restart of Sluice would end the whole run.
 cleanup() { "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true; }
 trap 'cleanup; exit 130' INT TERM
+
+# Every run starts from a new replication slot. A slot keeps what a previous
+# run left undispatched (a run that saturated Sluice can leave hundreds of MB),
+# and the next Sluice would replay it, setup's TRUNCATE included, into the
+# new run's streams. With PostgreSQL up and no Sluice yet, the load test's
+# slots are inactive and can go.
 status=0
+if "${compose[@]}" up -d --wait db >/dev/null 2>&1; then
+	"${compose[@]}" exec -T db psql -U postgres -d postgres -tAc \
+		"select slot_name from pg_replication_slots where slot_name like 'load\_%' and not active and pg_drop_replication_slot(slot_name) is not null" ||
+		true
+fi
 if "${compose[@]}" up -d --build; then
 	"${compose[@]}" logs -f --no-color "runner-$profile" &
 	follow=$!

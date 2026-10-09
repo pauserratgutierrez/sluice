@@ -36,8 +36,22 @@ type RoomsReport struct {
 	BigTxns     []BigTxnResult     `json:"bigtxns,omitempty"`
 	Reconnects  []WaveResult       `json:"reconnects,omitempty"`
 	Calibration *CalibrationResult `json:"calibration,omitempty"`
-	Verdict     Verdict            `json:"verdict"`
-	Counters    map[string]int64   `json:"counters"`
+
+	Ramp           []RampStep `json:"ramp,omitempty"`
+	RampMaxStreams int        `json:"ramp_max_passing_streams,omitempty"`
+	RampFailedAt   int        `json:"ramp_failed_at_streams,omitempty"`
+	RampLimits     []string   `json:"ramp_limits,omitempty"`
+
+	Profiles []Profile `json:"profiles,omitempty"`
+	// Stages is, per phase, how far behind the WAL end the walsender and Sluice
+	// were, in seconds; LSN the readings it comes from.
+	Stages []StageLag `json:"stages,omitempty"`
+	LSN    []LSNPoint `json:"lsn_timeline,omitempty"`
+
+	Probe    *ProbeSummary    `json:"resume_buffer,omitempty"`
+	Probes   []ProbeRound     `json:"resume_buffer_rounds,omitempty"`
+	Verdict  Verdict          `json:"verdict"`
+	Counters map[string]int64 `json:"counters"`
 
 	Windows         []window              `json:"windows"`
 	EventsPerSecond []int32               `json:"events_per_second"`
@@ -197,6 +211,22 @@ type WaveResult struct {
 	Latency           map[string]Summary `json:"latency"`
 	Counters          map[string]int64   `json:"counters"`
 	Error             string             `json:"error,omitempty"`
+	// ResumeByTable is, per table, how many streams Sluice resumed and how
+	// old their positions were.
+	ResumeByTable map[string]ResumeAges `json:"resume_by_table,omitempty"`
+}
+
+// ResumeAges splits the streams of a wave by whether their table resumed,
+// with the age of the position each asked to resume from (seconds since it
+// was current).
+type ResumeAges struct {
+	Resumed       int     `json:"resumed"`
+	NotResumed    int     `json:"not_resumed"`
+	PctResumed    float64 `json:"pct_resumed"`
+	AgeP50Resumed float64 `json:"age_p50_resumed_s"`
+	AgeMaxResumed float64 `json:"age_max_resumed_s"`
+	AgeP50Not     float64 `json:"age_p50_not_resumed_s"`
+	AgeMinNot     float64 `json:"age_min_not_resumed_s"`
 }
 
 type CalWindow struct {
@@ -418,6 +448,15 @@ func (e *engine) report(mStart, mSteady, mEnd mark, arrival, steady *LatSet, arr
 	r.EventsPerSecond = append([]int32(nil), e.secs...)
 	e.secMu.Unlock()
 	r.IssuerSeconds = e.sampler.issuerSeconds()
+	e.probeMu.Lock()
+	r.Probes = append([]ProbeRound(nil), e.probes...)
+	e.probeMu.Unlock()
+	r.Probe = summarizeProbes(r.Probes, "")
+	r.Profiles = e.profiles
+	e.lsnMu.Lock()
+	r.LSN = append([]LSNPoint(nil), e.lsns...)
+	e.lsnMu.Unlock()
+	r.Stages = stageLags(r.LSN, r.Phases)
 	r.Timeline = e.sampler.snapshotPoints()
 	return r
 }
@@ -473,6 +512,7 @@ func reportEnv() map[string]string {
 			k == "LOAD_DB_URL":
 			continue
 		case strings.HasPrefix(k, "LOAD_"), strings.HasPrefix(k, "SLUICE_"), strings.HasPrefix(k, "POSTGRES_IMAGE"),
+			k == "HOST_POWER_PLAN", k == "POSTGRES_SYNCHRONOUS_COMMIT",
 			strings.HasSuffix(k, "_CPUSET"), strings.HasSuffix(k, "_CPUS"):
 			out[k] = v
 		}
@@ -539,6 +579,21 @@ func roomsMarkdown(r RoomsReport) string {
 		r.Host.SluiceProcs, r.Host.SluiceLimitMB, orDash(r.Env["SLUICE_CPUS"]), orDash(r.Env["SLUICE_MEM_LIMIT"]), orDash(r.Env["SLUICE_CPUSET"]))
 	pgVersion, _, _ := strings.Cut(r.Host.Postgres["version"], " on ")
 	fmt.Fprintf(&b, "- PostgreSQL: %s, synchronous_commit %s\n", orDash(pgVersion), orDash(r.Host.Postgres["synchronous_commit"]))
+	issuerName := r.Env["LOAD_ISSUER_NAME"]
+	if issuerName != "" {
+		issuerName += ": "
+	}
+	// Runs from before LOAD_HOLD_ORDER existed wrote holds room first.
+	holdOrder := r.Env["LOAD_HOLD_ORDER"]
+	if holdOrder == "" {
+		holdOrder = "room-first"
+	}
+	fmt.Fprintf(&b, "- Issuer: %slatency %s, %s calls at once, hook ttl %s, membership holds %s\n", issuerName, orDash(r.Env["LOAD_ISSUER_LATENCY"]),
+		orDash(r.Env["LOAD_ISSUER_CONCURRENCY"]), orDash(r.Env["LOAD_HOOK_TTL"]), holdOrder)
+	fmt.Fprintf(&b, "- Host power plan: %s\n", orDash(r.Env["HOST_POWER_PLAN"]))
+	if v := r.Env["SLUICE_GOMAXPROCS"]; v != "" {
+		fmt.Fprintf(&b, "- GOMAXPROCS forced to %s\n", v)
+	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, seed %d\n", r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.Seed)
 	verdict := "PASS"
 	if !r.Verdict.Pass {
@@ -620,14 +675,63 @@ func roomsMarkdown(r RoomsReport) string {
 				w.GapsAfterResume, w.SluiceCPUSeconds)
 		}
 		b.WriteByte('\n')
+		fmt.Fprintf(&b, "Resume per table (position age = seconds since the position a stream sent was current):\n\n")
+		fmt.Fprintf(&b, "| # | Table | Resumed | %% | Age p50 / max resumed s | Age p50 / min not resumed s |\n| ---: | --- | ---: | ---: | --- | --- |\n")
+		for _, w := range r.Reconnects {
+			tables := make([]string, 0, len(w.ResumeByTable))
+			for tb := range w.ResumeByTable {
+				tables = append(tables, tb)
+			}
+			slices.Sort(tables)
+			for _, tb := range tables {
+				a := w.ResumeByTable[tb]
+				fmt.Fprintf(&b, "| %d | %s | %d of %d | %.1f | %.1f / %.1f | %.1f / %.1f |\n", w.N, tb, a.Resumed, a.Resumed+a.NotResumed,
+					a.PctResumed, a.AgeP50Resumed, a.AgeMaxResumed, a.AgeP50Not, a.AgeMinNot)
+			}
+		}
+		b.WriteByte('\n')
+	}
+
+	if r.Probe != nil {
+		fmt.Fprintf(&b, "## Resume buffer\n\nHow far back a stream could resume each table: probed (median and minimum over %d rounds, ages %v), and derived from the table's change rate (`SLUICE_RING_EVENTS`=%d, `SLUICE_RING_MAX_AGE`=%s).\n\n",
+			r.Probe.Rounds, r.Config.ProbeAges, r.Config.RingEvents, r.Config.RingMaxAge)
+		fmt.Fprintf(&b, "| Table | Changes/s | Probed median s | Probed min s | Derived s |\n| --- | ---: | ---: | ---: | ---: |\n")
+		tables := make([]string, 0, len(r.Probe.DerivedMedianS))
+		for tb := range r.Probe.DerivedMedianS {
+			tables = append(tables, tb)
+		}
+		slices.Sort(tables)
+		for _, tb := range tables {
+			fmt.Fprintf(&b, "| %s | %.0f | %s | %s | %.1f |\n", tb, r.Probe.RateMedian[tb],
+				optS(r.Probe.CoverMedianS, tb), optS(r.Probe.CoverMinS, tb), r.Probe.DerivedMedianS[tb])
+		}
+		b.WriteByte('\n')
+	}
+
+	if len(r.Ramp) > 0 {
+		fmt.Fprintf(&b, "## Ramp\n\nLargest step that passed: **%d streams**", r.RampMaxStreams)
+		if r.RampFailedAt > 0 {
+			fmt.Fprintf(&b, "; failed at %d streams. Near the limit there: %s", r.RampFailedAt, orDash(strings.Join(r.RampLimits, "; ")))
+		}
+		fmt.Fprintf(&b, ".\n\n| Step | Streams (opened) | Changes/s | Events/s | Cores avg / peak | Go mem / limit MiB | RSS MiB | KiB/stream | GC max ms | msg / member / typing p95 ms | Pass | Why not | Near the limit |\n")
+		fmt.Fprintf(&b, "| ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |\n")
+		for _, s := range r.Ramp {
+			w := s.Window
+			fmt.Fprintf(&b, "| %d | %d (%d) | %.0f | %.0f | %.2f / %.2f | %.0f / %.0f | %.0f | %.1f | %.1f | %.0f / %.0f / %.0f | %t | %s | %s |\n",
+				s.N, s.Streams, s.Opened, w.ChangesPerSec, w.EventsPerSec, w.SluiceCoresAvg, w.SluiceCoresPeak,
+				w.GoMemPeakMiB, w.GoMemLimitMiB, w.RSSPeakMiB, s.KiBPerStream, w.GCPauseMaxMs,
+				w.Latency["message"].P95, w.Latency["member"].P95, w.Latency["typing"].P95, s.Pass,
+				orDash(strings.Join(s.Reasons, "; ")), orDash(strings.Join(s.Limits, "; ")))
+		}
+		b.WriteByte('\n')
 	}
 
 	if r.Calibration != nil {
-		fmt.Fprintf(&b, "## Calibration\n\n**%.1f ms of Sluice CPU per 1000 events** (median of %d windows), %.2f ms per stream open.\n\n",
-			r.Calibration.CPUMsPer1kEvents, len(r.Calibration.Windows), r.Calibration.CPUMsPerOpen)
-		fmt.Fprintf(&b, "| Window | Events | Events/s | CPU s | ms / 1k events |\n| ---: | ---: | ---: | ---: | ---: |\n")
+		fmt.Fprintf(&b, "## Calibration\n\n**%.1f ms of Sluice CPU per 1000 events**, %.1f per 1000 decoded changes (medians of %d windows), %.2f ms per stream open.\n\n",
+			r.Calibration.CPUMsPer1kEvents, r.Calibration.CPUMsPer1kChanges, len(r.Calibration.Windows), r.Calibration.CPUMsPerOpen)
+		fmt.Fprintf(&b, "| Window | Events | Events/s | Changes | CPU s | ms / 1k events | ms / 1k changes |\n| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 		for i, w := range r.Calibration.Windows {
-			fmt.Fprintf(&b, "| %d | %d | %.0f | %.2f | %.1f |\n", i+1, w.Events, w.EventsPerSec, w.CPUSeconds, w.CPUMsPer1kEvents)
+			fmt.Fprintf(&b, "| %d | %d | %.0f | %.0f | %.2f | %.1f | %.1f |\n", i+1, w.Events, w.EventsPerSec, w.Changes, w.CPUSeconds, w.CPUMsPer1kEvents, w.CPUMsPer1kChanges)
 		}
 		b.WriteByte('\n')
 	}
@@ -666,4 +770,11 @@ func printRoomsSummary(r RoomsReport) {
 	} else {
 		fmt.Println("  verdict: FAIL — " + strings.Join(r.Verdict.Reasons, "; "))
 	}
+}
+
+func optS(m map[string]float64, k string) string {
+	if v, ok := m[k]; ok {
+		return fmt.Sprintf("%.1f", v)
+	}
+	return "—"
 }

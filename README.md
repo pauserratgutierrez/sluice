@@ -607,9 +607,21 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
 | `cmd/audit` | a broad policy spectrum, DML and WAL edge cases, revocation, `/diagnostics`; needs `SERVICE_ROLE_KEY` and writes a JSON report to `/out` |
 | `cmd/load` | a fan-out soak on the harness (`LOAD_SCENARIO`, `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`) |
 | `node packages/sluice-js/test/live.mjs [baseUrl]` | the built SDK through the gateway, including a reconnect that must miss nothing |
-| [`apps/loadtest`](apps/loadtest/README.md) | capacity hunts against a published image, with its own compose stack |
+| [`apps/loadtest`](apps/loadtest/README.md) | capacity hunts and production-shaped loads (rooms, big transactions, reconnect storms) against a published image, with its own compose stack |
 
 The harness applies `deploy/db/fixtures.sql`, `issuer_fixtures.sql` and `audit_fixtures.sql` on every `up`. Releases (image and SDK, from `v*.*.*` tags) are described in [MAINTENANCE.md](MAINTENANCE.md).
+
+### Profiling
+
+A build with the `pprof` tag serves Go's profiling handlers (`/debug/pprof/…`) on `SLUICE_PPROF_ADDR`, apart from the public listener; release images do not contain them.
+
+```bash
+CGO_ENABLED=0 GOOS=linux go build -tags pprof -o .bin/sluice ./cmd/sluice
+SLUICE_PPROF_ADDR=127.0.0.1:6060 .bin/sluice     # with the usual SLUICE_* variables
+go tool pprof -top 'http://127.0.0.1:6060/debug/pprof/profile?seconds=60'
+```
+
+The handlers are unauthenticated: bind them to loopback or a private network. [`apps/loadtest/scripts/build-pprof.sh`](apps/loadtest/scripts/build-pprof.sh) builds such an image for the load test, which takes profiles with `LOAD_PPROF_AT`.
 
 ## Repository layout
 
