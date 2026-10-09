@@ -9,6 +9,7 @@ package shape
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -278,31 +279,38 @@ func compileTerm(t Term, col catalog.Column) (expr.Node, error) {
 // Returning "" means the shape is unindexed and will be scanned for every
 // change to the relation.
 func (f *Filter) RoutingKey(rel *catalog.Relation) string {
-	var indexedAndRI, indexed, any string
+	if cols := f.RoutingCandidates(rel); len(cols) > 0 {
+		return cols[0]
+	}
+	return ""
+}
+
+// RoutingCandidates lists the equally good routing columns, in filter order:
+// those of the best non-empty tier of RoutingKey's preference order. An index
+// that knows how long its lists are can pick among them; RoutingKey takes the
+// first.
+func (f *Filter) RoutingCandidates(rel *catalog.Relation) []string {
+	var indexedAndRI, indexed, any []string
 	for _, t := range f.Terms {
 		if t.Op != OpEq || t.Negate {
 			continue
 		}
 		col := t.Column
-		if _, ok := f.Equalities[col]; !ok {
+		if _, ok := f.Equalities[col]; !ok || slices.Contains(any, col) {
 			continue
 		}
-		if any == "" {
-			any = col
-		}
+		any = append(any, col)
 		if rel.IndexedColumns[col] {
-			if indexed == "" {
-				indexed = col
-			}
-			if rel.InReplicaIdentity(col) && indexedAndRI == "" {
-				indexedAndRI = col
+			indexed = append(indexed, col)
+			if rel.InReplicaIdentity(col) {
+				indexedAndRI = append(indexedAndRI, col)
 			}
 		}
 	}
 	switch {
-	case indexedAndRI != "":
+	case len(indexedAndRI) > 0:
 		return indexedAndRI
-	case indexed != "":
+	case len(indexed) > 0:
 		return indexed
 	default:
 		return any

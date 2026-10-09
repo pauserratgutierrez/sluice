@@ -383,3 +383,31 @@ func (r *Registry) All() []*Subscription {
 	}
 	return out
 }
+
+// IndexSize counts the routing index, for tests and diagnostics: subscriptions
+// by stream, constants and entries in the routing lists (with their capacity),
+// and unindexed subscriptions.
+type IndexSize struct {
+	Subscriptions, Relations, Constants, Routed, RoutedCap, Unindexed int
+}
+
+func (r *Registry) IndexSize() IndexSize {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var s IndexSize
+	for _, subs := range r.byStream {
+		s.Subscriptions += len(subs)
+	}
+	s.Relations = len(r.rels)
+	for _, ri := range r.rels {
+		for _, byConst := range ri.byColumn {
+			s.Constants += len(byConst)
+			for _, list := range byConst {
+				s.Routed += len(list)
+				s.RoutedCap += cap(list)
+			}
+		}
+		s.Unindexed += len(ri.unindexed)
+	}
+	return s
+}

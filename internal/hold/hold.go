@@ -47,6 +47,9 @@ type route struct {
 	oid     uint32
 	col     string
 	val     string
+	// counted are the candidate columns this hold was counted under in
+	// relIndex.cols, taken out again by unindexLocked.
+	counted []string
 }
 
 func newWatch(streamID, label string, holds []Spec) *Watch {
@@ -68,12 +71,32 @@ type relIndex struct {
 	byColumn  map[string]map[string][]*Watch
 	unindexed []*Watch
 	all       map[*Watch]bool
+	// cols counts, for each candidate routing column, the holds that have an
+	// equality on it and how many share each constant, whichever column each
+	// hold is listed under: what its lists would hold if every hold used it.
+	cols map[string]*colCount
+}
+
+type colCount struct {
+	holds   int
+	byConst map[string]int
+}
+
+// meanList is the mean number of holds per constant: the expected length of
+// the list a change to one row looks through when holds are listed by this
+// column.
+func (c *colCount) meanList() float64 {
+	if c == nil || len(c.byConst) == 0 {
+		return 0
+	}
+	return float64(c.holds) / float64(len(c.byConst))
 }
 
 func newRelIndex() *relIndex {
 	return &relIndex{
 		byColumn: map[string]map[string][]*Watch{},
 		all:      map[*Watch]bool{},
+		cols:     map[string]*colCount{},
 	}
 }
 
@@ -148,8 +171,8 @@ func (x *Index) unindexWatchLocked(w *Watch) {
 	}
 }
 
-// indexLocked lists hold i of w under its relation's routing key, and records
-// where in w.routes.
+// indexLocked lists hold i of w under the routing column of its relation whose
+// lists are shortest, and records where in w.routes.
 func (x *Index) indexLocked(w *Watch, i int) {
 	spec := w.Holds[i]
 	if spec.Rel == nil || spec.Filter == nil {
@@ -162,7 +185,24 @@ func (x *Index) indexLocked(w *Watch, i int) {
 		x.rels[oid] = ri
 	}
 	ri.all[w] = true
-	r := route{indexed: true, oid: oid, col: spec.Filter.RoutingKey(spec.Rel)}
+	r := route{indexed: true, oid: oid, counted: spec.Filter.RoutingCandidates(spec.Rel)}
+	// Count the hold under every candidate column, then list it under the one
+	// whose lists are shortest on average: a change to one row then looks
+	// through the fewest holds, whatever order the issuer wrote the columns
+	// in. Ties go to the first in the filter.
+	best := -1.0
+	for _, col := range r.counted {
+		c := ri.cols[col]
+		if c == nil {
+			c = &colCount{byConst: map[string]int{}}
+			ri.cols[col] = c
+		}
+		c.holds++
+		c.byConst[spec.Filter.Equalities[col].String()]++
+		if m := c.meanList(); best < 0 || m < best {
+			r.col, best = col, m
+		}
+	}
 	if r.col == "" {
 		if !slices.Contains(ri.unindexed, w) {
 			ri.unindexed = append(ri.unindexed, w)
@@ -215,6 +255,21 @@ func (x *Index) unindexLocked(w *Watch, i int) {
 	ri := x.rels[r.oid]
 	if ri == nil {
 		return
+	}
+	spec := w.Holds[i]
+	for _, col := range r.counted {
+		c := ri.cols[col]
+		if c == nil {
+			continue
+		}
+		c.holds--
+		val := spec.Filter.Equalities[col].String()
+		if c.byConst[val]--; c.byConst[val] <= 0 {
+			delete(c.byConst, val)
+		}
+		if c.holds <= 0 {
+			delete(ri.cols, col)
+		}
 	}
 	delete(ri.all, w)
 	if r.col == "" {
@@ -594,4 +649,37 @@ func Exists(ctx context.Context, q Querier, specs []Spec) error {
 		}
 	}
 	return nil
+}
+
+// Size counts what the index holds, for tests and diagnostics: watches by
+// stream, constants and entries in the routing lists (with their capacity),
+// and unindexed watches.
+type Size struct {
+	Watches, Relations, Constants, Routed, RoutedCap, Unindexed int
+	// Counted is the constants counted per candidate column (relIndex.cols).
+	Counted int
+}
+
+func (x *Index) Size() Size {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	var s Size
+	for _, subs := range x.byStream {
+		s.Watches += len(subs)
+	}
+	s.Relations = len(x.rels)
+	for _, ri := range x.rels {
+		for _, byConst := range ri.byColumn {
+			s.Constants += len(byConst)
+			for _, list := range byConst {
+				s.Routed += len(list)
+				s.RoutedCap += cap(list)
+			}
+		}
+		s.Unindexed += len(ri.unindexed)
+		for _, c := range ri.cols {
+			s.Counted += len(c.byConst)
+		}
+	}
+	return s
 }
