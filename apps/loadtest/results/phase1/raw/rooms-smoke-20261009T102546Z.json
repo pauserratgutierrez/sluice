@@ -1,0 +1,1751 @@
+{
+  "scenario": "rooms",
+  "label": "smoke",
+  "target": "ghcr.io/pauserratgutierrez/sluice:0.8.0",
+  "started_at": "2026-10-09T10:24:40.951806854Z",
+  "finished_at": "2026-10-09T10:25:46.313133105Z",
+  "seed": 1484407748560536187,
+  "config": {
+    "classes": [
+      {
+        "count": 4,
+        "members": 20,
+        "streams": 5,
+        "typing": 1
+      }
+    ],
+    "shapes": 7,
+    "msg_every": 5000000000,
+    "typing_every": 2000000000,
+    "typing_enabled": true,
+    "duration": 60000000000,
+    "arrival": 0,
+    "arrival_traffic": true,
+    "wave": 256,
+    "open_timeout": 180000000000,
+    "token_every": 900000000000,
+    "token_ttl": 3600000000000,
+    "replica_identity": "full",
+    "sse_buffer": 16,
+    "sample_every": 5000000000,
+    "stats_every": 20000000000,
+    "drain": 5000000000,
+    "backoff": [
+      500000000,
+      1000000000,
+      2000000000,
+      5000000000,
+      10000000000
+    ],
+    "seed": 0,
+    "label": "smoke",
+    "p95_max": 500000000,
+    "delivery_min": 0.99,
+    "slot_lag_max_bytes": 67108864
+  },
+  "env": {
+    "DB_CPUSET": "6-9",
+    "ISSUER_CPUSET": "10,11",
+    "LOAD_ARRIVAL": "",
+    "LOAD_ARRIVAL_TRAFFIC": "",
+    "LOAD_AXIS": "all",
+    "LOAD_BACKOFF": "",
+    "LOAD_BIGTXN_AFTER": "",
+    "LOAD_BIGTXN_BASELINE": "",
+    "LOAD_BIGTXN_EVERY": "",
+    "LOAD_BIGTXN_REPEAT": "",
+    "LOAD_BIGTXN_ROWS": "",
+    "LOAD_BIGTXN_STREAMED": "",
+    "LOAD_BIGTXN_TIMEOUT": "",
+    "LOAD_CALIBRATE_WINDOW": "",
+    "LOAD_CALIBRATE_WINDOWS": "",
+    "LOAD_CHANGES": "20",
+    "LOAD_CHANNEL": "room:load",
+    "LOAD_DELIVERY_MIN": "",
+    "LOAD_DRAIN": "",
+    "LOAD_DURATION": "60s",
+    "LOAD_GRANULARITY": "50",
+    "LOAD_HOOK_TTL": "0",
+    "LOAD_HUNT": "",
+    "LOAD_IDLE_SHAPES": "",
+    "LOAD_ISSUER_CONCURRENCY": "32",
+    "LOAD_ISSUER_LATENCY": "5ms-20ms",
+    "LOAD_LABEL": "smoke",
+    "LOAD_LADDER": "",
+    "LOAD_MAX_STREAMS": "0",
+    "LOAD_MSG_EVERY": "5s",
+    "LOAD_OPEN_MIN": "0.95",
+    "LOAD_OPEN_TIMEOUT": "",
+    "LOAD_P95_MAX": "",
+    "LOAD_PROXY_DOWN": "",
+    "LOAD_RECONNECT_AFTER": "",
+    "LOAD_RECONNECT_COUNT": "",
+    "LOAD_RECONNECT_EVERY": "",
+    "LOAD_RECONNECT_MODE": "",
+    "LOAD_RECONNECT_TIMEOUT": "",
+    "LOAD_REPLICA_IDENTITY": "",
+    "LOAD_RESULTS": "/results",
+    "LOAD_ROOMS": "4",
+    "LOAD_ROOM_MEMBERS": "20",
+    "LOAD_ROOM_MIX": "",
+    "LOAD_ROOM_STREAMS": "5",
+    "LOAD_SAMPLE_EVERY": "",
+    "LOAD_SCENARIO": "rooms",
+    "LOAD_SEED": "",
+    "LOAD_SHAPES": "",
+    "LOAD_SLOT": "load_rooms",
+    "LOAD_SLOT_LAG_MAX_MB": "",
+    "LOAD_SSE_BUFFER": "",
+    "LOAD_START": "100",
+    "LOAD_STATS_EVERY": "20s",
+    "LOAD_STREAMS": "",
+    "LOAD_TOKEN_EVERY": "",
+    "LOAD_TOKEN_TTL": "",
+    "LOAD_TYPING": "",
+    "LOAD_TYPING_ENABLED": "",
+    "LOAD_TYPING_EVERY": "",
+    "LOAD_WAVE": "256",
+    "POSTGRES_IMAGE": "postgres:18.6-trixie",
+    "PROXY_CPUSET": "12,13",
+    "RUNNER_CPUSET": "14-19",
+    "SLUICE_CPUS": "1",
+    "SLUICE_CPUSET": "2,3",
+    "SLUICE_IMAGE": "ghcr.io/pauserratgutierrez/sluice:0.8.0",
+    "SLUICE_MAX_STREAMS": "5000",
+    "SLUICE_MEM_LIMIT": "512m",
+    "SLUICE_METRICS_URL": "http://sluice-rooms:4000/metrics",
+    "SLUICE_URL": "http://sluice-rooms:4000/sluice/v1"
+  },
+  "host": {
+    "cpu_model": "12th Gen Intel(R) Core(TM) i7-12700H",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "runner_cpus": 6,
+    "runner_mem_mib": 6144,
+    "sluice_gomaxprocs": 2,
+    "sluice_gomemlimit_mib": 460.79999923706055
+  },
+  "expected": {
+    "rooms": 4,
+    "members": 80,
+    "streams": 20,
+    "changes_per_s": 16.8,
+    "message_events_per_s": 4,
+    "member_events_per_s": 4,
+    "typing_events_per_s": 8,
+    "events_per_s": 16
+  },
+  "arrival_seconds": 0.202,
+  "arrival_complete": true,
+  "kib_per_stream": 321.2,
+  "phases": [
+    {
+      "name": "arrival",
+      "from_s": 0.010079546,
+      "to_s": 0.291149311,
+      "duration_s": 0.211525521,
+      "events": 4,
+      "events_per_s": 18.9102477142699,
+      "events_per_s_peak": 0,
+      "changes_per_s": 378.20495428539806,
+      "delivery": {
+        "typing": {
+          "expected": 4,
+          "received": 4,
+          "pct": 100
+        }
+      },
+      "latency": {
+        "open": {
+          "count": 20,
+          "p50_ms": 101.888,
+          "p95_ms": 118.272,
+          "p99_ms": 118.272,
+          "max_ms": 119.918,
+          "mean_ms": 104.03545
+        },
+        "publish": {
+          "count": 1,
+          "p50_ms": 2.862,
+          "p95_ms": 2.862,
+          "p99_ms": 2.862,
+          "max_ms": 2.862,
+          "mean_ms": 2.862
+        },
+        "typing": {
+          "count": 4,
+          "p50_ms": 2.992,
+          "p95_ms": 2.992,
+          "p99_ms": 2.992,
+          "max_ms": 3.027,
+          "mean_ms": 2.9915
+        }
+      },
+      "sluice_cpu_s": 0.06,
+      "cpu_ms_per_1k_events": 15000,
+      "cpu_ms_per_open": 3,
+      "sluice_cores_avg": 0.2836537157140485,
+      "sluice_cores_peak": 0.2134701325843425,
+      "rss_peak_mib": 24.0625,
+      "go_mem_peak_mib": 15.240486145019531,
+      "heap_live_peak_mib": 9.859375,
+      "gomemlimit_mib": 460.79999923706055,
+      "goroutines_peak": 205,
+      "gc_count": 2,
+      "gc_pause_max_ms": 0.062442,
+      "gc_pause_total_ms": 0.090237,
+      "dispatch_avg_us": 1.8431749999999991,
+      "backlog_max_bytes": 752,
+      "backlog_first_quarter_bytes": 0,
+      "backlog_last_quarter_bytes": 0,
+      "slot_lag_max_bytes": 78064,
+      "retained_max_bytes": 78120,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "sluice_restarts": 0,
+      "open_attempts": 20,
+      "open_failures": 0,
+      "issuer_calls_per_s": 756.4099085707961,
+      "issuer_peak_per_s": 160,
+      "issuer_peak_by_kind": {
+        "hook": 20,
+        "subscribe": 140
+      },
+      "issuer_queued_peak": 0,
+      "issuer_inflight_peak": 0,
+      "issuer_cores_peak": 0,
+      "runner_cores_avg": 0.0711567108614475,
+      "runner_cores_peak": 0.0711567108614475,
+      "runner_rss_peak_mib": 15.3125,
+      "containers": {
+        "db": {
+          "cores_avg": 0.06681311983193759,
+          "cores_peak": 0.06681311983193759,
+          "mem_peak_mib": 88.5546875
+        },
+        "issuer": {
+          "cores_avg": 0.11438127769958326,
+          "cores_peak": 0.11438127769958326,
+          "mem_peak_mib": 5.515625
+        },
+        "jwks": {
+          "cores_avg": 0,
+          "cores_peak": 0,
+          "mem_peak_mib": 3.21484375
+        },
+        "runner-rooms": {
+          "cores_avg": 0.06407303129014646,
+          "cores_peak": 0.06407303129014646,
+          "mem_peak_mib": 7.671875
+        },
+        "sluice-rooms": {
+          "cores_avg": 0.22901323934484005,
+          "cores_peak": 0.22901323934484005,
+          "mem_peak_mib": 12.8984375
+        }
+      }
+    },
+    {
+      "name": "steady",
+      "from_s": 0.291149311,
+      "to_s": 65.301831531,
+      "duration_s": 65.064753541,
+      "events": 960,
+      "events_per_s": 14.754532181468484,
+      "events_per_s_peak": 22,
+      "changes_per_s": 15.492258790541907,
+      "delivery": {
+        "member": {
+          "expected": 240,
+          "received": 240,
+          "pct": 100
+        },
+        "message": {
+          "expected": 240,
+          "received": 240,
+          "pct": 100
+        },
+        "typing": {
+          "expected": 480,
+          "received": 480,
+          "pct": 100
+        }
+      },
+      "latency": {
+        "member": {
+          "count": 240,
+          "p50_ms": 177.152,
+          "p95_ms": 374.784,
+          "p99_ms": 402.493,
+          "max_ms": 402.493,
+          "mean_ms": 190.83288333333334
+        },
+        "message": {
+          "count": 240,
+          "p50_ms": 177.152,
+          "p95_ms": 374.784,
+          "p99_ms": 402.418,
+          "max_ms": 402.418,
+          "mean_ms": 190.71132500000002
+        },
+        "publish": {
+          "count": 120,
+          "p50_ms": 0.836,
+          "p95_ms": 1.576,
+          "p99_ms": 1.72,
+          "max_ms": 2.026,
+          "mean_ms": 0.9476416666666666
+        },
+        "token": {
+          "count": 1,
+          "p50_ms": 117.201,
+          "p95_ms": 117.201,
+          "p99_ms": 117.201,
+          "max_ms": 117.201,
+          "mean_ms": 117.201
+        },
+        "txn": {
+          "count": 48,
+          "p50_ms": 0.62,
+          "p95_ms": 1.208,
+          "p99_ms": 1.368,
+          "max_ms": 1.611,
+          "mean_ms": 0.7300208333333333
+        },
+        "typing": {
+          "count": 480,
+          "p50_ms": 0.804,
+          "p95_ms": 1.512,
+          "p99_ms": 1.848,
+          "max_ms": 2.15,
+          "mean_ms": 0.9372270833333334
+        }
+      },
+      "sluice_cpu_s": 0.31,
+      "cpu_ms_per_1k_events": 322.9166666666667,
+      "sluice_cores_avg": 0.004764484350265864,
+      "sluice_cores_peak": 0.007999938552471974,
+      "rss_peak_mib": 28.75,
+      "go_mem_peak_mib": 19.39673614501953,
+      "heap_live_peak_mib": 12.0546875,
+      "gomemlimit_mib": 460.79999923706055,
+      "goroutines_peak": 218,
+      "gc_count": 8,
+      "gc_pause_max_ms": 0.293656,
+      "gc_pause_total_ms": 0.7336750000000001,
+      "dispatch_avg_us": 45.90534821428575,
+      "backlog_max_bytes": 752,
+      "backlog_first_quarter_bytes": 250.66666666666666,
+      "backlog_last_quarter_bytes": 0,
+      "slot_lag_max_bytes": 78064,
+      "retained_max_bytes": 300744,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "sluice_restarts": 0,
+      "open_attempts": 0,
+      "open_failures": 0,
+      "issuer_calls_per_s": 3.1968153059848383,
+      "issuer_peak_per_s": 160,
+      "issuer_peak_by_kind": {
+        "hook": 21,
+        "refresh": 7,
+        "subscribe": 140
+      },
+      "issuer_queued_peak": 0,
+      "issuer_inflight_peak": 0,
+      "issuer_cores_peak": 0.0020000798091846256,
+      "runner_cores_avg": 0.006328812266466443,
+      "runner_cores_peak": 0.03436732682841863,
+      "runner_rss_peak_mib": 17.015625,
+      "containers": {
+        "db": {
+          "cores_avg": 0.010255452162142766,
+          "cores_peak": 0.018211491936649164,
+          "mem_peak_mib": 98.6171875
+        },
+        "issuer": {
+          "cores_avg": 0.004136724328369606,
+          "cores_peak": 0.005599285019801974,
+          "mem_peak_mib": 6.58984375
+        },
+        "jwks": {
+          "cores_avg": 0.0037433147028134743,
+          "cores_peak": 0.0045008385525015585,
+          "mem_peak_mib": 3.3359375
+        },
+        "runner-rooms": {
+          "cores_avg": 0.005452969686320562,
+          "cores_peak": 0.020689511110075685,
+          "mem_peak_mib": 9.78125
+        },
+        "sluice-rooms": {
+          "cores_avg": 0.01534091973538243,
+          "cores_peak": 0.019394654064537314,
+          "mem_peak_mib": 27.2734375
+        }
+      }
+    },
+    {
+      "name": "run",
+      "from_s": 0.010079546,
+      "to_s": 65.301831531,
+      "duration_s": 65.276279062,
+      "events": 964,
+      "events_per_s": 14.767998633690258,
+      "events_per_s_peak": 22,
+      "changes_per_s": 16.667616715202282,
+      "delivery": {
+        "member": {
+          "expected": 240,
+          "received": 240,
+          "pct": 100
+        },
+        "message": {
+          "expected": 240,
+          "received": 240,
+          "pct": 100
+        },
+        "typing": {
+          "expected": 484,
+          "received": 484,
+          "pct": 100
+        }
+      },
+      "latency": {
+        "member": {
+          "count": 240,
+          "p50_ms": 177.152,
+          "p95_ms": 374.784,
+          "p99_ms": 402.493,
+          "max_ms": 402.493,
+          "mean_ms": 190.83288333333334
+        },
+        "message": {
+          "count": 240,
+          "p50_ms": 177.152,
+          "p95_ms": 374.784,
+          "p99_ms": 402.418,
+          "max_ms": 402.418,
+          "mean_ms": 190.71132500000002
+        },
+        "open": {
+          "count": 20,
+          "p50_ms": 101.888,
+          "p95_ms": 118.272,
+          "p99_ms": 118.272,
+          "max_ms": 119.918,
+          "mean_ms": 104.03545
+        },
+        "publish": {
+          "count": 121,
+          "p50_ms": 0.836,
+          "p95_ms": 1.64,
+          "p99_ms": 1.832,
+          "max_ms": 2.862,
+          "mean_ms": 0.9634628099173553
+        },
+        "token": {
+          "count": 1,
+          "p50_ms": 117.201,
+          "p95_ms": 117.201,
+          "p99_ms": 117.201,
+          "max_ms": 117.201,
+          "mean_ms": 117.201
+        },
+        "txn": {
+          "count": 48,
+          "p50_ms": 0.62,
+          "p95_ms": 1.208,
+          "p99_ms": 1.368,
+          "max_ms": 1.611,
+          "mean_ms": 0.7300208333333333
+        },
+        "typing": {
+          "count": 484,
+          "p50_ms": 0.804,
+          "p95_ms": 1.544,
+          "p99_ms": 2.128,
+          "max_ms": 3.027,
+          "mean_ms": 0.9542045454545455
+        }
+      },
+      "sluice_cpu_s": 0.37,
+      "cpu_ms_per_1k_events": 383.81742738589213,
+      "sluice_cores_avg": 0.005668215243221365,
+      "sluice_cores_peak": 0.2134701325843425,
+      "rss_peak_mib": 28.75,
+      "go_mem_peak_mib": 19.39673614501953,
+      "heap_live_peak_mib": 12.0546875,
+      "gomemlimit_mib": 460.79999923706055,
+      "goroutines_peak": 218,
+      "gc_count": 10,
+      "gc_pause_max_ms": 0.293656,
+      "gc_pause_total_ms": 0.823912,
+      "dispatch_avg_us": 42.665482536764735,
+      "backlog_max_bytes": 752,
+      "backlog_first_quarter_bytes": 188,
+      "backlog_last_quarter_bytes": 0,
+      "slot_lag_max_bytes": 78064,
+      "retained_max_bytes": 300744,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "sluice_restarts": 0,
+      "open_attempts": 20,
+      "open_failures": 0,
+      "issuer_calls_per_s": 3.186456136729848,
+      "issuer_peak_per_s": 160,
+      "issuer_peak_by_kind": {
+        "hook": 21,
+        "refresh": 7,
+        "subscribe": 140
+      },
+      "issuer_queued_peak": 0,
+      "issuer_inflight_peak": 0,
+      "issuer_cores_peak": 0.0020000798091846256,
+      "runner_cores_avg": 0.010650672172798515,
+      "runner_cores_peak": 0.0711567108614475,
+      "runner_rss_peak_mib": 17.015625,
+      "containers": {
+        "db": {
+          "cores_avg": 0.014025963340129089,
+          "cores_peak": 0.06681311983193759,
+          "mem_peak_mib": 98.6171875
+        },
+        "issuer": {
+          "cores_avg": 0.011486361219783848,
+          "cores_peak": 0.11438127769958326,
+          "mem_peak_mib": 6.58984375
+        },
+        "jwks": {
+          "cores_avg": 0.003493760389292576,
+          "cores_peak": 0.0045008385525015585,
+          "mem_peak_mib": 3.3359375
+        },
+        "runner-rooms": {
+          "cores_avg": 0.00936097379324229,
+          "cores_peak": 0.06407303129014646,
+          "mem_peak_mib": 9.78125
+        },
+        "sluice-rooms": {
+          "cores_avg": 0.029585741042679605,
+          "cores_peak": 0.22901323934484005,
+          "mem_peak_mib": 27.2734375
+        }
+      }
+    }
+  ],
+  "verdict": {
+    "pass": true
+  },
+  "counters": {
+    "sub_ok": 160,
+    "token_ok": 1,
+    "warning:replica_identity_insufficient": 20
+  },
+  "windows": [
+    {
+      "t": 20.011194899,
+      "phase": "steady",
+      "latency": {
+        "member": {
+          "count": 80,
+          "p50_ms": 177.152,
+          "p95_ms": 402.493,
+          "p99_ms": 402.493,
+          "max_ms": 402.493,
+          "mean_ms": 202.0511375
+        },
+        "message": {
+          "count": 80,
+          "p50_ms": 177.152,
+          "p95_ms": 402.418,
+          "p99_ms": 402.418,
+          "max_ms": 402.418,
+          "mean_ms": 201.9569375
+        },
+        "open": {
+          "count": 20,
+          "p50_ms": 101.888,
+          "p95_ms": 118.272,
+          "p99_ms": 118.272,
+          "max_ms": 119.918,
+          "mean_ms": 104.03545
+        },
+        "publish": {
+          "count": 40,
+          "p50_ms": 0.836,
+          "p95_ms": 1.672,
+          "p99_ms": 1.832,
+          "max_ms": 2.862,
+          "mean_ms": 1.028775
+        },
+        "txn": {
+          "count": 16,
+          "p50_ms": 0.676,
+          "p95_ms": 1.368,
+          "p99_ms": 1.368,
+          "max_ms": 1.611,
+          "mean_ms": 0.812875
+        },
+        "typing": {
+          "count": 160,
+          "p50_ms": 0.82,
+          "p95_ms": 1.816,
+          "p99_ms": 2.992,
+          "max_ms": 3.027,
+          "mean_ms": 1.02421875
+        }
+      }
+    },
+    {
+      "t": 40.011149327,
+      "phase": "steady",
+      "latency": {
+        "member": {
+          "count": 80,
+          "p50_ms": 166.912,
+          "p95_ms": 382.976,
+          "p99_ms": 382.976,
+          "max_ms": 384.098,
+          "mean_ms": 179.3743875
+        },
+        "message": {
+          "count": 80,
+          "p50_ms": 166.912,
+          "p95_ms": 382.976,
+          "p99_ms": 382.976,
+          "max_ms": 383.89,
+          "mean_ms": 179.26532500000002
+        },
+        "publish": {
+          "count": 40,
+          "p50_ms": 0.772,
+          "p95_ms": 1.576,
+          "p99_ms": 1.64,
+          "max_ms": 1.725,
+          "mean_ms": 0.926925
+        },
+        "token": {
+          "count": 1,
+          "p50_ms": 117.201,
+          "p95_ms": 117.201,
+          "p99_ms": 117.201,
+          "max_ms": 117.201,
+          "mean_ms": 117.201
+        },
+        "txn": {
+          "count": 16,
+          "p50_ms": 0.588,
+          "p95_ms": 0.972,
+          "p99_ms": 0.972,
+          "max_ms": 1.2,
+          "mean_ms": 0.6663125
+        },
+        "typing": {
+          "count": 160,
+          "p50_ms": 0.772,
+          "p95_ms": 1.512,
+          "p99_ms": 1.688,
+          "max_ms": 1.699,
+          "mean_ms": 0.91724375
+        }
+      }
+    },
+    {
+      "t": 60.011831056,
+      "phase": "steady",
+      "latency": {
+        "member": {
+          "count": 80,
+          "p50_ms": 171.008,
+          "p95_ms": 374.784,
+          "p99_ms": 374.784,
+          "max_ms": 374.96,
+          "mean_ms": 191.073125
+        },
+        "message": {
+          "count": 80,
+          "p50_ms": 171.008,
+          "p95_ms": 374.784,
+          "p99_ms": 374.784,
+          "max_ms": 374.822,
+          "mean_ms": 190.9117125
+        },
+        "publish": {
+          "count": 40,
+          "p50_ms": 0.844,
+          "p95_ms": 1.256,
+          "p99_ms": 1.464,
+          "max_ms": 2.026,
+          "mean_ms": 0.9327000000000001
+        },
+        "txn": {
+          "count": 16,
+          "p50_ms": 0.62,
+          "p95_ms": 1.012,
+          "p99_ms": 1.012,
+          "max_ms": 1.144,
+          "mean_ms": 0.710875
+        },
+        "typing": {
+          "count": 160,
+          "p50_ms": 0.796,
+          "p95_ms": 1.336,
+          "p99_ms": 2.128,
+          "max_ms": 2.15,
+          "mean_ms": 0.91385625
+        }
+      }
+    }
+  ],
+  "events_per_second": [
+    22,
+    4,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    22,
+    4,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    22,
+    4,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    22,
+    4,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    22,
+    4,
+    22,
+    14,
+    22,
+    14,
+    12,
+    14,
+    22,
+    14,
+    4,
+    0,
+    0,
+    0,
+    0
+  ],
+  "issuer_seconds": [
+    {
+      "at": 1791541481,
+      "n": {
+        "hook": 20,
+        "subscribe": 140
+      }
+    },
+    {
+      "at": 1791541505,
+      "n": {
+        "hook": 21,
+        "refresh": 7
+      }
+    },
+    {
+      "at": 1791541535,
+      "n": {
+        "hook": 20
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "t": 0.010079546,
+      "phase": "start",
+      "sluice_streams": 0,
+      "live_clients": 0,
+      "sluice_cpu_s": 0,
+      "sluice_cores": 0,
+      "rss_mib": 15,
+      "go_mem_mib": 7.295173645019531,
+      "heap_live_mib": 3.5859375,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 16,
+      "gc_count": 0,
+      "gc_pause_s": 0,
+      "gc_pause_max_ms": 0,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 0,
+      "changes_per_s": 0,
+      "dispatch_s": 0,
+      "dispatch_count": 0,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 36312,
+      "retained_bytes": 36368,
+      "send_lag_bytes": 0,
+      "events": 0,
+      "events_per_s": 0,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0,
+      "runner_rss_mib": 13.4375,
+      "runner_goroutines": 13,
+      "containers": {
+        "db": {
+          "cores": 0,
+          "mem_mib": 86.2734375
+        },
+        "issuer": {
+          "cores": 0,
+          "mem_mib": 1.875
+        },
+        "jwks": {
+          "cores": 0,
+          "mem_mib": 3.21484375
+        },
+        "runner-rooms": {
+          "cores": 0,
+          "mem_mib": 6.6875
+        },
+        "sluice-rooms": {
+          "cores": 0,
+          "mem_mib": 5.20703125
+        }
+      }
+    },
+    {
+      "t": 0.291149311,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.06,
+      "sluice_cores": 0.2134701325843425,
+      "rss_mib": 24.0625,
+      "go_mem_mib": 15.240486145019531,
+      "heap_live_mib": 9.859375,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 205,
+      "gc_count": 2,
+      "gc_pause_s": 0.000090237,
+      "gc_pause_max_ms": 0.062442,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 80,
+      "changes_per_s": 284.62684344579003,
+      "dispatch_s": 0.00014745399999999993,
+      "dispatch_count": 80,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 752,
+      "slot_lag_bytes": 78064,
+      "retained_bytes": 78120,
+      "send_lag_bytes": 752,
+      "events": 4,
+      "events_per_s": 14.231342172289501,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.0711567108614475,
+      "runner_rss_mib": 15.3125,
+      "runner_goroutines": 93,
+      "containers": {
+        "db": {
+          "cores": 0.06681311983193759,
+          "mem_mib": 88.5546875
+        },
+        "issuer": {
+          "cores": 0.11438127769958326,
+          "mem_mib": 5.515625
+        },
+        "jwks": {
+          "cores": 0,
+          "mem_mib": 3.21484375
+        },
+        "runner-rooms": {
+          "cores": 0.06407303129014646,
+          "mem_mib": 7.671875
+        },
+        "sluice-rooms": {
+          "cores": 0.22901323934484005,
+          "mem_mib": 12.8984375
+        }
+      }
+    },
+    {
+      "t": 5.010656318,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.09,
+      "sluice_cores": 0.006356596135042035,
+      "rss_mib": 25.15625,
+      "go_mem_mib": 16.07642364501953,
+      "heap_live_mib": 8.6640625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 205,
+      "gc_count": 4,
+      "gc_pause_s": 0.000453076,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 164,
+      "changes_per_s": 17.798469178117696,
+      "dispatch_s": 0.006620695999999999,
+      "dispatch_count": 164,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 103576,
+      "send_lag_bytes": 0,
+      "events": 84,
+      "events_per_s": 16.95092302677876,
+      "issuer_calls_per_s": 33.90184605355752,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.004237730756694691,
+      "runner_rss_mib": 15.625,
+      "runner_goroutines": 91,
+      "containers": {
+        "db": {
+          "cores": 0.011604407314778124,
+          "mem_mib": 88.41015625
+        },
+        "issuer": {
+          "cores": 0.004791897240608551,
+          "mem_mib": 5.44140625
+        },
+        "jwks": {
+          "cores": 0.004307494911881563,
+          "mem_mib": 3.2265625
+        },
+        "runner-rooms": {
+          "cores": 0.004671053737939703,
+          "mem_mib": 8.5234375
+        },
+        "sluice-rooms": {
+          "cores": 0.015073198039791158,
+          "mem_mib": 24.08203125
+        }
+      }
+    },
+    {
+      "t": 10.010456803,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.11,
+      "sluice_cores": 0.004000159618369253,
+      "rss_mib": 25.78125,
+      "go_mem_mib": 16.69361114501953,
+      "heap_live_mib": 10.390625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 205,
+      "gc_count": 4,
+      "gc_pause_s": 0.000453076,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 248,
+      "changes_per_s": 16.80067039715086,
+      "dispatch_s": 0.009989693000000001,
+      "dispatch_count": 248,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 22328,
+      "retained_bytes": 22328,
+      "send_lag_bytes": 0,
+      "events": 160,
+      "events_per_s": 15.200606549803158,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0.0020000798091846256,
+      "runner_cores": 0.006000239427553878,
+      "runner_rss_mib": 15.9375,
+      "runner_goroutines": 85,
+      "containers": {
+        "db": {
+          "cores": 0.009831858287997895,
+          "mem_mib": 88.73828125
+        },
+        "issuer": {
+          "cores": 0.004370864949611297,
+          "mem_mib": 5.765625
+        },
+        "jwks": {
+          "cores": 0.004115788521955656,
+          "mem_mib": 3.28125
+        },
+        "runner-rooms": {
+          "cores": 0.004029662054694104,
+          "mem_mib": 8.296875
+        },
+        "sluice-rooms": {
+          "cores": 0.018043312508795095,
+          "mem_mib": 25.015625
+        }
+      }
+    },
+    {
+      "t": 15.010545816,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.13,
+      "sluice_cores": 0.003999928790867708,
+      "rss_mib": 26.5625,
+      "go_mem_mib": 17.32642364501953,
+      "heap_live_mib": 10.2578125,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 205,
+      "gc_count": 5,
+      "gc_pause_s": 0.000511446,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 332,
+      "changes_per_s": 16.799700921644373,
+      "dispatch_s": 0.013245442000000001,
+      "dispatch_count": 332,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 35912,
+      "send_lag_bytes": 0,
+      "events": 244,
+      "events_per_s": 16.799700921644373,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.0019999643954338527,
+      "runner_rss_mib": 16.09375,
+      "runner_goroutines": 83,
+      "containers": {
+        "db": {
+          "cores": 0.009924653779596422,
+          "mem_mib": 88.5625
+        },
+        "issuer": {
+          "cores": 0.004182192057037181,
+          "mem_mib": 5.99609375
+        },
+        "jwks": {
+          "cores": 0.0045008385525015585,
+          "mem_mib": 3.3203125
+        },
+        "runner-rooms": {
+          "cores": 0.005161196278640565,
+          "mem_mib": 8.66796875
+        },
+        "sluice-rooms": {
+          "cores": 0.013507279238044375,
+          "mem_mib": 25.06640625
+        }
+      }
+    },
+    {
+      "t": 20.011213776,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.16,
+      "sluice_cores": 0.0059991985550666305,
+      "rss_mib": 26.875,
+      "go_mem_mib": 17.32642364501953,
+      "heap_live_mib": 11.6953125,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 205,
+      "gc_count": 5,
+      "gc_pause_s": 0.000511446,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 416,
+      "changes_per_s": 16.797755954186567,
+      "dispatch_s": 0.016381232000000006,
+      "dispatch_count": 416,
+      "resume_buffer_mib": 0,
+      "hook_rechecks": 0,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 13048,
+      "retained_bytes": 48960,
+      "send_lag_bytes": 0,
+      "events": 320,
+      "events_per_s": 15.197969672835466,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.0059991985550666305,
+      "runner_rss_mib": 16.25,
+      "runner_goroutines": 89,
+      "containers": {
+        "db": {
+          "cores": 0.009369804796667448,
+          "mem_mib": 88.57421875
+        },
+        "issuer": {
+          "cores": 0.004060255657538399,
+          "mem_mib": 6.046875
+        },
+        "jwks": {
+          "cores": 0.0038462051642307975,
+          "mem_mib": 3.30078125
+        },
+        "runner-rooms": {
+          "cores": 0.00407075361769722,
+          "mem_mib": 8.96484375
+        },
+        "sluice-rooms": {
+          "cores": 0.018050710150565016,
+          "mem_mib": 25.3671875
+        }
+      }
+    },
+    {
+      "t": 25.010689824,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.19,
+      "sluice_cores": 0.006000628808293072,
+      "rss_mib": 26.875,
+      "go_mem_mib": 17.35767364501953,
+      "heap_live_mib": 10.6328125,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 6,
+      "gc_pause_s": 0.000576495,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 500,
+      "changes_per_s": 16.801760663220602,
+      "dispatch_s": 0.01981247100000001,
+      "dispatch_count": 500,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 274968,
+      "send_lag_bytes": 0,
+      "events": 404,
+      "events_per_s": 16.801760663220602,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.004000419205528719,
+      "runner_rss_mib": 16.5625,
+      "runner_goroutines": 93,
+      "containers": {
+        "db": {
+          "cores": 0.018211491936649164,
+          "mem_mib": 94.7265625
+        },
+        "issuer": {
+          "cores": 0.005599285019801974,
+          "mem_mib": 6.33203125
+        },
+        "jwks": {
+          "cores": 0.003797881914736355,
+          "mem_mib": 3.3046875
+        },
+        "runner-rooms": {
+          "cores": 0.004773656466455919,
+          "mem_mib": 8.7734375
+        },
+        "sluice-rooms": {
+          "cores": 0.015947190549790453,
+          "mem_mib": 25.609375
+        }
+      }
+    },
+    {
+      "t": 30.011253764,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.21000000000000002,
+      "sluice_cores": 0.003999548898878796,
+      "rss_mib": 26.875,
+      "go_mem_mib": 17.35767364501953,
+      "heap_live_mib": 10.0234375,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 7,
+      "gc_pause_s": 0.000648783,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 584,
+      "changes_per_s": 16.79810537529093,
+      "dispatch_s": 0.02354137700000002,
+      "dispatch_count": 584,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 12752,
+      "retained_bytes": 287720,
+      "send_lag_bytes": 0,
+      "events": 480,
+      "events_per_s": 15.198285815739414,
+      "issuer_calls_per_s": 5.599368458430311,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0.001999774449439397,
+      "runner_cores": 0.003999548898878791,
+      "runner_rss_mib": 16.5625,
+      "runner_goroutines": 87,
+      "containers": {
+        "db": {
+          "cores": 0.00952557717353925,
+          "mem_mib": 94.5234375
+        },
+        "issuer": {
+          "cores": 0.004238921993238919,
+          "mem_mib": 6.3515625
+        },
+        "jwks": {
+          "cores": 0.004197115360489385,
+          "mem_mib": 3.31640625
+        },
+        "runner-rooms": {
+          "cores": 0.004456261914584787,
+          "mem_mib": 8.80859375
+        },
+        "sluice-rooms": {
+          "cores": 0.013769153442398353,
+          "mem_mib": 25.36328125
+        }
+      }
+    },
+    {
+      "t": 35.011113674,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.23,
+      "sluice_cores": 0.00400011207514012,
+      "rss_mib": 26.875,
+      "go_mem_mib": 17.35767364501953,
+      "heap_live_mib": 10.296875,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 8,
+      "gc_pause_s": 0.000691195,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 668,
+      "changes_per_s": 16.80047071558851,
+      "dispatch_s": 0.026701841000000018,
+      "dispatch_count": 668,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 300744,
+      "send_lag_bytes": 0,
+      "events": 564,
+      "events_per_s": 16.80047071558851,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.00400011207514012,
+      "runner_rss_mib": 16.5625,
+      "runner_goroutines": 91,
+      "containers": {
+        "db": {
+          "cores": 0.009735810155107648,
+          "mem_mib": 94.32421875
+        },
+        "issuer": {
+          "cores": 0.004415451034210019,
+          "mem_mib": 6.08203125
+        },
+        "jwks": {
+          "cores": 0.004197169784704457,
+          "mem_mib": 3.31640625
+        },
+        "runner-rooms": {
+          "cores": 0.003991589707130613,
+          "mem_mib": 9.125
+        },
+        "sluice-rooms": {
+          "cores": 0.018819248294523055,
+          "mem_mib": 25.3671875
+        }
+      }
+    },
+    {
+      "t": 40.011154007,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.25,
+      "sluice_cores": 0.003999967733860276,
+      "rss_mib": 27.03125,
+      "go_mem_mib": 17.38111114501953,
+      "heap_live_mib": 11.890625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 8,
+      "gc_pause_s": 0.000691195,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 752,
+      "changes_per_s": 16.799864482213167,
+      "dispatch_s": 0.030065306,
+      "dispatch_count": 752,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 12720,
+      "retained_bytes": 12720,
+      "send_lag_bytes": 0,
+      "events": 640,
+      "events_per_s": 15.199877388669055,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.003999967733860282,
+      "runner_rss_mib": 16.703125,
+      "runner_goroutines": 93,
+      "containers": {
+        "db": {
+          "cores": 0.009961117777336877,
+          "mem_mib": 94.7734375
+        },
+        "issuer": {
+          "cores": 0.004225372937734455,
+          "mem_mib": 6.3046875
+        },
+        "jwks": {
+          "cores": 0.00382811095935187,
+          "mem_mib": 3.32421875
+        },
+        "runner-rooms": {
+          "cores": 0.004588496399881822,
+          "mem_mib": 9.2265625
+        },
+        "sluice-rooms": {
+          "cores": 0.013663387036137712,
+          "mem_mib": 25.48046875
+        }
+      }
+    },
+    {
+      "t": 45.011192412,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.29,
+      "sluice_cores": 0.007999938552471974,
+      "rss_mib": 28.125,
+      "go_mem_mib": 18.51392364501953,
+      "heap_live_mib": 10.1796875,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 9,
+      "gc_pause_s": 0.000732897,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 836,
+      "changes_per_s": 16.799870960191157,
+      "dispatch_s": 0.033738888,
+      "dispatch_count": 836,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 25496,
+      "send_lag_bytes": 0,
+      "events": 724,
+      "events_per_s": 16.799870960191157,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.005999953914353984,
+      "runner_rss_mib": 16.703125,
+      "runner_goroutines": 91,
+      "containers": {
+        "db": {
+          "cores": 0.0103664767080881,
+          "mem_mib": 94.81640625
+        },
+        "issuer": {
+          "cores": 0.004258600120200269,
+          "mem_mib": 6.18359375
+        },
+        "jwks": {
+          "cores": 0.00387473259441165,
+          "mem_mib": 3.328125
+        },
+        "runner-rooms": {
+          "cores": 0.004188174872696302,
+          "mem_mib": 9.05078125
+        },
+        "sluice-rooms": {
+          "cores": 0.018282362633986346,
+          "mem_mib": 27.03125
+        }
+      }
+    },
+    {
+      "t": 50.010340524,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.3,
+      "sluice_cores": 0.0020003408132669483,
+      "rss_mib": 28.125,
+      "go_mem_mib": 18.67798614501953,
+      "heap_live_mib": 11.65625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 9,
+      "gc_pause_s": 0.000732897,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 920,
+      "changes_per_s": 16.80286283144235,
+      "dispatch_s": 0.037373637,
+      "dispatch_count": 920,
+      "resume_buffer_mib": 0.21156978607177734,
+      "hook_rechecks": 21,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 13048,
+      "retained_bytes": 38544,
+      "send_lag_bytes": 0,
+      "events": 800,
+      "events_per_s": 15.202590180828793,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.004000681626533891,
+      "runner_rss_mib": 16.703125,
+      "runner_goroutines": 89,
+      "containers": {
+        "db": {
+          "cores": 0.00996276797602118,
+          "mem_mib": 94.55859375
+        },
+        "issuer": {
+          "cores": 0.004228511563071612,
+          "mem_mib": 6.58984375
+        },
+        "jwks": {
+          "cores": 0.003875646631130924,
+          "mem_mib": 3.328125
+        },
+        "runner-rooms": {
+          "cores": 0.004299245719961326,
+          "mem_mib": 8.94921875
+        },
+        "sluice-rooms": {
+          "cores": 0.013239928115728352,
+          "mem_mib": 26.60546875
+        }
+      }
+    },
+    {
+      "t": 55.010435854,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.33999999999999997,
+      "sluice_cores": 0.00799984747490804,
+      "rss_mib": 28.4375,
+      "go_mem_mib": 18.81861114501953,
+      "heap_live_mib": 10.4140625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 10,
+      "gc_pause_s": 0.000823912,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 1004,
+      "changes_per_s": 16.799679697306892,
+      "dispatch_s": 0.041442298000000044,
+      "dispatch_count": 1004,
+      "resume_buffer_mib": 0.44358253479003906,
+      "hook_rechecks": 41,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 12736,
+      "send_lag_bytes": 0,
+      "events": 884,
+      "events_per_s": 16.799679697306892,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.003999923737454026,
+      "runner_rss_mib": 16.703125,
+      "runner_goroutines": 93,
+      "containers": {
+        "db": {
+          "cores": 0.013900641461807084,
+          "mem_mib": 97.1953125
+        },
+        "issuer": {
+          "cores": 0.0044084591736487325,
+          "mem_mib": 6.46484375
+        },
+        "jwks": {
+          "cores": 0.0039756355979264964,
+          "mem_mib": 3.328125
+        },
+        "runner-rooms": {
+          "cores": 0.004154074429856062,
+          "mem_mib": 9.4609375
+        },
+        "sluice-rooms": {
+          "cores": 0.019394654064537314,
+          "mem_mib": 27.18359375
+        }
+      }
+    },
+    {
+      "t": 60.011849107,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.36,
+      "sluice_cores": 0.0039988697170751505,
+      "rss_mib": 28.75,
+      "go_mem_mib": 19.39673614501953,
+      "heap_live_mib": 11.6640625,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 10,
+      "gc_pause_s": 0.000823912,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 1088,
+      "changes_per_s": 16.795252811715617,
+      "dispatch_s": 0.046420045000000035,
+      "dispatch_count": 1088,
+      "resume_buffer_mib": 0.44358253479003906,
+      "hook_rechecks": 41,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 12640,
+      "retained_bytes": 25376,
+      "send_lag_bytes": 0,
+      "events": 960,
+      "events_per_s": 15.195704924885558,
+      "issuer_calls_per_s": 3.998869717075147,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.005998304575612715,
+      "runner_rss_mib": 16.703125,
+      "runner_goroutines": 87,
+      "containers": {
+        "db": {
+          "cores": 0.010019065273534272,
+          "mem_mib": 98.21484375
+        },
+        "issuer": {
+          "cores": 0.004215170094099049,
+          "mem_mib": 6.2890625
+        },
+        "jwks": {
+          "cores": 0.0038400022665484525,
+          "mem_mib": 3.3359375
+        },
+        "runner-rooms": {
+          "cores": 0.005883500019377798,
+          "mem_mib": 9.78125
+        },
+        "sluice-rooms": {
+          "cores": 0.014110956267155876,
+          "mem_mib": 27.26171875
+        }
+      }
+    },
+    {
+      "t": 65.010857489,
+      "phase": "steady",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.37,
+      "sluice_cores": 0.0020003967258801067,
+      "rss_mib": 28.75,
+      "go_mem_mib": 19.39673614501953,
+      "heap_live_mib": 11.921875,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 10,
+      "gc_pause_s": 0.000823912,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 1088,
+      "changes_per_s": 0,
+      "dispatch_s": 0.046420045000000035,
+      "dispatch_count": 1088,
+      "resume_buffer_mib": 0.44358253479003906,
+      "hook_rechecks": 41,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 25376,
+      "send_lag_bytes": 0,
+      "events": 964,
+      "events_per_s": 0.800158690352042,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0,
+      "runner_rss_mib": 16.859375,
+      "runner_goroutines": 85,
+      "containers": {
+        "db": {
+          "cores": 0.008985431125270423,
+          "mem_mib": 98.6171875
+        },
+        "issuer": {
+          "cores": 0.004156920406850149,
+          "mem_mib": 6.515625
+        },
+        "jwks": {
+          "cores": 0.0040497835795194675,
+          "mem_mib": 3.33203125
+        },
+        "runner-rooms": {
+          "cores": 0.0013843992794959578,
+          "mem_mib": 9.4296875
+        },
+        "sluice-rooms": {
+          "cores": 0.015548885586538597,
+          "mem_mib": 27.26953125
+        }
+      }
+    },
+    {
+      "t": 65.301831531,
+      "phase": "end",
+      "sluice_streams": 20,
+      "live_clients": 20,
+      "sluice_cpu_s": 0.37,
+      "sluice_cores": 0,
+      "rss_mib": 28.75,
+      "go_mem_mib": 19.39673614501953,
+      "heap_live_mib": 12.0546875,
+      "gomemlimit_mib": 460.79999923706055,
+      "gomaxprocs": 2,
+      "goroutines": 218,
+      "gc_count": 10,
+      "gc_pause_s": 0.000823912,
+      "gc_pause_max_ms": 0.293656,
+      "stream_lagging": 0,
+      "dropped_events": 0,
+      "changes": 1088,
+      "changes_per_s": 0,
+      "dispatch_s": 0.046420045000000035,
+      "dispatch_count": 1088,
+      "resume_buffer_mib": 0.44358253479003906,
+      "hook_rechecks": 41,
+      "backlog_bytes": 0,
+      "slot_lag_bytes": 0,
+      "retained_bytes": 25376,
+      "send_lag_bytes": 0,
+      "events": 964,
+      "events_per_s": 0,
+      "issuer_calls_per_s": 0,
+      "issuer_inflight": 0,
+      "issuer_queued": 0,
+      "issuer_cores": 0,
+      "runner_cores": 0.03436732682841863,
+      "runner_rss_mib": 17.015625,
+      "runner_goroutines": 79,
+      "containers": {
+        "db": {
+          "cores": 0.002177226503604838,
+          "mem_mib": 98.34375
+        },
+        "issuer": {
+          "cores": 0.0007622383495238768,
+          "mem_mib": 6.2734375
+        },
+        "jwks": {
+          "cores": 0,
+          "mem_mib": 3.33203125
+        },
+        "runner-rooms": {
+          "cores": 0.020689511110075685,
+          "mem_mib": 9.50390625
+        },
+        "sluice-rooms": {
+          "cores": 0.007322610367362283,
+          "mem_mib": 27.2734375
+        }
+      }
+    }
+  ]
+}

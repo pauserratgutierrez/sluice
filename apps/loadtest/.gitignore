@@ -3,3 +3,4 @@ results/*.json
 results/*.md
 results/*.txt
 !results/.gitkeep
+results/logs/
