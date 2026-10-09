@@ -283,3 +283,26 @@ func TestColumnsNeededDeduplicates(t *testing.T) {
 		t.Errorf("columns needed = %v, want 2 distinct", got)
 	}
 }
+
+// Among equally good columns the routing key is the first in the filter,
+// every time: indexes key a subscription or a hold by it when adding and when
+// removing, and a different answer the second time leaves an entry behind.
+func TestRoutingKeyIsTheFirstEqualCandidate(t *testing.T) {
+	r := rel()
+	for _, c := range []struct{ filter, want string }{
+		{"id=eq.5,owner_id=eq.abc", "id"},
+		{"owner_id=eq.abc,id=eq.5", "owner_id"},
+		{"title=eq.x,owner_id=eq.abc,id=eq.5", "owner_id"},
+		{"owner_id=not.eq.abc,id=eq.5", "id"},
+	} {
+		f, err := Parse(c.filter, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range 100 {
+			if got := f.RoutingKey(r); got != c.want {
+				t.Fatalf("%s: routing key %q, want %q", c.filter, got, c.want)
+			}
+		}
+	}
+}

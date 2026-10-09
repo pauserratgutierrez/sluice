@@ -2,6 +2,29 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.8.1
+
+Issuer mode: hold watches that were never removed, and grants dropped by updates that could not affect them.
+
+### Fixed
+
+- A hold filter with two columns that both lead an index and are in the replica identity, such as a membership `project_id=eq.42,user_id=eq.<sub>`, was indexed under one of them and, about half the time, looked up under the other when it was removed. Every `POST /token` (which re-grants each shape) and every stream that closed could leave a watch behind. The process's memory grew with them for as long as it ran, and so did the CPU spent on each change to the hold table, which checked every one left on its value. In a load test with such holds (1,500 streams, 337 changes/s, `/token` every 15 minutes), the live heap grew 39% in 29 minutes and CPU per change 31%; with this fix it stayed flat over the 10 minutes measured.
+- Such a leftover watch could drop a live shape with `shape_not_authorized`: when the row of an earlier hold of the same subscription was deleted, or updated out of its filter, though the hold of the current grant still existed. An issuer that holds each grant on a row it replaces at every `/token` would see it. Only the watch currently registered for a subscription can cut it now; a leftover one is removed and cuts nothing.
+- With `REPLICA IDENTITY DEFAULT` or `USING INDEX` on a hold table, an `UPDATE` that changed no column of the replica identity (which arrives without the old row) dropped with `shape_not_authorized` every grant held by another row sharing a value with it: updating any column of one member's row dropped the grants of the other members of the same project, or the member's grants held by their other projects, depending on which column the holds were routed by. Such an `UPDATE` cuts nothing now: a hold reads only replica-identity columns, so none of them changed. `REPLICA IDENTITY FULL` was not affected.
+
+### Changed
+
+- When the reader sees a hold table's definition change so that its replica identity no longer covers a hold's columns, the shape is dropped with `shape_not_authorized` before any further change is dispatched, instead of at the next catalog refresh. This also covers the first time it sees the table after a restart.
+- Among columns that are equally good routing keys (leading an index and in the replica identity), shapes and holds are routed by the first in the filter, where either could be picked before.
+
+### For issuers
+
+- Put the most selective column first in hold filters: in a membership, the member before the scope (`user_id=eq.<sub>,project_id=eq.42`). A change to one member's row is then checked against that member's holds, not every hold in the project. In the same load test, where each message updates every member's row of its room, this order cut Sluice's CPU per change by 75–80% (1,500 streams at 337 changes/s on 1 CPU; 12,000 streams at 2,320 changes/s on 2 CPUs, where message latency p95 fell from 305 ms to 6 ms).
+
+### For clients
+
+- Nothing changes. The SDK has no changes: `@pauserratgutierrez/sluice-js` 0.8.1 is 0.8.0's code, published under the server's version.
+
 ## 0.8.0
 
 Request IDs: Sluice joins the trace of the requests it serves.

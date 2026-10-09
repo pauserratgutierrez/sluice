@@ -272,11 +272,21 @@ func compileTerm(t Term, col catalog.Column) (expr.Node, error) {
 //
 // Preference order: an equality on a column that is BOTH indexed in PostgreSQL
 // and present in the replica identity (so DELETE events can be routed too),
-// then any indexed column, then any equality at all. Returning "" means the
-// shape is unindexed and will be scanned for every change to the relation.
+// then any indexed column, then any equality at all. Among equally good
+// columns, the first in the filter: the answer depends on the filter alone,
+// so a caller that indexes and unindexes by it always finds the same list.
+// Returning "" means the shape is unindexed and will be scanned for every
+// change to the relation.
 func (f *Filter) RoutingKey(rel *catalog.Relation) string {
 	var indexedAndRI, indexed, any string
-	for col := range f.Equalities {
+	for _, t := range f.Terms {
+		if t.Op != OpEq || t.Negate {
+			continue
+		}
+		col := t.Column
+		if _, ok := f.Equalities[col]; !ok {
+			continue
+		}
 		if any == "" {
 			any = col
 		}

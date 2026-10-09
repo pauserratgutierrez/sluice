@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
+	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/encode"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
@@ -92,6 +93,24 @@ func (s *Server) OnRelation(old, nw *pgoutput.Relation) {
 			s.sessionsOID.Store(nw.OID)
 		case s.cfg.UsersTable != "" && name == s.cfg.UsersTable:
 			s.usersOID.Store(nw.OID)
+		}
+	}
+
+	// A hold may read only replica-identity columns: an UPDATE without an old
+	// tuple cuts nothing on that promise. The catalog refresh re-checks every
+	// hold, but later and on its own goroutine; this checks the holds on nw
+	// against the identity the WAL carries now, before the reader dispatches
+	// another change. It runs on the first Relation message after a restart
+	// too, when there is no previous definition to compare with.
+	if s.holds != nil {
+		cuts := s.holds.OutsideIdentity(&catalog.Relation{
+			OID: nw.OID, Schema: nw.Namespace, Name: nw.Name,
+			ReplicaIdentity: nw.ReplicaIdentity, ReplicaIdentityColumns: nw.KeyColumns(),
+		})
+		if len(cuts) > 0 {
+			s.log.Warn("hold filters read columns outside the replica identity; their shapes were dropped",
+				"relation", nw.FullName(), "replica_identity", string(nw.ReplicaIdentity), "shapes", len(cuts))
+			s.applyHoldCuts(cuts)
 		}
 	}
 

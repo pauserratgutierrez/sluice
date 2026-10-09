@@ -158,21 +158,13 @@ func TestOnChangeUpdateOmitsOldTuple(t *testing.T) {
 		}
 	})
 
-	t.Run("no longer matching", func(t *testing.T) {
-		idx := New()
-		// Routing is on id (indexed + replica identity). Same id keeps the
-		// watch a candidate; a filter column that left the predicate cuts.
-		left := holdSpec(t, rel, "id=eq."+id+",project_id=eq.42")
-		if !idx.Add("s1", "docs", []Spec{left}) {
-			t.Fatal("add")
-		}
-		cuts := idx.OnChange(rel.OID, 'U', nil, row{
-			"id":         expr.Text(id),
-			"project_id": expr.Text("99"),
-			"user_id":    expr.Text("u1"),
-		})
-		if len(cuts) != 1 {
-			t.Fatalf("omitted old with a new row that left the filter must cut, got %+v", cuts)
+	t.Run("a filter column outside the identity is refused", func(t *testing.T) {
+		// Without an old tuple a change to project_id could not be seen, so a
+		// hold may not read it: the grant is refused, and a catalog change
+		// that leaves it outside drops the shape.
+		f := holdSpec(t, rel, "id=eq."+id+",project_id=eq.42").Filter
+		if got := MissingReplicaIdentity(rel, f); len(got) != 1 || got[0] != "project_id" {
+			t.Fatalf("missing = %v, want [project_id]", got)
 		}
 	})
 

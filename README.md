@@ -141,7 +141,7 @@ Only an allow grants. `"allow": false`, a redirect or a `4xx` other than `408` a
   "shape": { "schema": "public", "table": "documents",
              "filter": "project_id=eq.42", "columns": ["id", "title", "body"] },
   "holds": [ { "schema": "public", "table": "project_members",
-               "filter": "project_id=eq.42,user_id=eq.<sub>" } ]
+               "filter": "user_id=eq.<sub>,project_id=eq.42" } ]
 }
 ```
 
@@ -151,9 +151,11 @@ Sluice checks the grant before using it:
 - `shape.filter` uses the [filter grammar](#filters) and has at least one non-negated equality, so it can never mean the whole table.
 - The effective filter is `authorized AND client`. The client may omit or repeat an authorized equality; a different constant is a deny.
 - Columns are the requested ones (or all) plus the key columns, intersected with `shape.columns` when present (an empty list denies), and with the pool role's physical `SELECT`.
-- `holds` is non-empty. Every hold table is published, and every hold filter has an equality and only reads columns in that table's replica identity (otherwise its `DELETE` could not be detected).
+- `holds` is non-empty. Every hold table is published, and every hold filter has an equality and only reads columns in that table's replica identity: the only columns an old tuple carries, so that a `DELETE`, or an `UPDATE` that changes one of them, can be detected. If the table's replica identity later stops covering a hold's columns, the shape is dropped with `shape_not_authorized` as soon as the reader sees the table's new definition.
 
-Sluice then installs the hold watches and the shape, and only after that checks that every hold row exists, so a `DELETE` racing the join is still caught. When a hold row is deleted, or updated out of its filter, or its table is truncated, the shape is dropped with `shape_not_authorized`; the stream and its other subscriptions continue. Zero rows in the subscribed table is a valid, empty shape. The ready result carries `oracle: "issuer"` and the effective `filter`, and no `tier`. Snapshots and `EXISTS` run as the pool role.
+Sluice then installs the hold watches and the shape, and only after that checks that every hold row exists, so a `DELETE` racing the join is still caught. When a hold row is deleted, or updated out of its filter, or its table is truncated, the shape is dropped with `shape_not_authorized`; the stream and its other subscriptions continue. An `UPDATE` that changes none of a hold's columns leaves it alone. Zero rows in the subscribed table is a valid, empty shape. The ready result carries `oracle: "issuer"` and the effective `filter`, and no `tier`. Snapshots and `EXISTS` run as the pool role.
+
+Each hold is routed like a shape (see [Routing](#filters)): by the first of its equally good columns, so a change to a hold table is checked against the holds listed under that column's value. Put the most selective column first. In a membership hold, the member before the scope (`user_id=eq.<sub>,project_id=eq.42`), so a change to one member's row is checked against that member's holds rather than every hold in the project.
 
 `POST /admin/shapes/drop` (service_role token, or the issuer bearer) drops this process's subscriptions matching a table, equalities and optionally an identity:
 
@@ -188,7 +190,7 @@ PostgREST spelling, AND-only: `column=op.value`, joined with commas.
 
 Values may be double-quoted (`title=eq."a,b"`). A filter naming an unknown column is refused; values are never interpolated into SQL. There is no `OR`: it would defeat constant routing. Subscribe twice instead.
 
-**Routing.** Among the non-negated `eq` terms, Sluice prefers a column that leads an index and is in the replica identity, then any indexed column, then any `eq` column. A shape with none is **unindexed**: it is scanned on every change to its table, gets the `unindexed_shape` warning, and at most `SLUICE_UNINDEXED_SHAPES_MAX` of them are admitted per process.
+**Routing.** Among the non-negated `eq` terms, Sluice prefers a column that leads an index and is in the replica identity, then any indexed column, then any `eq` column; among columns that are equally good, the first in the filter. A shape with none is **unindexed**: it is scanned on every change to its table, gets the `unindexed_shape` warning, and at most `SLUICE_UNINDEXED_SHAPES_MAX` of them are admitted per process.
 
 ### Replica identity
 

@@ -32,6 +32,28 @@ type Watch struct {
 	StreamID string
 	Label    string
 	Holds    []Spec
+
+	// routes[i] is where Holds[i] is indexed. Unindexing goes by it rather
+	// than working the place out again, so a hold always leaves the list it
+	// was put in.
+	routes []route
+}
+
+// route is where one hold is indexed: its relation, and the column and
+// constant it is listed under (no column: scanned on every change).
+type route struct {
+	indexed bool
+	oid     uint32
+	col     string
+	val     string
+}
+
+func newWatch(streamID, label string, holds []Spec) *Watch {
+	return &Watch{
+		StreamID: streamID, Label: label,
+		Holds:  append([]Spec(nil), holds...),
+		routes: make([]route, len(holds)),
+	}
 }
 
 // Cut is a shape that must be dropped because a hold stopped matching.
@@ -83,11 +105,9 @@ func (x *Index) Add(streamID, label string, holds []Spec) bool {
 	if _, exists := subs[label]; exists {
 		return false
 	}
-	w := &Watch{StreamID: streamID, Label: label, Holds: append([]Spec(nil), holds...)}
+	w := newWatch(streamID, label, holds)
 	subs[label] = w
-	for i := range w.Holds {
-		x.indexLocked(w, w.Holds[i])
-	}
+	x.indexWatchLocked(w)
 	return true
 }
 
@@ -101,19 +121,32 @@ func (x *Index) Replace(streamID, label string, holds []Spec) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.removeLocked(streamID, label)
-	w := &Watch{StreamID: streamID, Label: label, Holds: append([]Spec(nil), holds...)}
+	w := newWatch(streamID, label, holds)
 	subs := x.byStream[streamID]
 	if subs == nil {
 		subs = map[string]*Watch{}
 		x.byStream[streamID] = subs
 	}
 	subs[label] = w
+	x.indexWatchLocked(w)
+}
+
+func (x *Index) indexWatchLocked(w *Watch) {
 	for i := range w.Holds {
-		x.indexLocked(w, w.Holds[i])
+		x.indexLocked(w, i)
 	}
 }
 
-func (x *Index) indexLocked(w *Watch, spec Spec) {
+func (x *Index) unindexWatchLocked(w *Watch) {
+	for i := range w.Holds {
+		x.unindexLocked(w, i)
+	}
+}
+
+// indexLocked lists hold i of w under its relation's routing key, and records
+// where in w.routes.
+func (x *Index) indexLocked(w *Watch, i int) {
+	spec := w.Holds[i]
 	if spec.Rel == nil || spec.Filter == nil {
 		return
 	}
@@ -124,22 +157,23 @@ func (x *Index) indexLocked(w *Watch, spec Spec) {
 		x.rels[oid] = ri
 	}
 	ri.all[w] = true
-	key := spec.Filter.RoutingKey(spec.Rel)
-	if key == "" {
+	r := route{indexed: true, oid: oid, col: spec.Filter.RoutingKey(spec.Rel)}
+	if r.col == "" {
 		if !slices.Contains(ri.unindexed, w) {
 			ri.unindexed = append(ri.unindexed, w)
 		}
-		return
+	} else {
+		r.val = spec.Filter.Equalities[r.col].String()
+		byConst := ri.byColumn[r.col]
+		if byConst == nil {
+			byConst = map[string][]*Watch{}
+			ri.byColumn[r.col] = byConst
+		}
+		if !slices.Contains(byConst[r.val], w) {
+			byConst[r.val] = append(byConst[r.val], w)
+		}
 	}
-	constVal := spec.Filter.Equalities[key].String()
-	byConst := ri.byColumn[key]
-	if byConst == nil {
-		byConst = map[string][]*Watch{}
-		ri.byColumn[key] = byConst
-	}
-	if !slices.Contains(byConst[constVal], w) {
-		byConst[constVal] = append(byConst[constVal], w)
-	}
+	w.routes[i] = r
 }
 
 // Remove drops one watch.
@@ -162,39 +196,35 @@ func (x *Index) removeLocked(streamID, label string) *Watch {
 	if len(subs) == 0 {
 		delete(x.byStream, streamID)
 	}
-	for _, spec := range w.Holds {
-		x.unindexLocked(w, spec)
-	}
+	x.unindexWatchLocked(w)
 	return w
 }
 
-func (x *Index) unindexLocked(w *Watch, spec Spec) {
-	if spec.Rel == nil {
+// unindexLocked takes hold i of w out of the list w.routes says it is in.
+func (x *Index) unindexLocked(w *Watch, i int) {
+	r := w.routes[i]
+	if !r.indexed {
 		return
 	}
-	ri := x.rels[spec.Rel.OID]
+	w.routes[i] = route{}
+	ri := x.rels[r.oid]
 	if ri == nil {
 		return
 	}
 	delete(ri.all, w)
-	ri.unindexed = slices.DeleteFunc(ri.unindexed, func(e *Watch) bool { return e == w })
-	if spec.Filter != nil {
-		key := spec.Filter.RoutingKey(spec.Rel)
-		if key != "" {
-			constVal := spec.Filter.Equalities[key].String()
-			if byConst := ri.byColumn[key]; byConst != nil {
-				byConst[constVal] = slices.DeleteFunc(byConst[constVal], func(e *Watch) bool { return e == w })
-				if len(byConst[constVal]) == 0 {
-					delete(byConst, constVal)
-				}
-				if len(byConst) == 0 {
-					delete(ri.byColumn, key)
-				}
-			}
+	if r.col == "" {
+		ri.unindexed = slices.DeleteFunc(ri.unindexed, func(e *Watch) bool { return e == w })
+	} else if byConst := ri.byColumn[r.col]; byConst != nil {
+		byConst[r.val] = slices.DeleteFunc(byConst[r.val], func(e *Watch) bool { return e == w })
+		if len(byConst[r.val]) == 0 {
+			delete(byConst, r.val)
+		}
+		if len(byConst) == 0 {
+			delete(ri.byColumn, r.col)
 		}
 	}
 	if len(ri.all) == 0 {
-		delete(x.rels, spec.Rel.OID)
+		delete(x.rels, r.oid)
 	}
 }
 
@@ -228,6 +258,39 @@ func (x *Index) All() []*Watch {
 	return out
 }
 
+// OutsideIdentity cuts every watch with a hold on rel whose filter reads a
+// column outside rel's replica identity, which OnChange relies on not
+// existing. rel is the relation as the WAL now describes it, which can differ
+// from the catalog the holds were granted against until the next refresh. The
+// watches are removed here, as in OnChange; the caller drops the shapes.
+func (x *Index) OutsideIdentity(rel *catalog.Relation) []Cut {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	ri := x.rels[rel.OID]
+	if ri == nil {
+		return nil
+	}
+	var cuts []Cut
+	for w := range ri.all {
+		if !x.current(w) {
+			continue
+		}
+		for _, h := range w.Holds {
+			if h.Rel == nil || h.Rel.OID != rel.OID {
+				continue
+			}
+			if missing := MissingReplicaIdentity(rel, h.Filter); len(missing) > 0 {
+				cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label, Reason: ReplicaIdentityReason(rel, missing)})
+				break
+			}
+		}
+	}
+	for _, c := range cuts {
+		x.removeLocked(c.StreamID, c.Label)
+	}
+	return cuts
+}
+
 // Count returns the number of live watches.
 func (x *Index) Count() int {
 	x.mu.RLock()
@@ -257,20 +320,31 @@ func (x *Index) RefreshRels(streamID, label string, rels []*catalog.Relation) {
 		if rel == nil {
 			continue
 		}
-		old := w.Holds[i]
-		x.unindexLocked(w, old)
+		x.unindexLocked(w, i)
 		w.Holds[i].Rel = rel
-		x.indexLocked(w, w.Holds[i])
+		x.indexLocked(w, i)
 	}
+}
+
+// current reports whether w is the watch registered for its stream and label.
+// Only that one speaks for the shape: a watch that a later grant replaced, if
+// one were still indexed, must not cut the grant that replaced it.
+func (x *Index) current(w *Watch) bool {
+	return x.byStream[w.StreamID][w.Label] == w
 }
 
 // OnChange returns watches whose hold on this relation no longer holds after
 // the WAL change. DELETE of a matching row, or UPDATE that leaves the filter,
-// cuts. An UPDATE that omits the old tuple (replica identity unchanged) is
-// decided from the new row only; omitting old is not unknown. The watch is
+// cuts. An UPDATE that omits the old tuple cuts nothing: no replica-identity
+// column changed, and a hold's filter reads only those columns (checked when
+// it is granted, on each catalog refresh and when the relation's definition
+// changes), so every hold matches the row as it did before. The watch is
 // removed from the index here so a later change cannot recut; the caller still
 // drops the shape from the registry.
 func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
+	if op == 'U' && oldRow == nil {
+		return nil
+	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
@@ -328,6 +402,12 @@ func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 		if !cut {
 			continue
 		}
+		if !x.current(w) {
+			// Not the stream's watch for that label any more: drop it from
+			// the index and cut nothing.
+			x.unindexWatchLocked(w)
+			continue
+		}
 		x.removeLocked(w.StreamID, w.Label)
 		cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label, Reason: reason})
 	}
@@ -346,7 +426,12 @@ func (x *Index) OnTruncate(oid uint32) []Cut {
 		return nil
 	}
 	cuts := make([]Cut, 0, len(ri.all))
+	var stale []*Watch
 	for w := range ri.all {
+		if !x.current(w) {
+			stale = append(stale, w)
+			continue
+		}
 		name := ""
 		for _, spec := range w.Holds {
 			if spec.Rel != nil && spec.Rel.OID == oid {
@@ -356,6 +441,9 @@ func (x *Index) OnTruncate(oid uint32) []Cut {
 		}
 		cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label,
 			Reason: "a hold on " + name + " no longer exists: the table was truncated"})
+	}
+	for _, w := range stale {
+		x.unindexWatchLocked(w)
 	}
 	for _, c := range cuts {
 		x.removeLocked(c.StreamID, c.Label)
@@ -377,14 +465,16 @@ func watchBroken(w *Watch, oid uint32, op byte, oldRow, newRow expr.Row) (string
 		case 'U':
 			// Protocol: Update carries 'K' (old key) or 'O' (old full) or
 			// neither, never both. 'K' only if replica-identity columns changed;
-			// 'N' is always present. A nil old row is omitted, not unknown.
-			matchNew, unkNew := visible(spec.Filter, newRow)
-			cut := unkNew || !matchNew
-			if oldRow != nil {
-				matchOld, _ := visible(spec.Filter, oldRow)
-				cut = matchOld && cut
+			// 'N' is always present. With neither, no column a hold reads
+			// changed (see OnChange): nothing to cut. Deciding from the new row
+			// alone would cut other rows' holds, since a watch is a candidate
+			// when one routed column matches, not the whole identity.
+			if oldRow == nil {
+				continue
 			}
-			if cut {
+			matchOld, _ := visible(spec.Filter, oldRow)
+			matchNew, unkNew := visible(spec.Filter, newRow)
+			if matchOld && (unkNew || !matchNew) {
 				return "a hold on " + spec.Rel.FullName() + " no longer matches", true
 			}
 		}
