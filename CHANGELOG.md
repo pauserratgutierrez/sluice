@@ -40,7 +40,11 @@ The load test's rooms workload (`apps/loadtest`): 7 shapes and a hook channel pe
   - live heap ~44 KiB idle and ~48 KiB under that load;
   - about twice that between collections: ~93 KiB idle (15,000 streams in 1,359 MiB), 110–120 KiB under load.
 - Extrapolated from those, with the live heap kept under 40% of `GOMEMLIMIT` (room for the heap to double between collections and for a burst of reconnections, whose cost is not yet measured): about 4,000 such streams per 512 MB container and 8,000 per GB.
-- The live heap held flat at 1,500 streams over those 10 minutes (72 → 74 MiB). At 12,000 it rose 2–3 MiB a minute (545 → 572 MiB), against about 15 MiB a minute on 0.8.0. Ten minutes are two thirds of one `/token` cycle, so whether it levels off is not yet measured.
+- Growth of the live heap at a constant load:
+  - 1,500 streams: flat (72 → 74 MiB over 10 minutes).
+  - 12,000 streams: down from about 15 MiB a minute on 0.8.0 to 2–3 MiB a minute (545 → 572 MiB over 10 minutes, with about 800 `POST /token` a minute).
+
+  A possible residual retention per `/token` is being looked into.
 
 ## 0.8.0
 
