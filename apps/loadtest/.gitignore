@@ -10,3 +10,5 @@ results/logs/
 # binaries kept out of git (locally, or attached to a release).
 results/**/*.json
 results/**/*.pprof
+# The queue's console output; queue.log keeps what ran.
+results/**/*-console.log
