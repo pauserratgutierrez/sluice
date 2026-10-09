@@ -305,14 +305,15 @@ func (x *Index) RemoveStream(streamID string) {
 	}
 }
 
-// All returns every live watch.
+// All returns every live watch, as copies that are safe to read without the
+// lock: RefreshRels replaces a watch's Holds while others may be reading.
 func (x *Index) All() []*Watch {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
 	var out []*Watch
 	for _, subs := range x.byStream {
 		for _, w := range subs {
-			out = append(out, w)
+			out = append(out, &Watch{StreamID: w.StreamID, Label: w.Label, Holds: w.Holds})
 		}
 	}
 	return out
@@ -408,13 +409,21 @@ func (x *Index) RefreshRels(streamID, label string, rels []*catalog.Relation) {
 	if w == nil || len(rels) != len(w.Holds) {
 		return
 	}
+	// A new slice, not an edit in place: OnChange evaluates holds it read under
+	// the read lock after letting go of it.
+	holds := slices.Clone(w.Holds)
 	for i, rel := range rels {
 		if rel == nil {
 			continue
 		}
 		x.unindexLocked(w, i)
-		w.Holds[i].Rel = rel
-		x.indexLocked(w, i)
+		holds[i].Rel = rel
+	}
+	w.Holds = holds
+	for i, rel := range rels {
+		if rel != nil {
+			x.indexLocked(w, i)
+		}
 	}
 }
 
@@ -433,25 +442,78 @@ func (x *Index) current(w *Watch) bool {
 // changes), so every hold matches the row as it did before. The watch is
 // removed from the index here so a later change cannot recut; the caller still
 // drops the shape from the registry.
+//
+// The candidates are found under the read lock and evaluated with no lock
+// held: evaluating is most of the work, and stream opens and /token (Add,
+// Replace) must not wait on it. Only removing a broken watch takes the write
+// lock.
 func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 	if op == 'U' && oldRow == nil {
 		return nil
 	}
+	var broken []candidate
+	for _, c := range x.candidates(oid, oldRow, newRow) {
+		if reason, cut := watchBroken(c.holds, oid, op, oldRow, newRow); cut {
+			c.reason = reason
+			broken = append(broken, c)
+		}
+	}
+	if len(broken) == 0 {
+		return nil
+	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	var cuts []Cut
+	for _, c := range broken {
+		w := x.byStream[c.w.StreamID][c.w.Label]
+		if w != c.w {
+			// Removed or replaced since it was read; a leftover, if one were
+			// still indexed, leaves the index and cuts nothing.
+			x.unindexWatchLocked(c.w)
+			if w == nil {
+				continue
+			}
+			// The change answers to the replacement, as it would have had the
+			// replacement been indexed first. (A replacement's grant also
+			// runs EXISTS after Replace, which sees any change the reader has
+			// already received.)
+			reason, cut := watchBroken(w.Holds, oid, op, oldRow, newRow)
+			if !cut {
+				continue
+			}
+			c.reason = reason
+		}
+		x.removeLocked(w.StreamID, w.Label)
+		cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label, Reason: c.reason})
+	}
+	return cuts
+}
 
+// candidate is a watch that may be affected by a change, with the holds it
+// had when it was read.
+type candidate struct {
+	w      *Watch
+	holds  []Spec
+	reason string
+}
+
+// candidates finds the watches listed under the change's values, and the
+// unindexed ones, under the read lock.
+func (x *Index) candidates(oid uint32, oldRow, newRow expr.Row) []candidate {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
 	ri := x.rels[oid]
 	if ri == nil {
 		return nil
 	}
 
 	seen := map[*Watch]bool{}
-	var candidates []*Watch
+	var out []candidate
 	add := func(list []*Watch) {
 		for _, w := range list {
 			if !seen[w] {
 				seen[w] = true
-				candidates = append(candidates, w)
+				out = append(out, candidate{w: w, holds: w.Holds})
 			}
 		}
 	}
@@ -487,23 +549,7 @@ func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 		}
 	}
 	add(ri.unindexed)
-
-	var cuts []Cut
-	for _, w := range candidates {
-		reason, cut := watchBroken(w, oid, op, oldRow, newRow)
-		if !cut {
-			continue
-		}
-		if !x.current(w) {
-			// Not the stream's watch for that label any more: drop it from
-			// the index and cut nothing.
-			x.unindexWatchLocked(w)
-			continue
-		}
-		x.removeLocked(w.StreamID, w.Label)
-		cuts = append(cuts, Cut{StreamID: w.StreamID, Label: w.Label, Reason: reason})
-	}
-	return cuts
+	return out
 }
 
 // OnTruncate returns every watch with a hold on a truncated relation: TRUNCATE
@@ -543,8 +589,8 @@ func (x *Index) OnTruncate(oid uint32) []Cut {
 	return cuts
 }
 
-func watchBroken(w *Watch, oid uint32, op byte, oldRow, newRow expr.Row) (string, bool) {
-	for _, spec := range w.Holds {
+func watchBroken(holds []Spec, oid uint32, op byte, oldRow, newRow expr.Row) (string, bool) {
+	for _, spec := range holds {
 		if spec.Rel == nil || spec.Rel.OID != oid || spec.Filter == nil {
 			continue
 		}
