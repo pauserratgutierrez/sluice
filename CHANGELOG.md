@@ -8,13 +8,13 @@ Issuer mode: hold watches that were never removed, and grants dropped by updates
 
 ### Fixed
 
-- A hold filter with two columns that both lead an index and are in the replica identity, such as a membership `project_id=eq.42,user_id=eq.<sub>`, was indexed under one of them and, about half the time, looked up under the other when it was removed. Every `POST /token` (which re-grants each shape) and every stream that closed could leave a watch behind. The process's memory grew with them for as long as it ran, and so did the CPU spent on each change to the hold table, which checked every one left on its value. In a load test with such holds (1,500 streams, 337 changes/s, `/token` every 15 minutes), the live heap grew 39% in 29 minutes and CPU per change 31%; with this fix it stayed flat over the 10 minutes measured.
+- A hold filter with two columns that both lead an index and are in the replica identity, such as a membership `project_id=eq.42,user_id=eq.<sub>`, was indexed under one of them and, about half the time, looked up under the other when it was removed. Every `POST /token` (which re-grants each shape) and every stream that closed could leave a watch behind. The process's memory grew with them for as long as it ran, and so did the CPU spent on each change to the hold table, which checked every one left on its value. In a load test with such holds (1,500 streams, 337 changes/s, `/token` every 15 minutes), the live heap grew 39% in 29 minutes and CPU per change 31% (see Measured).
 - Such a leftover watch could drop a live shape with `shape_not_authorized`: when the row of an earlier hold of the same subscription was deleted, or updated out of its filter, though the hold of the current grant still existed. An issuer that holds each grant on a row it replaces at every `/token` would see it. Only the watch currently registered for a subscription can cut it now; a leftover one is removed and cuts nothing.
 - With `REPLICA IDENTITY DEFAULT` or `USING INDEX` on a hold table, an `UPDATE` that changed no column of the replica identity (which arrives without the old row) dropped with `shape_not_authorized` every grant held by another row sharing a value with it: updating any column of one member's row dropped the grants of the other members of the same project, or the member's grants held by their other projects, depending on which column the holds were routed by. Such an `UPDATE` cuts nothing now: a hold reads only replica-identity columns, so none of them changed. `REPLICA IDENTITY FULL` was not affected.
 
 ### Changed
 
-- When the reader sees a hold table's definition change so that its replica identity no longer covers a hold's columns, the shape is dropped with `shape_not_authorized` before any further change is dispatched, instead of at the next catalog refresh. This also covers the first time it sees the table after a restart.
+- A hold may read only columns of its table's replica identity, which Sluice checked when granting it and on each catalog refresh (`SLUICE_CATALOG_REFRESH`, 30 s). When a table's replica identity stops covering a hold's columns (for example `ALTER TABLE ... REPLICA IDENTITY DEFAULT` while a hold filters a column outside the primary key), each such shape is now dropped as soon as the reader sees the table's new definition in the WAL, before it dispatches another change, instead of at the next catalog refresh; the first time it sees the table after a restart counts too. A grant or a `POST /token` re-grant with such a hold, made before the catalog catches up, is refused the same way. The client gets an `error` event with `code: "shape_not_authorized"`, the subscription's `sub`, and a message naming the columns and the remedy (a unique index over them and `REPLICA IDENTITY USING INDEX`); the stream and its other subscriptions continue. The log has one `hold filters read columns outside the replica identity; their shapes were dropped` warning per table, with the count. `/diagnostics` lists no `hold_replica_identity` finding for them, since they are no longer installed.
 - Among columns that are equally good routing keys (leading an index and in the replica identity), shapes and holds are routed by the first in the filter, where either could be picked before.
 
 ### For issuers
@@ -24,6 +24,23 @@ Issuer mode: hold watches that were never removed, and grants dropped by updates
 ### For clients
 
 - Nothing changes. The SDK has no changes: `@pauserratgutierrez/sluice-js` 0.8.1 is 0.8.0's code, published under the server's version.
+
+### Measured
+
+The load test's rooms workload (`apps/loadtest`): 7 shapes and a hook channel per stream, membership holds written member first (room first on 0.8.0, which keyed them on either column at random), a message every 15 s per room that updates every member's row, PostgreSQL 18.6, `POST /token` every 15 minutes. CPU per 1,000 changes over the first 10 minutes of the steady phase:
+
+| | 0.8.0 | 0.8.1 |
+| --- | --- | --- |
+| 1,500 streams, 337 changes/s, 1 CPU, 512 MB | 365–387 ms (0.13 cores) | 104 ms with `REPLICA IDENTITY FULL`, 91 ms with `DEFAULT` (0.03 cores) |
+| 12,000 streams, 2,320 changes/s, 1 CPU, 4 GB | 499 ms; falls behind (about 1,950 changes/s dispatched, fewer as it runs) | 105 ms with `FULL`, 108 ms with `DEFAULT` (0.25 cores; message p95 10 ms) |
+| 12,000 streams, 2,320 changes/s, 2 CPUs, 4 GB | 535 ms (1.24 cores; message p95 305 ms) | 105 ms (0.24 cores; message p95 6 ms) |
+
+- 12,000 such streams fit 1 CPU but not 512 MB. They need about 1.3 GiB of Go memory, and in a 512 MB container the process was killed for memory 11 times in 15 minutes.
+- Memory per stream (Go memory, the figure `GOMEMLIMIT` bounds):
+  - live heap ~44 KiB idle and ~48 KiB under that load;
+  - about twice that between collections: ~93 KiB idle (15,000 streams in 1,359 MiB), 110–120 KiB under load.
+- Extrapolated from those, with the live heap kept under 40% of `GOMEMLIMIT` (room for the heap to double between collections and for a burst of reconnections, whose cost is not yet measured): about 4,000 such streams per 512 MB container and 8,000 per GB.
+- The live heap held flat at 1,500 streams over those 10 minutes (72 → 74 MiB). At 12,000 it rose 2–3 MiB a minute (545 → 572 MiB), against about 15 MiB a minute on 0.8.0. Ten minutes are two thirds of one `/token` cycle, so whether it levels off is not yet measured.
 
 ## 0.8.0
 

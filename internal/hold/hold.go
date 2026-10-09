@@ -8,6 +8,7 @@ package hold
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -81,12 +82,16 @@ type Index struct {
 	mu       sync.RWMutex
 	rels     map[uint32]*relIndex
 	byStream map[string]map[string]*Watch
+	// identity is each hold table's replica identity as the WAL last
+	// described it (OutsideIdentity), which the catalog may not show yet.
+	identity map[uint32]*catalog.Relation
 }
 
 func New() *Index {
 	return &Index{
 		rels:     map[uint32]*relIndex{},
 		byStream: map[string]map[string]*Watch{},
+		identity: map[uint32]*catalog.Relation{},
 	}
 }
 
@@ -261,11 +266,13 @@ func (x *Index) All() []*Watch {
 // OutsideIdentity cuts every watch with a hold on rel whose filter reads a
 // column outside rel's replica identity, which OnChange relies on not
 // existing. rel is the relation as the WAL now describes it, which can differ
-// from the catalog the holds were granted against until the next refresh. The
-// watches are removed here, as in OnChange; the caller drops the shapes.
+// from the catalog the holds were granted against until the next refresh; it
+// is kept for CheckIdentity. The watches are removed here, as in OnChange; the
+// caller drops the shapes.
 func (x *Index) OutsideIdentity(rel *catalog.Relation) []Cut {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	x.identity[rel.OID] = rel
 	ri := x.rels[rel.OID]
 	if ri == nil {
 		return nil
@@ -289,6 +296,36 @@ func (x *Index) OutsideIdentity(rel *catalog.Relation) []Cut {
 		x.removeLocked(c.StreamID, c.Label)
 	}
 	return cuts
+}
+
+// CheckIdentity is called after Add or Replace, whose holds were checked
+// against the catalog when they were granted. Until the catalog refreshes, the
+// WAL may already describe a replica identity that does not cover a hold's
+// columns; such a watch is removed and the reason returned. It also fails when
+// the watch is gone, cut by a change or by OutsideIdentity since it was added.
+// OutsideIdentity runs under the same lock, so whichever comes second sees the
+// other.
+func (x *Index) CheckIdentity(streamID, label string) error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	w := x.byStream[streamID][label]
+	if w == nil {
+		return errors.New("a hold of this grant was cut while it was being installed")
+	}
+	for _, h := range w.Holds {
+		if h.Rel == nil {
+			continue
+		}
+		id := x.identity[h.Rel.OID]
+		if id == nil {
+			continue
+		}
+		if missing := MissingReplicaIdentity(id, h.Filter); len(missing) > 0 {
+			x.removeLocked(streamID, label)
+			return errors.New(ReplicaIdentityReason(id, missing))
+		}
+	}
+	return nil
 }
 
 // Count returns the number of live watches.

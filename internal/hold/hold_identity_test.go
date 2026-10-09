@@ -2,6 +2,7 @@ package hold
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -120,4 +121,32 @@ func TestOutsideIdentityCutsHoldsTheIdentityNoLongerCovers(t *testing.T) {
 	if cuts := x.OutsideIdentity(&nothing); len(cuts) != 2 {
 		t.Fatalf("REPLICA IDENTITY NOTHING covers no column; cut %+v", cuts)
 	}
+}
+
+// A hold granted against a catalog that has not caught up with a replica
+// identity change the WAL already carried is refused once it is in the index.
+func TestCheckIdentityRefusesHoldsTheWALIdentityDoesNotCover(t *testing.T) {
+	rel := membersRel()
+	rel.ReplicaIdentity = 'f' // the catalog still says FULL
+	x := New()
+	byKey := *rel
+	byKey.ReplicaIdentity = 'd'
+	byKey.ReplicaIdentityColumns = []string{"project_id", "user_id"}
+	x.OutsideIdentity(&byKey) // the WAL has moved to the primary key
+
+	x.Add("s1", "docs", []Spec{holdSpec(t, rel, "user_id=eq.u1,project_id=eq.42")})
+	if err := x.CheckIdentity("s1", "docs"); err != nil {
+		t.Fatalf("a hold on key columns is covered: %v", err)
+	}
+	x.Add("s2", "docs", []Spec{holdSpec(t, rel, "user_id=eq.u2,role=eq.admin")})
+	if err := x.CheckIdentity("s2", "docs"); err == nil || !strings.Contains(err.Error(), "role") {
+		t.Fatalf("a hold reading role must be refused, got %v", err)
+	}
+	if x.Count() != 1 {
+		t.Fatalf("%d watches left, want 1", x.Count())
+	}
+	if err := x.CheckIdentity("s3", "docs"); err == nil {
+		t.Fatal("a watch that is gone must fail the check")
+	}
+	checkConsistent(t, x)
 }

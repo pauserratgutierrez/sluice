@@ -1559,6 +1559,10 @@ func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label str
 		return false
 	}
 	s.holds.Replace(st.StreamID(), label, grant.Holds)
+	if err := s.holds.CheckIdentity(st.StreamID(), label); err != nil {
+		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
+		return false
+	}
 	if err := s.verifyHolds(ctx, grant.Holds); err != nil {
 		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
 		return false
@@ -1616,6 +1620,13 @@ func (s *Server) installShape(ctx context.Context, sub *registry.Subscription, h
 	}
 	if len(holds) == 0 {
 		return nil
+	}
+	// The holds were checked against the catalog, which lags a replica identity
+	// change the reader may already have seen.
+	if err := s.holds.CheckIdentity(sid, sub.Label); err != nil {
+		s.reg.Remove(sid, sub.Label)
+		s.holds.Remove(sid, sub.Label)
+		return err
 	}
 	if s.pool == nil {
 		s.reg.Remove(sid, sub.Label)
