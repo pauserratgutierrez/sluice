@@ -36,7 +36,7 @@ var (
 
 	MemoryFloorBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_memory_floor_bytes",
-		Help: "Memory a collection cannot give back, as of the last one: the live heap plus the runtime's memory outside it (goroutine stacks above all). What stream admission measures.",
+		Help: "Memory a collection cannot give back, as of the last one: the live heap, the stack space goroutines are using and the runtime's structures (not free or fragmented heap). What stream admission measures.",
 	})
 
 	HeapLiveBytes = promauto.NewGauge(prometheus.GaugeOpts{

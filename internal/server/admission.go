@@ -70,35 +70,38 @@ func newAdmission(threshold float64) *admission {
 }
 
 // readLiveHeap returns the memory a collection cannot give back, as of the last
-// one: the live heap plus everything the runtime holds outside the heap
-// (goroutine stacks -- two per stream -- buffers, metadata). GOMEMLIMIT bounds
-// all of it, so this is the floor the limit is measured against; the live heap
+// one: the live heap, the stack space goroutines are using (two per stream),
+// and the runtime's own structures. GOMEMLIMIT bounds all of it; the live heap
 // alone left out the stacks of thousands of streams.
+//
+// It leaves out what the runtime holds but can reuse: free and unused heap
+// (fragmentation, filled again by later allocations) and stack space reserved
+// but idle. Counting those made the floor jump by a fifth from one sample to
+// the next and, after a mass disconnect, kept refusing streams that fit.
 func readLiveHeap() (floor, gcs uint64) {
 	s := []rtmetrics.Sample{
 		{Name: "/gc/heap/live:bytes"},
-		{Name: "/memory/classes/total:bytes"},
-		{Name: "/memory/classes/heap/released:bytes"},
-		{Name: "/memory/classes/heap/free:bytes"},
-		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/gc/scan/stack:bytes"},
+		{Name: "/memory/classes/metadata/mcache/inuse:bytes"},
+		{Name: "/memory/classes/metadata/mspan/inuse:bytes"},
+		{Name: "/memory/classes/metadata/other:bytes"},
+		{Name: "/memory/classes/os-stacks:bytes"},
+		{Name: "/memory/classes/other:bytes"},
+		{Name: "/memory/classes/profiling/buckets:bytes"},
 		{Name: "/gc/cycles/total:gc-cycles"},
 	}
 	rtmetrics.Read(s)
-	v := make([]uint64, len(s))
-	for i := range s {
+	for i := range s[:len(s)-1] {
 		if s[i].Value.Kind() == rtmetrics.KindUint64 {
-			v[i] = s[i].Value.Uint64()
+			floor += s[i].Value.Uint64()
 		}
 	}
-	live, total, released, free, objects := v[0], v[1], v[2], v[3], v[4]
-	// total less what is free or returned to the OS, less the garbage among
-	// the heap's objects (objects minus live).
-	reclaimable := released + free + objects - min(live, objects)
-	if total > reclaimable {
-		floor = total - reclaimable
+	if last := s[len(s)-1]; last.Value.Kind() == rtmetrics.KindUint64 {
+		gcs = last.Value.Uint64()
 	}
-	return floor, v[5]
+	return floor, gcs
 }
+
 
 // enabled reports whether there is a limit to measure against.
 func (a *admission) enabled() bool {
