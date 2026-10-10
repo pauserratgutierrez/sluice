@@ -6,6 +6,9 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ### Changed
 
+- The events one transaction brings a stream are written together: the stream's writer is woken at the transaction's commit rather than by each event (at once if a quarter of its queue fills, or once the transaction has been dispatching for 5 ms). In a rooms workload a member's stream gets the message and its own membership row from the same transaction: one write and one flush instead of two.
+- Identical filters are parsed once and shared: same text on the same relation, held weakly and collected with the last subscription or hold that uses it. Parsed filters were 44% of the live heap at 12,000 streams, and most were copies (every member of a room asks for the same one; a stream's holds often repeat one).
+- New metrics, set at each scrape: `sluice_index_size{index,kind}` (the hold and subscription indexes), `sluice_heap_live_bytes` and `sluice_memory_floor_bytes`.
 - Calls to the shape issuer and to channel hooks carry an `Idempotency-Key` header and use connections idle at most `SLUICE_ISSUER_IDLE_TIMEOUT` (default 4 s; Go's default was 90 s). An endpoint closing an idle keep-alive connection (Node after 5 s, Bun after 10 s) just as Sluice sent a request on it failed that call, refusing or revoking a shape with `issuer_unavailable`. The request is now re-sent on a new connection.
 - The SDK waits for the `Retry-After` of a `429` or `503` before opening the stream again, plus up to a tenth at random, instead of its own backoff, which could come back after a few milliseconds.
 - The reader's lag in seconds: how long ago the transaction being dispatched committed, which is how late every change arrives. It is in `sluice_reader_lag_seconds` and in `/readyz` as `reader_lag_seconds`. Past `SLUICE_LAG_DEGRADED` (default 5 s), `/readyz` adds `"degraded": "reader_lag"` and stays `200`; past `SLUICE_READY_MAX_LAG` (unset by default) it answers `503`.

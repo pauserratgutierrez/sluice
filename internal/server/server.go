@@ -194,8 +194,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	if s.cfg.MetricsEnabled {
-		mux.Handle("GET "+p+"/metrics", promhttp.Handler())
-		mux.Handle("GET /metrics", promhttp.Handler())
+		metricsHandler := s.withIndexGauges(promhttp.Handler())
+		mux.Handle("GET "+p+"/metrics", metricsHandler)
+		mux.Handle("GET /metrics", metricsHandler)
 	}
 	if s.cfg.DiagnosticsEnabled {
 		mux.HandleFunc("GET "+p+"/diagnostics", s.handleDiagnostics)

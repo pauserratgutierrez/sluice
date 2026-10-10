@@ -2,9 +2,12 @@ package server
 
 import (
 	"math"
+	"net/http"
 	"runtime/debug"
-	"runtime/metrics"
+	rtmetrics "runtime/metrics"
 	"sync"
+
+	"github.com/pauserratgutierrez/sluice/internal/metrics"
 )
 
 // admission decides whether a new stream may open from the memory it would
@@ -56,7 +59,7 @@ func newAdmission(threshold float64) *admission {
 // all of it, so this is the floor the limit is measured against; the live heap
 // alone left out the stacks of thousands of streams.
 func readLiveHeap() (floor, gcs uint64) {
-	s := []metrics.Sample{
+	s := []rtmetrics.Sample{
 		{Name: "/gc/heap/live:bytes"},
 		{Name: "/memory/classes/total:bytes"},
 		{Name: "/memory/classes/heap/released:bytes"},
@@ -64,10 +67,10 @@ func readLiveHeap() (floor, gcs uint64) {
 		{Name: "/memory/classes/heap/objects:bytes"},
 		{Name: "/gc/cycles/total:gc-cycles"},
 	}
-	metrics.Read(s)
+	rtmetrics.Read(s)
 	v := make([]uint64, len(s))
 	for i := range s {
-		if s[i].Value.Kind() == metrics.KindUint64 {
+		if s[i].Value.Kind() == rtmetrics.KindUint64 {
 			v[i] = s[i].Value.Uint64()
 		}
 	}
@@ -120,4 +123,30 @@ func (a *admission) admit(streams int) (bool, float64) {
 		a.refusing = true
 	}
 	return !a.refusing, share
+}
+
+// withIndexGauges sets the gauges of the hold and subscription indexes and
+// of memory just before each scrape: counting them walks the indexes, which
+// is cheap once per scrape but not per change.
+func (s *Server) withIndexGauges(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := s.holds.Size()
+		for kind, v := range map[string]int{"watches": h.Watches, "constants": h.Constants, "routed": h.Routed,
+			"routed_cap": h.RoutedCap, "unindexed": h.Unindexed, "counted": h.Counted} {
+			metrics.IndexSize.WithLabelValues("holds", kind).Set(float64(v))
+		}
+		g := s.reg.IndexSize()
+		for kind, v := range map[string]int{"subscriptions": g.Subscriptions, "constants": g.Constants, "routed": g.Routed,
+			"routed_cap": g.RoutedCap, "unindexed": g.Unindexed} {
+			metrics.IndexSize.WithLabelValues("subscriptions", kind).Set(float64(v))
+		}
+		floor, _ := readLiveHeap()
+		metrics.MemoryFloorBytes.Set(float64(floor))
+		s := []rtmetrics.Sample{{Name: "/gc/heap/live:bytes"}}
+		rtmetrics.Read(s)
+		if s[0].Value.Kind() == rtmetrics.KindUint64 {
+			metrics.HeapLiveBytes.Set(float64(s[0].Value.Uint64()))
+		}
+		next.ServeHTTP(w, r)
+	})
 }

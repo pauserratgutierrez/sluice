@@ -29,6 +29,21 @@ var (
 		return 0
 	})
 
+	IndexSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sluice_index_size",
+		Help: "Entries in the hold and subscription indexes, by kind, counted at each scrape: watches or subscriptions, constants, routed entries and their capacity, unindexed, and (holds) the constants counted per candidate column.",
+	}, []string{"index", "kind"})
+
+	MemoryFloorBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sluice_memory_floor_bytes",
+		Help: "Memory a collection cannot give back, as of the last one: the live heap plus the runtime's memory outside it (goroutine stacks above all). What stream admission measures.",
+	})
+
+	HeapLiveBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sluice_heap_live_bytes",
+		Help: "The live heap the last collection found.",
+	})
+
 	StreamsRefused = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_streams_refused_total",
 		Help: "New streams refused, by reason: max_streams (SLUICE_MAX_STREAMS) or memory (SLUICE_ADMIT_MEMORY).",
