@@ -49,9 +49,22 @@ type Subscription struct {
 	// unindexed and therefore scanned for every change to the relation.
 	RoutingKey string
 
+	// Requested is what the client asked for when it subscribed, before the
+	// grant narrowed it. A refresh asks the issuer about this again: asking
+	// about the effective Filter would add the grant's terms to it once more
+	// on every renewal.
+	Requested Requested
+
 	// seq numbers the subscription's change events. It is shared by every copy
 	// Rebind makes, and advanced by the reader, snapshots and replays alike.
 	seq *atomic.Int64
+}
+
+// Requested is a client's subscribe request for a shape.
+type Requested struct {
+	Filter  *shape.Filter
+	Columns []string
+	Ops     []string
 }
 
 // Indexed reports whether this subscription avoids the per-change scan.

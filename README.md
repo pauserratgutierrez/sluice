@@ -133,7 +133,7 @@ Only an allow grants. `"allow": false`, a redirect or a `4xx` other than `408` a
 }
 ```
 
-`action` is `refresh` when the stream presents a new token (`POST /token`). There, a shape the issuer denies is dropped with `shape_not_authorized`, and one it gives no verdict on is dropped with `issuer_unavailable`, so a new token never keeps a grant made for the previous one; the client subscribes again. A grant:
+`action` is `refresh` when the stream presents a new token (`POST /token`), with `requested` as on `subscribe`: what the client asked for, not the shape a grant made of it. There, a shape the issuer denies is dropped with `shape_not_authorized`, and one it gives no verdict on is dropped with `issuer_unavailable`, so a new token never keeps a grant made for the previous one; the client subscribes again. A grant:
 
 ```json
 {
@@ -334,7 +334,7 @@ Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insuf
 | `/presence` `{ "stream_id", "channel", "action": "track" \| "update" \| "untrack", "meta" }` | `{ "ok": true }`; `403 presence_key_not_allowed`, `403 channel_not_subscribed`, `429 rate_limited`, `429 presence_too_many_keys` |
 | `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch`, `503 session_check_unavailable` |
 
-`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape), and every hook channel is asked about again; `revoked_subscriptions` counts both, including shapes dropped with `issuer_unavailable`.
+`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape, asking about the shape as the client subscribed to it), and every hook channel is asked about again; `revoked_subscriptions` counts both, including shapes dropped with `issuer_unavailable`.
 
 ### Resume
 

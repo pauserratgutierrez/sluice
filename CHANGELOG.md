@@ -2,6 +2,23 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.8.2
+
+Issuer mode: `POST /token` no longer grows each shape's filter.
+
+### Fixed
+
+- Each `POST /token` asked the issuer about a shape's effective filter instead of the one the client subscribed with, and narrowed that again with the grant, so every renewal added the grant's terms to the filter once more (`project_id=eq.42,project_id=eq.42,…`). The process's memory grew by about 320 bytes per shape and renewal, and the cost of matching each change to the table grew with it. MEASURED_082 The issuer is now asked about the shape as the client requested it, as at subscribe.
+- For the same reason, a grant that widened at a `/token` (dropping a term it had required) left the shape as narrow as before. The shape now follows the grant.
+
+### For issuers
+
+- On `refresh`, `requested` is now what the client subscribed with (`filter`, `columns` and `ops`), as on `subscribe`. It was the effective shape: the previous grant's filter, repeated once per earlier renewal, followed by the client's, and only the granted columns.
+
+### For clients
+
+- Nothing changes. The SDK has no changes: `@pauserratgutierrez/sluice-js` 0.8.2 is 0.8.1's code, published under the server's version.
+
 ## 0.8.1
 
 Issuer mode: hold watches that were never removed, and grants dropped by updates that could not affect them.

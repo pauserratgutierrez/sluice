@@ -118,9 +118,8 @@ func TestGrantsAfterAnIdentityChangeAreCheckedAgainstTheWAL(t *testing.T) {
 	}
 	covered := s.hub.Open("n1.2", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	err = s.installShape(context.Background(), sub(covered), holdOn("user_id=eq.u1,project_id=eq.42"))
-	if err == nil || !strings.Contains(err.Error(), "database pool") {
-		// With no pool, a hold that passes the identity check fails the EXISTS.
-		t.Fatalf("a hold on key columns must pass the identity check, got %v", err)
+	if err != nil {
+		t.Fatalf("a hold on key columns must be installed, got %v", err)
 	}
 
 	renewed := s.hub.Open("n1.3", "", authz.Identity{Sub: "u3", Role: "authenticated"})

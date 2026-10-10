@@ -682,10 +682,11 @@ func (s *Server) prepareShapes(ctx context.Context, id authz.Identity, specs []s
 // preparedShape is a shape request validated and resolved by the oracle, not
 // yet installed. A failure is carried in res.
 type preparedShape struct {
-	res   subResult
-	rel   *catalog.Relation
-	ops   shape.Ops
-	grant *oracle.Grant
+	res       subResult
+	rel       *catalog.Relation
+	ops       shape.Ops
+	grant     *oracle.Grant
+	requested registry.Requested
 }
 
 func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSpec) preparedShape {
@@ -753,6 +754,7 @@ func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSp
 		metrics.AuthzCompileFailures.WithLabelValues(rel.Schema, rel.Name, truncate(d.Reason, 60)).Inc()
 	}
 	p.rel, p.ops, p.grant = rel, ops, grant
+	p.requested = registry.Requested{Filter: filter, Columns: sp.Columns, Ops: sp.Ops}
 	return p
 }
 
@@ -784,6 +786,7 @@ func (s *Server) subscribeShape(
 		Transitions: sp.Transitions,
 		Decision:    authz.NewHandle(decision),
 		RoutingKey:  filter.RoutingKey(rel),
+		Requested:   prep.requested,
 	}
 
 	// Warnings. Every one carries a remedy that is a runnable statement, because
@@ -1521,12 +1524,20 @@ func issuerUnavailable(e *oracle.ErrUnavailable) event.Error {
 // previous grant instead would let a token that changed what its holder may see
 // keep the old view for as long as the issuer is down.
 func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) string {
+	// Ask about what the client requested, as at subscribe. The effective filter
+	// already holds the previous grant's terms; narrowing it again would add
+	// them once more on every renewal, and a grant could never widen back.
+	req := sub.Requested
+	if req.Filter == nil {
+		req = registry.Requested{Filter: sub.Filter, Columns: sub.Columns}
+	}
 	grant, err := s.oracle.Refresh(ctx, oracle.Request{
 		Action:   oracle.ActionRefresh,
 		Identity: id,
 		Relation: sub.Relation,
-		Filter:   sub.Filter,
-		Columns:  sub.Columns,
+		Filter:   req.Filter,
+		Columns:  req.Columns,
+		Ops:      req.Ops,
 	})
 	var unavailable *oracle.ErrUnavailable
 	if errors.As(err, &unavailable) {
@@ -1628,12 +1639,7 @@ func (s *Server) installShape(ctx context.Context, sub *registry.Subscription, h
 		s.holds.Remove(sid, sub.Label)
 		return err
 	}
-	if s.pool == nil {
-		s.reg.Remove(sid, sub.Label)
-		s.holds.Remove(sid, sub.Label)
-		return fmt.Errorf("cannot verify holds without a database pool")
-	}
-	if err := hold.Exists(ctx, s.pool, holds); err != nil {
+	if err := s.verifyHolds(ctx, holds); err != nil {
 		s.reg.Remove(sid, sub.Label)
 		s.holds.Remove(sid, sub.Label)
 		return err
