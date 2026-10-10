@@ -483,6 +483,36 @@ test('a stream refused with 503 and Retry-After waits that long before trying ag
   client.close()
 })
 
+test('refusals that last back off past their Retry-After', async () => {
+  const opened: number[] = []
+  const random = Math.random
+  Math.random = () => 0.999 // the longest jittered wait, so the backoff is visible
+  try {
+    const client = createClient<Database>('https://example.test/sluice/v1', {
+      accessToken: 'tok',
+      pauseWhenHidden: false,
+      backoff: [1, 1500],
+      onError: () => {},
+      fetch: async () => {
+        opened.push(Date.now())
+        if (opened.length <= 2) {
+          return new Response('{"error":"too_many_streams"}', { status: 503, headers: { 'Retry-After': '1' } })
+        }
+        return sse(openStream('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'))
+      },
+    })
+    const live = client.from('documents').as('s1').on('*', () => {}).subscribe()
+    await new Promise((r) => setTimeout(r, 2900))
+    await live
+    assert.equal(opened.length, 3)
+    assert.ok(opened[1]! - opened[0]! >= 990, `first retry after ${opened[1]! - opened[0]!} ms, want the 1 s Retry-After`)
+    assert.ok(opened[2]! - opened[1]! >= 1490, `second retry after ${opened[2]! - opened[1]!} ms, want the 1.5 s backoff step, longer than Retry-After`)
+    client.close()
+  } finally {
+    Math.random = random
+  }
+})
+
 /** A ready event for one subscription. */
 const readyFor = (walLsn: string, result: Record<string, unknown>) =>
   'event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', wal_lsn: walLsn, subscriptions: [result] }) + '\n\n'

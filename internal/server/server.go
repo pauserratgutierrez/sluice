@@ -24,7 +24,6 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -78,6 +77,8 @@ type Server struct {
 	// admission refuses new streams when memory nears the Go memory limit.
 	admission   *admission
 	capacityLog capacityLog
+	// opening counts the stream opens admitted but not yet in the hub.
+	opening atomic.Int64
 
 	// Reader goroutine only: when the transaction being dispatched began, and
 	// the streams it queued events for without waking their writers, which
@@ -275,16 +276,25 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			"this node is shutting down; reconnect to another or retry shortly")
 		return
 	}
-	n := s.hub.Count()
-	if s.cfg.MaxStreams > 0 && n >= s.cfg.MaxStreams {
+	// Opens in progress hold a reservation from here until hub.Open counts them,
+	// so the opens of a storm, all arriving before any is counted, are not all
+	// measured against the same number of streams.
+	open, pending := s.hub.Count(), int(s.opening.Add(1))-1
+	reserved := true
+	release := func() {
+		if reserved {
+			reserved = false
+			s.opening.Add(-1)
+		}
+	}
+	defer release()
+	if s.cfg.MaxStreams > 0 && open+pending >= s.cfg.MaxStreams {
 		s.refuseCapacity(w, "max_streams", "this node is at its configured stream limit")
 		return
 	}
-	ok, share := s.admission.admit(n)
+	ok, share := s.admission.admit(open, pending)
 	metrics.AdmissionMemoryShare.Set(share)
 	if !ok {
-		// Spread the retries of a refused storm over a few seconds.
-		w.Header().Set("Retry-After", strconv.Itoa(1+rand.IntN(5)))
 		s.refuseCapacity(w, "memory", fmt.Sprintf("this node is near its memory limit (%.0f%% in use, refusing new streams from %.0f%%)", share*100, s.cfg.AdmitMemory*100))
 		return
 	}
@@ -312,6 +322,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	streamID := fmt.Sprintf("%s.%d-%d", s.cfg.NodeID, time.Now().UnixNano(), s.streamSeq.Add(1))
 
 	st := s.hub.Open(streamID, requestid.From(r.Context()).Value, id)
+	release()
 	if s.draining.Load() {
 		// Drain may have listed the open streams before this one was added.
 		st.CloseWith("server_shutdown")

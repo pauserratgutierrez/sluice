@@ -10,8 +10,10 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 
 - **`SLUICE_MAX_STREAMS=0` changes meaning, and is the new default.** It used to refuse every stream, since no stream count is below 0. It now means no fixed cap. The default was `50000`.
   - New streams are admitted by memory instead. Once the memory a collection cannot give back, plus what the streams opened since the last collection are expected to hold, reaches `SLUICE_ADMIT_MEMORY` (new; default `0.5`) of the Go memory limit, new streams are refused with `503 too_many_streams` and a `Retry-After` of 1 to 5 seconds. That memory is the live heap, goroutine stacks and the rest of the runtime's. Streams are admitted again 5 points below the threshold.
+  - Opens in progress count too: each holds a reservation until the hub counts it, so the simultaneous opens of a reconnect storm cannot all pass on the same number of streams.
+  - Streams closed since the last collection are taken off the projection, down to 20% of the measured floor, so that after a mass disconnect the memory the departed streams held does not refuse their reconnections until the next collection. When admission still refuses with far fewer streams than that collection saw, it forces one, at most every 5 s.
   - Capacity is decided before the token is verified. Refusals are logged once a second with their count (`streams refused`) instead of once per request.
-  - A positive `SLUICE_MAX_STREAMS` still caps the count besides.
+  - A positive `SLUICE_MAX_STREAMS` still caps the count besides, with the same count (open and opening) and the same `Retry-After`.
   - With no memory limit known and `SLUICE_MAX_STREAMS=0`, nothing bounds streams, and the log warns at startup.
   - Why `0.5`: with 12,000 streams offered to 1 CPU and 512 MB, `0.5` admitted 3,022 and delivered messages at p95 5 ms. A threshold of `0.85` on the live heap alone admitted 7,215, but the collector then ran without pause and messages arrived 30–60 s late. On 0.8.x, with a cap above what fit, the process was killed for memory 11 times in 15 minutes.
 - Issuer mode: **a hold is listed under whichever of its equally good columns has the shortest lists.** Sluice counts, per hold table, how many holds share each value of each column. 0.8.1 took the first column in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) checked each change to a member's row against every hold in the project. The order of a hold's columns no longer matters, and holds already listed move at their next `/token`.
@@ -33,7 +35,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 ### Performance
 
 - Identical filters are parsed once and shared, and collected with the last subscription or hold that uses one. They are keyed by the relation and its columns, so they are shared across catalog refreshes too. Parsed filters were 44% of the live heap at 12,000 streams.
-- The events one transaction brings a stream are written together. The writer is woken at the commit, or at once when a quarter of its queue fills or the transaction has been dispatching for 5 ms.
+- The events one transaction brings a stream are written together. The writer is woken at the commit, or at once when a quarter of its queue fills. Once the transaction has been dispatching for 5 ms, it is woken at the next row the reader dispatches, delivered or not.
 - Hold checks no longer hold up stream opens and `POST /token`. Candidates are evaluated with no lock held, and the lock is taken only to remove a hold that broke.
 
 ### For operators
@@ -48,7 +50,8 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 
 ### For clients
 
-- The SDK waits for the `Retry-After` of a `429` or `503` before opening the stream again, plus up to a tenth at random. It used to apply its own backoff, which could come back after a few milliseconds.
+- The SDK waits for the longer of a `429` or `503`'s `Retry-After` (plus up to a tenth at random) and its own backoff step before opening the stream again. Before, it applied only its backoff, which could come back after a few milliseconds; a refusal that lasts is now retried less and less often.
+- `resumed: false` can follow a short disconnect too, for a table busy enough that the resume buffer, which counts every change to it, reaches back only seconds. The READMEs say so now, with measured coverage.
 - `hold_check_unavailable` is a new retryable code, handled like `issuer_unavailable`.
 
 ### Measured

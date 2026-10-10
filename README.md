@@ -343,6 +343,8 @@ A client that reconnects sends `resume: { "schema.table": "<lsn>" }` per table: 
 
 The buffer holds up to `SLUICE_RING_EVENTS` changes per table since this process started replicating, and at most `SLUICE_RING_MAX_BYTES` of row data across every table, evicting the oldest first; entries older than `SLUICE_RING_MAX_AGE` are swept, except each table's newest transaction. `SLUICE_RING_EVENTS=0` disables it, which requires `SLUICE_SNAPSHOT_ENABLED=false` (a snapshot replays the buffer from its floor): every resume is then `resumed: false`, for clients that read the current state over HTTP whenever a subscription goes live. Broadcasts, presence and `TRUNCATE` are not replayed.
 
+The buffer counts a table's changes, whoever they were for, so on a busy table it reaches back seconds, not minutes. Measured: a table taking 337 changes a second (each message updating every member's row) was covered for about 12 s with `SLUICE_RING_EVENTS=4096`, and at 2,300 a second for about 2 s. A reconnect after a short network cut can therefore come back `resumed: false` for that table, not only after a restart or a long absence. Raise `SLUICE_RING_EVENTS` for such tables (about half a KiB of memory per buffered change), or write fewer rows per action.
+
 ## Channels: broadcast and presence
 
 A channel is `namespace:name`; the namespace is everything before the first `:`. Each namespace is declared in `SLUICE_CHANNELS` as `namespace:mode[:hook_url]`, comma-separated (default `room:public`). An undeclared namespace is refused, never public. The mode decides who may **join**; publishing and presence only require that the stream joined.

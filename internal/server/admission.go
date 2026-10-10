@@ -3,9 +3,11 @@ package server
 import (
 	"math"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 	rtmetrics "runtime/metrics"
 	"sync"
+	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
 )
@@ -31,11 +33,23 @@ type admission struct {
 	liveAtGC    uint64
 	streamsAtGC int
 	refusing    bool
+
+	now      func() time.Time
+	collect  func()
+	forcedGC time.Time
 }
 
 // admissionHysteresis is how far below the threshold the projection must fall
 // before streams are admitted again.
 const admissionHysteresis = 0.05
+
+// minFloorShare is the least of the measured floor a projection keeps after
+// streams close: some of it is the process, not the streams.
+const minFloorShare = 0.2
+
+// staleGCInterval is how often admission may force a collection when its
+// floor is stale.
+const staleGCInterval = 5 * time.Second
 
 // defaultStreamBytes is the memory a stream is assumed to hold until enough
 // streams are open to measure it. Measured: 44-49 KiB of live heap with seven
@@ -50,6 +64,8 @@ func newAdmission(threshold float64) *admission {
 		threshold: threshold,
 		limit:     func() int64 { return debug.SetMemoryLimit(-1) },
 		read:      readLiveHeap,
+		now:       time.Now,
+		collect:   runtime.GC,
 	}
 }
 
@@ -93,9 +109,18 @@ func (a *admission) enabled() bool {
 	return l > 0 && l != math.MaxInt64
 }
 
-// admit reports whether one more stream may open with streams open now, and
-// the projected share of the memory limit in use.
-func (a *admission) admit(streams int) (bool, float64) {
+// admit reports whether one more stream may open, with open streams in the hub
+// and pending opens admitted but not yet in it, and the projected share of the
+// memory limit in use.
+//
+// The projection moves from the floor the last collection found by the
+// streams opened or closed since, at the floor per stream then: opens add to
+// it, and so do the opens in progress, so that a storm's simultaneous opens do
+// not all see the same count; closes take from it, so that after a mass
+// disconnect the floor that held the departed streams does not refuse their
+// reconnections until the next collection. It never goes below
+// minFloorShare of the measured floor, since part of it is not the streams'.
+func (a *admission) admit(open, pending int) (bool, float64) {
 	if !a.enabled() {
 		return true, 0
 	}
@@ -105,22 +130,29 @@ func (a *admission) admit(streams int) (bool, float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if gcs != a.lastGC {
-		a.lastGC, a.liveAtGC, a.streamsAtGC = gcs, live, streams
+		a.lastGC, a.liveAtGC, a.streamsAtGC = gcs, live, open
 	}
 	perStream := float64(defaultStreamBytes)
 	if a.streamsAtGC >= minStreamsToMeasure {
 		perStream = float64(a.liveAtGC) / float64(a.streamsAtGC)
 	}
-	projected := float64(a.liveAtGC)
-	if opened := streams - a.streamsAtGC; opened > 0 {
-		projected += float64(opened) * perStream
-	}
+	streams := open + pending
+	projected := float64(a.liveAtGC) + float64(streams-a.streamsAtGC)*perStream
+	projected = max(projected, minFloorShare*float64(a.liveAtGC))
 	share := projected / float64(limit)
 	switch {
 	case a.refusing && share <= a.threshold-admissionHysteresis:
 		a.refusing = false
 	case !a.refusing && share >= a.threshold:
 		a.refusing = true
+	}
+	// Refusing with far fewer streams than the last collection saw: the floor
+	// is stale. Ask for a collection, at most one every staleGCInterval.
+	if a.refusing && streams < a.streamsAtGC*9/10 {
+		if now := a.now(); now.Sub(a.forcedGC) >= staleGCInterval {
+			a.forcedGC = now
+			go a.collect()
+		}
 	}
 	return !a.refusing, share
 }

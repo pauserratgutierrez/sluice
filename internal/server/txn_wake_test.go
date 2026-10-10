@@ -80,3 +80,26 @@ func TestALongTransactionWakesWritersAtOnce(t *testing.T) {
 		t.Fatal("past txnWakeDelay the writer must be woken at once")
 	}
 }
+
+// Events queued by a transaction are woken at the next row dispatched once
+// txnWakeDelay has passed, even when that row reaches no stream.
+func TestQueuedEventsAreWokenAtTheNextRowAfterTheDelay(t *testing.T) {
+	s := testServer(t, stubOracle{name: oracle.NameRLS})
+	st := docsStream(t, s)
+	wal := walDocs(t)
+	s.OnBegin(0x10, time.Now(), 1)
+	if err := s.OnChange(&pgoutput.Message{Type: pgoutput.MsgInsert, RelationOID: 100, New: row("1", "42", "t")}, wal, 0x10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if woken(st) {
+		t.Fatal("woken before the delay")
+	}
+	s.txnBegan = time.Now().Add(-2 * txnWakeDelay)
+	// A row of another project: no stream wants it.
+	if err := s.OnChange(&pgoutput.Message{Type: pgoutput.MsgInsert, RelationOID: 100, New: row("2", "99", "t")}, wal, 0x10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !woken(st) {
+		t.Fatal("past txnWakeDelay, the next row must wake the queued stream")
+	}
+}

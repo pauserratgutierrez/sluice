@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -137,9 +139,11 @@ type capacityLog struct {
 	refused int
 }
 
-// refuseCapacity answers 503 too_many_streams and logs it sampled.
+// refuseCapacity answers 503 too_many_streams with a Retry-After of 1 to 5
+// seconds, spreading a refused storm's retries, and logs it sampled.
 func (s *Server) refuseCapacity(w http.ResponseWriter, reason, msg string) {
 	metrics.StreamsRefused.WithLabelValues(reason).Inc()
+	w.Header().Set("Retry-After", strconv.Itoa(1+rand.IntN(5)))
 	writeErr(w, http.StatusServiceUnavailable, "too_many_streams", msg)
 	c := &s.capacityLog
 	c.mu.Lock()

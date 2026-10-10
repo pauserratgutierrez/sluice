@@ -492,9 +492,11 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         const wait = schedule[Math.min(this.attempt, schedule.length - 1)] ?? 1000
         this.attempt++
         // Full jitter: a server restart must not bring every client back at the
-        // same instant. A server that is shutting down spreads its clients
-        // itself, over a wider window, and says when to come back.
-        const delay = this.retryAfter ?? Math.random() * wait
+        // same instant. A server that is shutting down or refusing for capacity
+        // says when to come back; the backoff still grows under it, so a refusal
+        // that lasts is not retried every few seconds forever.
+        const jittered = Math.random() * wait
+        const delay = this.retryAfter === null ? jittered : Math.max(this.retryAfter, jittered)
         this.retryAfter = null
         await sleep(delay)
       }

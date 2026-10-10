@@ -250,6 +250,11 @@ func (s *Server) OnMessage(m *pgoutput.Message, commitLSN uint64) error {
 // Tier A and Tier B subscriptions.
 func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN uint64, commitTime time.Time) error {
 	op := opName(m.Type)
+	// Events a transaction queued wait for its commit, or at most txnWakeDelay
+	// and one row: checked at every row, delivered or not.
+	if len(s.wakes) > 0 && time.Since(s.txnBegan) >= txnWakeDelay {
+		s.wakeQueued()
+	}
 	metrics.WALMessages.WithLabelValues(strings.ToLower(op)).Inc()
 	metrics.Changes.WithLabelValues(rel.Namespace, rel.Name, op).Inc()
 
@@ -331,7 +336,8 @@ func (s *Server) sendChange(st *hub.Stream, ev event.Event, backfill bool) {
 }
 
 // txnWakeDelay bounds how long the events of a transaction wait for its
-// commit in a stream's queue.
+// commit in a stream's queue: past it, they are woken at the next row the
+// reader dispatches, and later events at once.
 const txnWakeDelay = 5 * time.Millisecond
 
 // wakeQueued wakes the writers of the streams the current transaction queued
