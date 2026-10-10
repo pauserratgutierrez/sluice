@@ -2,20 +2,70 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
-## Unreleased
+## Unreleased (proposed 0.9.0)
+
+Streams admitted by memory, hold checks that no longer depend on filter order or hold up `/token`, shared filters, and the reader's lag in seconds.
 
 ### Changed
 
-- The events one transaction brings a stream are written together: the stream's writer is woken at the transaction's commit rather than by each event (at once if a quarter of its queue fills, or once the transaction has been dispatching for 5 ms). In a rooms workload a member's stream gets the message and its own membership row from the same transaction: one write and one flush instead of two.
-- Identical filters are parsed once and shared: same text on the same relation, held weakly and collected with the last subscription or hold that uses it. Parsed filters were 44% of the live heap at 12,000 streams, and most were copies (every member of a room asks for the same one; a stream's holds often repeat one).
-- New metrics, set at each scrape: `sluice_index_size{index,kind}` (the hold and subscription indexes), `sluice_heap_live_bytes` and `sluice_memory_floor_bytes`.
-- Calls to the shape issuer and to channel hooks carry an `Idempotency-Key` header and use connections idle at most `SLUICE_ISSUER_IDLE_TIMEOUT` (default 4 s; Go's default was 90 s). An endpoint closing an idle keep-alive connection (Node after 5 s, Bun after 10 s) just as Sluice sent a request on it failed that call, refusing or revoking a shape with `issuer_unavailable`. The request is now re-sent on a new connection.
-- The SDK waits for the `Retry-After` of a `429` or `503` before opening the stream again, plus up to a tenth at random, instead of its own backoff, which could come back after a few milliseconds.
-- The reader's lag in seconds: how long ago the transaction being dispatched committed, which is how late every change arrives. It is in `sluice_reader_lag_seconds` and in `/readyz` as `reader_lag_seconds`. Past `SLUICE_LAG_DEGRADED` (default 5 s), `/readyz` adds `"degraded": "reader_lag"` and stays `200`; past `SLUICE_READY_MAX_LAG` (unset by default) it answers `503`.
-- `SLUICE_MAX_STREAMS=0` used to refuse every stream (no stream count is below 0); it now means no fixed cap, and it is the default (it was `50000`). New streams are admitted by memory instead, by default: they are refused with `503 too_many_streams` and a `Retry-After` of 1 to 5 seconds when the memory a collection cannot give back (live heap, goroutine stacks and the rest of the runtime's), plus what the streams opened since the last collection are expected to hold, reaches `SLUICE_ADMIT_MEMORY` (default `0.5`) of the Go memory limit, and admitted again 5 points below it. Capacity is decided before the token is verified, and refusals are logged once a second with their count (`streams refused`). A positive `SLUICE_MAX_STREAMS` still caps the count besides. With no memory limit known and `SLUICE_MAX_STREAMS=0`, nothing bounds streams, and the log warns at startup. New metrics: `sluice_streams_refused_total{reason}`, `sluice_admission_memory_share`.
-- A hold check that could not be made (the request was cancelled or timed out, or the database failed) now drops the shape with the retryable `hold_check_unavailable` and a `retry_after_ms`, at subscribe and at `POST /token`. It was `shape_not_authorized`, which the client does not retry, so a `/token` that timed out under load lost its shapes for good. A hold row that does not exist is still `shape_not_authorized`.
-- Issuer mode: a hold is listed for routing under whichever of its equally good columns has the shortest lists. Sluice counts, per hold table, how many holds share each value of each column. Before, it took the first in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) put every member of a project in one list, and each change to a member's row was checked against all of them. The order of a hold's columns no longer matters. Microbenchmark at 400 rooms of 28 streams with 7 holds each: a member update went from 107 µs (scope first) to 4.8 µs, and from 3.8 µs to 4.3 µs member first.
-- Hold checks no longer hold up stream opens and `POST /token`. The reader evaluated a change's candidate holds under the hold index's lock, which grants and renewals also need; it now evaluates them with no lock held and locks only to remove a hold that broke.
+- **`SLUICE_MAX_STREAMS=0` changes meaning, and is the new default.** It used to refuse every stream, since no stream count is below 0. It now means no fixed cap. The default was `50000`.
+  - New streams are admitted by memory instead. Once the memory a collection cannot give back, plus what the streams opened since the last collection are expected to hold, reaches `SLUICE_ADMIT_MEMORY` (new; default `0.5`) of the Go memory limit, new streams are refused with `503 too_many_streams` and a `Retry-After` of 1 to 5 seconds. That memory is the live heap, goroutine stacks and the rest of the runtime's. Streams are admitted again 5 points below the threshold.
+  - Capacity is decided before the token is verified. Refusals are logged once a second with their count (`streams refused`) instead of once per request.
+  - A positive `SLUICE_MAX_STREAMS` still caps the count besides.
+  - With no memory limit known and `SLUICE_MAX_STREAMS=0`, nothing bounds streams, and the log warns at startup.
+  - Why `0.5`: with 12,000 streams offered to 1 CPU and 512 MB, `0.5` admitted 3,022 and delivered messages at p95 5 ms. A threshold of `0.85` on the live heap alone admitted 7,215, but the collector then ran without pause and messages arrived 30–60 s late. On 0.8.x, with a cap above what fit, the process was killed for memory 11 times in 15 minutes.
+- Issuer mode: **a hold is listed under whichever of its equally good columns has the shortest lists.** Sluice counts, per hold table, how many holds share each value of each column. 0.8.1 took the first column in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) checked each change to a member's row against every hold in the project. The order of a hold's columns no longer matters, and holds already listed move at their next `/token`.
+- A hold check that could not be made now drops the shape with the retryable `hold_check_unavailable` and a `retry_after_ms`, at subscribe and at `POST /token`. That covers a request cancelled or timed out, or a database failure. It was `shape_not_authorized`, which clients do not retry, so a `/token` that timed out under load lost its shapes for good. A hold row that does not exist is still `shape_not_authorized`.
+- Calls to the shape issuer and to channel hooks carry an `Idempotency-Key` header. Idle connections to them close after `SLUICE_ISSUER_IDLE_TIMEOUT` (new; default 4 s; Go's default was 90 s).
+  - Before: an endpoint that closed an idle keep-alive connection just as Sluice sent a request on it made that call fail, and the shape was refused or revoked with `issuer_unavailable`. Node closes idle connections after 5 s, Bun after 10 s.
+  - Now: the request is re-sent on a new connection.
+
+### Added
+
+- The reader's lag in seconds: how long ago the transaction being dispatched committed, which is how late every change arrives. It is `sluice_reader_lag_seconds`, and `reader_lag_seconds` in `/readyz`.
+  - Past `SLUICE_LAG_DEGRADED` (default 5 s), `/readyz` adds `"degraded": "reader_lag"` and stays `200`.
+  - Past `SLUICE_READY_MAX_LAG` (unset by default), it answers `503`. Set this only with more than one node behind the balancer.
+- Metrics:
+  - `sluice_streams_refused_total{reason}` and `sluice_admission_memory_share`;
+  - `sluice_memory_floor_bytes` and `sluice_heap_live_bytes`;
+  - `sluice_index_size{index,kind}`, the sizes of the hold and subscription indexes, set at each scrape.
+
+### Performance
+
+- Identical filters are parsed once and shared, and collected with the last subscription or hold that uses one. They are keyed by the relation and its columns, so they are shared across catalog refreshes too. Parsed filters were 44% of the live heap at 12,000 streams.
+- The events one transaction brings a stream are written together. The writer is woken at the commit, or at once when a quarter of its queue fills or the transaction has been dispatching for 5 ms.
+- Hold checks no longer hold up stream opens and `POST /token`. Candidates are evaluated with no lock held, and the lock is taken only to remove a hold that broke.
+
+### For operators
+
+- If you set `SLUICE_MAX_STREAMS=0`, it now admits streams instead of refusing them all.
+- Give the container a memory limit (or set `GOMEMLIMIT`) so that automatic admission has something to measure against. Watch `sluice_streams_refused_total` and `sluice_reader_lag_seconds`.
+
+### For issuers
+
+- The same request may reach you twice, with the same `Idempotency-Key`, when the first one went out on a connection you were closing. Answer it as any other.
+- The order of a hold's columns no longer matters.
+
+### For clients
+
+- The SDK waits for the `Retry-After` of a `429` or `503` before opening the stream again, plus up to a tenth at random. It used to apply its own backoff, which could come back after a few milliseconds.
+- `hold_check_unavailable` is a new retryable code, handled like `issuer_unavailable`.
+
+### Measured
+
+The load test's rooms workload: 7 shapes and a hook channel per stream, membership holds, a message every 15 s per room updating every member's row, PostgreSQL 18.6.
+
+| | 0.8.1 (measured) | 0.9.0 candidate (measured) |
+| --- | --- | --- |
+| 12,000 streams, 2,320 changes/s, 1 CPU, holds member first: CPU per 1,000 changes | 105 ms | 103 ms |
+| Holds written room first | 365 ms per 1,000 changes (1,500 streams, 1 CPU) | the same as member first (microbenchmark below) |
+| Live heap at 12,000 streams | 546–572 MiB (46–48 KiB per stream) | 419 MiB (36 KiB per stream) |
+| Go memory at 12,000 streams | 1,291 MiB | 1,027 MiB |
+| 12,000 streams offered to 1 CPU and 512 MB | killed for memory 11 times (cap 15,000) | 3,022 admitted, message p95 5 ms, no kill |
+| A member's update checked against holds (microbenchmark, 400 rooms × 28 streams × 7 holds) | 107 µs room first, 3.8 µs member first | 4.8 µs, 4.3 µs |
+| `/token` (`Replace`) while the reader checks holds back to back (microbenchmark, Linux) | mean 12 µs, p99.9 2.1 ms (with item 2 only) | mean 2.4 µs, p99.9 0.35 ms |
+
+0.8.2 keeps each subscription's request, about 550 bytes per shape, which 0.9.0's shared filters more than pay back.
 
 ## 0.8.2
 
