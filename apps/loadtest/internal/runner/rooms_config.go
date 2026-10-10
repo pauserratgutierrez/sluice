@@ -21,17 +21,19 @@ type roomClass struct {
 // roomsConfig drives the production-shaped profiles: rooms, bigtxn,
 // reconnect and calibrate.
 type roomsConfig struct {
-	Classes         []roomClass     `json:"classes"`
-	Shapes          int             `json:"shapes"`
-	MsgEvery        time.Duration   `json:"msg_every"`
-	TypingEvery     time.Duration   `json:"typing_every"`
-	TypingEnabled   bool            `json:"typing_enabled"`
-	Duration        time.Duration   `json:"duration"`
-	Arrival         time.Duration   `json:"arrival"`
-	ArrivalTraffic  bool            `json:"arrival_traffic"`
-	Wave            int             `json:"wave"`
-	OpenTimeout     time.Duration   `json:"open_timeout"`
-	TokenEvery      time.Duration   `json:"token_every"`
+	Classes        []roomClass   `json:"classes"`
+	Shapes         int           `json:"shapes"`
+	MsgEvery       time.Duration `json:"msg_every"`
+	TypingEvery    time.Duration `json:"typing_every"`
+	TypingEnabled  bool          `json:"typing_enabled"`
+	Duration       time.Duration `json:"duration"`
+	Arrival        time.Duration `json:"arrival"`
+	ArrivalTraffic bool          `json:"arrival_traffic"`
+	Wave           int           `json:"wave"`
+	OpenTimeout    time.Duration `json:"open_timeout"`
+	TokenEvery     time.Duration `json:"token_every"`
+	// Churn is the share of open streams ended and reopened every minute.
+	Churn           float64         `json:"churn,omitempty"`
 	TokenTTL        time.Duration   `json:"token_ttl"`
 	ReplicaIdentity string          `json:"replica_identity"`
 	SSEBuffer       int             `json:"sse_buffer"`
@@ -157,6 +159,7 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 		Wave:            envInt("LOAD_WAVE", 256),
 		OpenTimeout:     envDur("LOAD_OPEN_TIMEOUT", 3*time.Minute),
 		TokenEvery:      envDur("LOAD_TOKEN_EVERY", 15*time.Minute),
+		Churn:           envFloat("LOAD_CHURN", 0),
 		TokenTTL:        envDur("LOAD_TOKEN_TTL", time.Hour),
 		ReplicaIdentity: strings.ToLower(envOr("LOAD_REPLICA_IDENTITY", "full")),
 		SSEBuffer:       envInt("LOAD_SSE_BUFFER", 16),

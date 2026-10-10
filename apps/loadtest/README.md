@@ -49,7 +49,7 @@ They run against `sluice-rooms`, an issuer-mode Sluice with RLS off and Sluice's
 
 **Profiles.** With `LOAD_PPROF_AT`, the runner takes a CPU profile of `LOAD_PPROF_SECONDS` that far into the steady phase, then heap and goroutine snapshots, from a Sluice built with the `pprof` tag (`scripts/build-pprof.sh` builds `sluice:pprof`; run with `SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never SLUICE_PPROF_ADDR=0.0.0.0:6060`). They are saved next to the report: `go tool pprof -top results/<run>.cpu.pprof`.
 
-How a stream behaves, in all four: it is driven the way [`packages/sluice-js`](../../packages/sluice-js/src/client.ts) drives one. One `POST /stream` carries every subscription and a resume map (the last `commit_lsn` seen per table, or the `wal_lsn` of the `ready` that installed it). When it ends, the client waits `retry_after_ms` if the server sent one, otherwise a random delay up to the backoff step (`LOAD_BACKOFF`, the SDK's `500ms,1s,2s,5s,10s`), and the step resets once a stream opens. A subscription refused with a retryable error (`issuer_unavailable`) is asked for again with `POST /subscribe` after its `retry_after_ms`.
+How a stream behaves, in all four: it is driven the way [`packages/sluice-js`](../../packages/sluice-js/src/client.ts) drives one. One `POST /stream` carries every subscription and a resume map (the last `commit_lsn` seen per table, or the `wal_lsn` of the `ready` that installed it). When it ends, the client waits `retry_after_ms` if the server sent one, or the `Retry-After` of a refused open (`429`, `503`) plus up to a tenth, otherwise a random delay up to the backoff step (`LOAD_BACKOFF`, the SDK's `500ms,1s,2s,5s,10s`), and the step resets once a stream opens. A subscription refused with a retryable error (`issuer_unavailable`) is asked for again with `POST /subscribe` after its `retry_after_ms`.
 
 The shapes of a stream, for `S = LOAD_SHAPES`: the room's messages (`room_id=eq.R`), the member's own memberships (`user_id=eq.U`, which receives their `last_message_at` updates), their notifications (`INSERT` only), and `S − 3` filler shapes. A filler costs what a shape costs (an issuer call, a hold, a registry entry, a refresh on `/token`) but asks for `DELETE` on the member's own row, which never happens, so it carries no traffic. Most of the `N` updates of a message reach no stream; Sluice decodes, routes and buffers them all the same.
 
@@ -146,6 +146,7 @@ Production-shaped profiles:
 | `LOAD_ARRIVAL_TRAFFIC` | `true` | write messages and typing while streams arrive |
 | `LOAD_OPEN_TIMEOUT` | `3m` | how long after the arrival window to wait for the last opens |
 | `LOAD_TOKEN_EVERY`, `LOAD_TOKEN_TTL` | `15m`, `1h` | `POST /token` per stream, from a random first offset; lifetime of each token |
+| `LOAD_CHURN` | `0` | share of the open streams ended and reopened every minute, chosen at random; each reopens as after any disconnect, with its resume positions |
 | `LOAD_REPLICA_IDENTITY` | `full` | `room_members`' replica identity: `full` or `pk` |
 | `LOAD_BACKOFF` | `500ms,1s,2s,5s,10s` | the reconnect schedule (the SDK's default) |
 | `LOAD_SSE_BUFFER` | `16` | (capacity profiles) events a stream buffers in the runner |
@@ -170,6 +171,7 @@ Production-shaped profiles:
 | `LOAD_RAMP_STEP`, `LOAD_RAMP_ARRIVAL`, `LOAD_RAMP_SETTLE`, `LOAD_RAMP_HOLD`, `LOAD_RAMP_AFTER_FAIL` | `1000`, `20s`, `15s`, `90s`, `0` | streams per step, spread of their opens, wait before judging, judged window, steps after the first failure |
 | `LOAD_PROBE_EVERY`, `LOAD_PROBE_AGES` | `2m` (`0` in `ramp` and `calibrate`), `500ms` … `90s` | the resume-buffer probe |
 | `LOAD_PPROF_AT`, `LOAD_PPROF_SECONDS`, `LOAD_PPROF_URL` | unset, `60s`, `http://sluice-rooms:6060/debug/pprof` | profiles of a `pprof` build |
+| `LOAD_PPROF_HEAP_AT` | `2m,9m` | with `LOAD_PPROF_AT`, also heap profiles at these times into the steady phase |
 | `LOAD_ISSUER_NAME` | unset | names the issuer's configuration in the report |
 | `SLUICE_GOMAXPROCS`, `SLUICE_PPROF_ADDR` | unset | Sluice's `GOMAXPROCS` (else Go's default for the quota) and pprof address (`pprof` builds) |
 | `RESULTS_DIR` | `./results` | where reports go (`scripts/queue.sh` sets it) |

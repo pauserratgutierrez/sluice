@@ -54,6 +54,14 @@ type Point struct {
 	HookRechecks   float64            `json:"hook_rechecks"`
 	SluiceRestarts int                `json:"sluice_restarts,omitempty"`
 
+	// From Sluice 0.9: the live heap the last GC found (exactly, unlike
+	// NextGCMiB/2), the memory a GC cannot give back (stream admission's
+	// measure), and the hold and subscription indexes by kind
+	// ("holds.watches", "subscriptions.routed", ...).
+	HeapLiveExactMiB float64            `json:"heap_live_exact_mib,omitempty"`
+	MemoryFloorMiB   float64            `json:"memory_floor_mib,omitempty"`
+	IndexSize        map[string]float64 `json:"index_size,omitempty"`
+
 	// Replication, in bytes behind pg_current_wal_lsn(): what Sluice has not
 	// dispatched yet (backlog, from its live confirmed position), what the
 	// slot has not acknowledged (slot_lag, confirmed_flush_lsn, which moves
@@ -219,6 +227,9 @@ func (s *sampler) sample(ctx context.Context, phase string) (Point, int) {
 		p.Goroutines = m["go_goroutines"]
 		p.GCPauseMaxMs = m[`go_gc_duration_seconds{quantile="1"}`] * 1000
 		p.ResumeBufMiB = m["sluice_resume_buffer_bytes"] / mib
+		p.HeapLiveExactMiB = m["sluice_heap_live_bytes"] / mib
+		p.MemoryFloorMiB = m["sluice_memory_floor_bytes"] / mib
+		p.IndexSize = indexSizes(m)
 		p.WALLagBytes = int64(m["sluice_wal_lag_bytes"])
 		tables := tableChanges(m)
 		if dt > 0 && s.prevTables != nil && !restarted {
@@ -420,6 +431,22 @@ func parseLSN(s string) (uint64, error) {
 }
 
 // tableChanges sums sluice_changes_total by schema.table.
+// indexSizes reads sluice_index_size{index,kind} as "index.kind" -> entries.
+func indexSizes(m map[string]float64) map[string]float64 {
+	var out map[string]float64
+	for k, v := range m {
+		labels, ok := strings.CutPrefix(k, "sluice_index_size{")
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = map[string]float64{}
+		}
+		out[labelValue(labels, "index")+"."+labelValue(labels, "kind")] = v
+	}
+	return out
+}
+
 func tableChanges(m map[string]float64) map[string]float64 {
 	out := map[string]float64{}
 	for k, v := range m {

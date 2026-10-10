@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,6 +99,10 @@ type rclient struct {
 	readyN  atomic.Int64 // ready events received
 	readyAt atomic.Int64 // the last ready, unix ns
 	downAt  atomic.Int64 // when a reconnect wave saw it drop, unix ns
+	// stop ends the stream open now, for LOAD_CHURN; churned marks that it was
+	// ended on purpose, so its end is counted as churn, not as a failure.
+	stop    atomic.Pointer[context.CancelFunc]
+	churned atomic.Bool
 }
 
 func (c *rclient) stamp() string { return *c.token.Load() }
@@ -167,7 +172,10 @@ func (c *rclient) openOnce(ctx context.Context) {
 		w.attempts.Add(1)
 	}
 	t0 := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.cfg.SluiceURL+"/stream", bytes.NewReader(body))
+	sctx, stop := context.WithCancel(ctx)
+	defer stop()
+	c.stop.Store(&stop)
+	req, err := http.NewRequestWithContext(sctx, http.MethodPost, e.cfg.SluiceURL+"/stream", bytes.NewReader(body))
 	if err != nil {
 		return
 	}
@@ -193,6 +201,10 @@ func (c *rclient) openOnce(ctx context.Context) {
 			code += ":" + eb.Error
 		}
 		e.openFailed(code)
+		// As the SDK does: a refusal for capacity says when to come back.
+		if d, ok := retryAfterHeader(resp); ok {
+			c.retryAfter = d
+		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			// The SDK stops here; for the runner it is a broken setup.
 			e.count("fatal_" + code)
@@ -219,6 +231,10 @@ func (c *rclient) wentDown(ctx context.Context, readErr error) {
 		c.e.liveClients.Add(-1)
 	}
 	if ctx.Err() != nil {
+		return
+	}
+	if c.churned.Swap(false) {
+		c.e.count("churned")
 		return
 	}
 	reason := "eof"
@@ -693,4 +709,37 @@ func (c *rclient) findLocked(label string) (subDef, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.find(label)
+}
+
+// churn ends the client's stream on purpose; run opens it again.
+func (c *rclient) churn() bool {
+	stop := c.stop.Load()
+	if stop == nil || !c.live.Load() {
+		return false
+	}
+	c.churned.Store(true)
+	(*stop)()
+	return true
+}
+
+// retryAfterHeader reads Retry-After (seconds or an HTTP date) on a 429 or
+// 503, at most a minute, plus up to a tenth at random, like the SDK.
+func retryAfterHeader(resp *http.Response) (time.Duration, bool) {
+	if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable {
+		return 0, false
+	}
+	h := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if h == "" {
+		return 0, false
+	}
+	var d time.Duration
+	if n, err := strconv.Atoi(h); err == nil {
+		d = time.Duration(n) * time.Second
+	} else if t, err := http.ParseTime(h); err == nil {
+		d = time.Until(t)
+	} else {
+		return 0, false
+	}
+	d = min(max(d, 0), time.Minute)
+	return d + time.Duration(rand.Float64()*float64(d)/10), true
 }

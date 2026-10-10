@@ -312,6 +312,9 @@ func runRooms(ctx context.Context, cfg Config, log *slog.Logger) error {
 	go e.sampler.run(e.clientsCtx, rc.SampleEvery)
 	go e.secondTicker(e.clientsCtx)
 	go e.windowTicker(e.clientsCtx)
+	if rc.Churn > 0 {
+		go e.churnLoop(e.clientsCtx)
+	}
 
 	go e.lsnLoop(e.clientsCtx)
 	if cfg.Scenario == "ramp" {
@@ -1130,4 +1133,30 @@ func postgresInfo(ctx context.Context, pool *pgxpool.Pool) map[string]string {
 		}
 	}
 	return out
+}
+
+// churnLoop ends LOAD_CHURN of the open streams every minute, chosen at
+// random; each client opens its stream again as after any disconnect, with
+// its resume positions. Sluice sees a stream leave and a new one arrive.
+func (e *engine) churnLoop(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		n := int(math.Round(e.rc.Churn * float64(len(e.clients))))
+		ended := 0
+		for _, i := range rand.Perm(len(e.clients)) {
+			if ended >= n {
+				break
+			}
+			if e.clients[i].churn() {
+				ended++
+			}
+		}
+		e.log.Info("churn", "ended", ended, "of", len(e.clients))
+	}
 }

@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -736,6 +737,7 @@ func roomsMarkdown(r RoomsReport) string {
 		b.WriteByte('\n')
 	}
 
+	writeIndexes(&b, r.Timeline)
 	keys := make([]string, 0, len(r.Counters))
 	for k := range r.Counters {
 		keys = append(keys, k)
@@ -777,4 +779,41 @@ func optS(m map[string]float64, k string) string {
 		return fmt.Sprintf("%.1f", v)
 	}
 	return "—"
+}
+
+// writeIndexes compares Sluice's indexes and memory at the first and last
+// steady samples (Sluice 0.9 exports them), and lists the live heap after each
+// collection: a run at constant load should end where it started.
+func writeIndexes(b *strings.Builder, tl []Point) {
+	var first, last *Point
+	for i := range tl {
+		if tl[i].Phase == "steady" && tl[i].IndexSize != nil {
+			if first == nil {
+				first = &tl[i]
+			}
+			last = &tl[i]
+		}
+	}
+	if first == nil {
+		return
+	}
+	fmt.Fprintf(b, "## Indexes and memory, start and end of the steady phase\n\n")
+	fmt.Fprintf(b, "| | %.0f s | %.0f s |\n| --- | ---: | ---: |\n", first.T, last.T)
+	fmt.Fprintf(b, "| streams | %.0f | %.0f |\n", first.Streams, last.Streams)
+	keys := slices.Sorted(maps.Keys(first.IndexSize))
+	for _, k := range keys {
+		fmt.Fprintf(b, "| %s | %.0f | %.0f |\n", k, first.IndexSize[k], last.IndexSize[k])
+	}
+	fmt.Fprintf(b, "| live heap MiB | %.1f | %.1f |\n| memory floor MiB | %.1f | %.1f |\n\n",
+		first.HeapLiveExactMiB, last.HeapLiveExactMiB, first.MemoryFloorMiB, last.MemoryFloorMiB)
+	// One value per collection: the gauge changes only when one ends.
+	var after []string
+	prev := -1.0
+	for _, p := range tl {
+		if p.Phase == "steady" && p.HeapLiveExactMiB > 0 && p.HeapLiveExactMiB != prev {
+			after = append(after, fmt.Sprintf("%.0f s %.1f", p.T, p.HeapLiveExactMiB))
+			prev = p.HeapLiveExactMiB
+		}
+	}
+	fmt.Fprintf(b, "Live heap after each collection (MiB): %s.\n\n", strings.Join(after, ", "))
 }

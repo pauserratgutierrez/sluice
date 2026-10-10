@@ -3,6 +3,7 @@ package runner
 import (
 	"math"
 	"math/rand/v2"
+	"net/http"
 	"testing"
 	"time"
 
@@ -184,5 +185,27 @@ func TestLagSeconds(t *testing.T) {
 	}
 	if s := lagSeconds(pts, 2, 50); s != -1 {
 		t.Fatalf("before the readings: %v", s)
+	}
+}
+
+func TestRetryAfterHeader(t *testing.T) {
+	resp := func(status int, h string) *http.Response {
+		r := &http.Response{StatusCode: status, Header: http.Header{}}
+		if h != "" {
+			r.Header.Set("Retry-After", h)
+		}
+		return r
+	}
+	if d, ok := retryAfterHeader(resp(503, "3")); !ok || d < 3*time.Second || d > 3300*time.Millisecond {
+		t.Fatalf("503 Retry-After 3: %v %v", d, ok)
+	}
+	if d, ok := retryAfterHeader(resp(429, "600")); !ok || d > 66*time.Second {
+		t.Fatalf("capped at a minute: %v %v", d, ok)
+	}
+	if _, ok := retryAfterHeader(resp(500, "3")); ok {
+		t.Fatal("only 429 and 503 carry a delay to honor")
+	}
+	if _, ok := retryAfterHeader(resp(503, "")); ok {
+		t.Fatal("no header, no delay")
 	}
 }
