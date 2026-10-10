@@ -261,7 +261,7 @@ Accept: text/event-stream
   "resume": { "public.documents": "0/1A2B3C4" } }
 ```
 
-The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`), `503 server_shutdown` (the process is stopping) or `503 session_check_unavailable` (the session lookup could not reach the database; retry). Closing the response is how a client leaves: everything the stream held, presence included, is released.
+The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`, or memory near its limit: `SLUICE_ADMIT_MEMORY`, with `Retry-After`), `503 server_shutdown` (the process is stopping) or `503 session_check_unavailable` (the session lookup could not reach the database; retry). Closing the response is how a client leaves: everything the stream held, presence included, is released.
 
 Control requests name the stream with `stream_id` in the body, the `Sluice-Stream-Id` header, or both; if both are present and differ the request is rejected (`400 stream_id_mismatch`). The token must name the same `sub` and `role` as the stream (`403 forbidden`); stream ids are not secrets. A stream id from another process is `404 unknown_stream`.
 
@@ -563,7 +563,8 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_HEARTBEAT` | `20s` | at least 5 s |
 | `SLUICE_STREAM_QUEUE` | `256` | most events queued per stream |
 | `SLUICE_WRITE_TIMEOUT` | `10s` | per write |
-| `SLUICE_MAX_STREAMS` | `50000` | per process; size it to the memory limit (about 8 000 streams of five shapes and a channel fit in 512 MB, see [`apps/loadtest`](apps/loadtest/README.md)) |
+| `SLUICE_MAX_STREAMS` | `0` | a fixed cap on streams per process, besides the memory-based admission below; `0` sets none |
+| `SLUICE_ADMIT_MEMORY` | `0.85` | refuse new streams (`503 too_many_streams` with `Retry-After`) when the live heap, plus what the streams opened since the last collection are expected to hold, reaches this share of the Go memory limit (`GOMEMLIMIT`, which Sluice sets to 90% of the container's); admit again 5 points below it. `0` turns it off. With no memory limit known it does nothing, and the log warns if `SLUICE_MAX_STREAMS` is `0` too |
 | `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
 | `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |
 | `SLUICE_SUBSCRIBE_RATE` / `SLUICE_PUBLISH_RATE` | `20` / `100` | per second per stream |

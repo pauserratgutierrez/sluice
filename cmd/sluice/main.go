@@ -90,6 +90,7 @@ func run() error {
 	log := newLogger(cfg)
 	log.Info("starting", "version", version, "node_id", cfg.NodeID)
 	applyMemoryLimit(log)
+	logAdmission(log, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

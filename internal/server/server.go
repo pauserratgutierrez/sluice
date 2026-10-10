@@ -24,6 +24,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,9 @@ type Server struct {
 	// hookRecheck is held while a round of hook re-checks runs, so a slow
 	// endpoint cannot stack rounds up across ticks.
 	hookRecheck atomic.Bool
+
+	// admission refuses new streams when memory nears the Go memory limit.
+	admission *admission
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
@@ -131,6 +135,7 @@ func New(ctx context.Context, o Options) *Server {
 		wheel:           timer.New(o.Config.Heartbeat, 64),
 		snapSem:         make(chan struct{}, max(1, o.Config.SnapshotMaxConc)),
 		hooks:           newHookCache(o.Config.HookTTL, o.Config.HookTimeout, o.Config.HookBearer),
+		admission:       newAdmission(o.Config.AdmitMemory),
 		startupWarnings: o.StartupWarnings,
 	}
 	if o.Catalog != nil {
@@ -260,9 +265,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			"this node is shutting down; reconnect to another or retry shortly")
 		return
 	}
-	if s.hub.Count() >= s.cfg.MaxStreams {
+	n := s.hub.Count()
+	if s.cfg.MaxStreams > 0 && n >= s.cfg.MaxStreams {
+		metrics.StreamsRefused.WithLabelValues("max_streams").Inc()
 		s.refuse(w, r, http.StatusServiceUnavailable, "too_many_streams",
 			"this node is at its configured stream limit")
+		return
+	}
+	ok, share := s.admission.admit(n)
+	metrics.AdmissionMemoryShare.Set(share)
+	if !ok {
+		metrics.StreamsRefused.WithLabelValues("memory").Inc()
+		// Spread the retries of a refused storm over a few seconds.
+		w.Header().Set("Retry-After", strconv.Itoa(1+rand.IntN(5)))
+		s.refuse(w, r, http.StatusServiceUnavailable, "too_many_streams",
+			fmt.Sprintf("this node is near its memory limit (%.0f%% in use, refusing new streams from %.0f%%)", share*100, s.cfg.AdmitMemory*100))
 		return
 	}
 	if !s.checkSession(w, r, id) {

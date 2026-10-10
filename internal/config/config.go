@@ -103,6 +103,7 @@ type Config struct {
 	WriteTimeout       time.Duration
 	ReconnectSpread    time.Duration
 	MaxStreams         int
+	AdmitMemory        float64
 	MaxSubsPerStream   int
 	MaxShapesPerStream int
 	MaxPayloadBytes    int
@@ -208,7 +209,8 @@ func Load() (*Config, error) {
 		StreamQueue:        envInt("SLUICE_STREAM_QUEUE", 256),
 		WriteTimeout:       envDur("SLUICE_WRITE_TIMEOUT", 10*time.Second),
 		ReconnectSpread:    envDur("SLUICE_RECONNECT_SPREAD", 10*time.Second),
-		MaxStreams:         envInt("SLUICE_MAX_STREAMS", 50000),
+		MaxStreams:         envInt("SLUICE_MAX_STREAMS", 0),
+		AdmitMemory:        envFloat("SLUICE_ADMIT_MEMORY", 0.85),
 		MaxSubsPerStream:   envInt("SLUICE_MAX_SUBS_PER_STREAM", 100),
 		MaxShapesPerStream: envInt("SLUICE_MAX_SHAPES_PER_STREAM", 20),
 		MaxPayloadBytes:    envInt("SLUICE_MAX_PAYLOAD_BYTES", 256*1024),
@@ -292,6 +294,12 @@ func (c *Config) validate() error {
 	case "withhold", "deliver":
 	default:
 		return fmt.Errorf("SLUICE_DEGRADED_DELETES must be withhold or deliver")
+	}
+	if c.MaxStreams < 0 {
+		return fmt.Errorf("SLUICE_MAX_STREAMS must not be negative (0: no fixed cap)")
+	}
+	if c.AdmitMemory < 0 || c.AdmitMemory >= 1 {
+		return fmt.Errorf("SLUICE_ADMIT_MEMORY must be at least 0 and below 1 (0: off), got %v", c.AdmitMemory)
 	}
 	if c.RingEvents < 0 {
 		return fmt.Errorf("SLUICE_RING_EVENTS must not be negative")
@@ -443,6 +451,15 @@ func envInt(k string, def int) int {
 	if v, ok := os.LookupEnv(k); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envFloat(k string, def float64) float64 {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

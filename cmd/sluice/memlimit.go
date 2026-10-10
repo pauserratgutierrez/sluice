@@ -2,10 +2,13 @@ package main
 
 import (
 	"log/slog"
+	"math"
 	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
+
+	"github.com/pauserratgutierrez/sluice/internal/config"
 )
 
 // memoryLimitShare is the fraction of the container's memory limit given to the
@@ -57,4 +60,21 @@ func parseCgroupMemory(s string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// logAdmission says how new streams will be admitted: refused when memory
+// nears the Go memory limit (SLUICE_ADMIT_MEMORY), and at a fixed number of
+// streams when SLUICE_MAX_STREAMS is set.
+func logAdmission(log *slog.Logger, cfg *config.Config) {
+	limit := debug.SetMemoryLimit(-1)
+	switch {
+	case cfg.AdmitMemory > 0 && limit > 0 && limit != math.MaxInt64:
+		log.Info("stream admission", "refuse_from_memory_share", cfg.AdmitMemory,
+			"gomemlimit_bytes", limit, "max_streams", cfg.MaxStreams)
+	case cfg.MaxStreams > 0:
+		log.Info("stream admission", "max_streams", cfg.MaxStreams,
+			"memory", "no limit to measure against, or SLUICE_ADMIT_MEMORY=0")
+	default:
+		log.Warn("stream admission is unbounded: no memory limit is known and SLUICE_MAX_STREAMS is 0; set a container memory limit or GOMEMLIMIT, or SLUICE_MAX_STREAMS")
+	}
 }

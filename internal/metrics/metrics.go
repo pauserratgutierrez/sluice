@@ -17,6 +17,16 @@ var (
 		Help: "Log sequence number by kind (received, confirmed).",
 	}, []string{"kind"})
 
+	StreamsRefused = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_streams_refused_total",
+		Help: "New streams refused, by reason: max_streams (SLUICE_MAX_STREAMS) or memory (SLUICE_ADMIT_MEMORY).",
+	}, []string{"reason"})
+
+	AdmissionMemoryShare = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sluice_admission_memory_share",
+		Help: "Share of the Go memory limit the last stream admission projected in use (live heap plus streams opened since the last collection).",
+	})
+
 	WALLagBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_wal_lag_bytes",
 		Help: "Bytes between the received and confirmed LSN.",
