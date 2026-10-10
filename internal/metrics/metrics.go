@@ -6,6 +6,8 @@
 package metrics
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -16,6 +18,16 @@ var (
 		Name: "sluice_wal_lsn",
 		Help: "Log sequence number by kind (received, confirmed).",
 	}, []string{"kind"})
+
+	ReaderLagSeconds = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "sluice_reader_lag_seconds",
+		Help: "How long ago the transaction the reader is dispatching committed: how far behind the WAL Sluice is, in time. 0 between transactions.",
+	}, func() float64 {
+		if f := readerLag.Load(); f != nil {
+			return (*f)()
+		}
+		return 0
+	})
 
 	StreamsRefused = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_streams_refused_total",
@@ -200,3 +212,8 @@ var (
 		Help: "Active configuration warnings by code. Non-zero means /diagnostics has something to say.",
 	}, []string{"code"})
 )
+
+var readerLag atomic.Pointer[func() float64]
+
+// SetReaderLag sets where sluice_reader_lag_seconds reads the reader's lag.
+func SetReaderLag(f func() float64) { readerLag.Store(&f) }

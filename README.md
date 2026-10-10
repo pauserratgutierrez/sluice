@@ -405,7 +405,7 @@ Streams are also closed with `token_expired` at the first heartbeat after the to
 
 ## Operating it
 
-**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded, this process is streaming from the slot and it is not shutting down; its body reports `catalog_loaded`, `replicating`, `streams`, `confirmed_lsn`, and `draining` once shutdown has begun.
+**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded, this process is streaming from the slot and it is not shutting down; its body reports `catalog_loaded`, `replicating`, `streams`, `confirmed_lsn`, `reader_lag_seconds`, and `draining` once shutdown has begun. `reader_lag_seconds` is how long ago the transaction the reader is dispatching committed: how late every change is arriving, 0 when it has caught up (also `sluice_reader_lag_seconds`). Past `SLUICE_LAG_DEGRADED` the body adds `"degraded": "reader_lag"` and the status stays `200`; past `SLUICE_READY_MAX_LAG`, when set, it is `503`. A single-node deployment should leave that unset, so that it never takes itself out of its load balancer for being slow.
 
 **Shutdown.** On `SIGTERM` or `SIGINT` Sluice stops accepting connections, refuses new streams with `503 server_shutdown`, and ends every open stream with a `server_shutdown` error whose `retry_after_ms` is spread over `SLUICE_RECONNECT_SPREAD`, so clients come back over that window rather than all at once. Requests in flight get up to `SLUICE_SHUTDOWN_GRACE`, after which the process exits; without any it exits at once. Give the container a stop timeout above that grace.
 
@@ -565,7 +565,9 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_STREAM_QUEUE` | `256` | most events queued per stream |
 | `SLUICE_WRITE_TIMEOUT` | `10s` | per write |
 | `SLUICE_MAX_STREAMS` | `0` | a fixed cap on streams per process, besides the memory-based admission below; `0` sets none |
-| `SLUICE_ADMIT_MEMORY` | `0.85` | refuse new streams (`503 too_many_streams` with `Retry-After`) when the live heap, plus what the streams opened since the last collection are expected to hold, reaches this share of the Go memory limit (`GOMEMLIMIT`, which Sluice sets to 90% of the container's); admit again 5 points below it. `0` turns it off. With no memory limit known it does nothing, and the log warns if `SLUICE_MAX_STREAMS` is `0` too |
+| `SLUICE_ADMIT_MEMORY` | `0.5` | refuse new streams (`503 too_many_streams` with `Retry-After`) when the memory a collection cannot give back (the live heap, plus goroutine stacks and the rest of the runtime's memory: about 64 KiB per stream with seven shapes), plus what the streams opened since the last collection are expected to hold, reaches this share of the Go memory limit (`GOMEMLIMIT`, which Sluice sets to 90% of the container's); admit again 5 points below it. At `0.5` the heap can still double between collections; nearer `1` the collector runs almost without pause and every change waits behind it. `0` turns it off. With no memory limit known it does nothing, and the log warns if `SLUICE_MAX_STREAMS` is `0` too |
+| `SLUICE_LAG_DEGRADED` | `5s` | reader lag at which `/readyz` reports `"degraded": "reader_lag"` (still `200`) |
+| `SLUICE_READY_MAX_LAG` | unset | reader lag at which `/readyz` turns `503`; for deployments with more than one node behind the balancer |
 | `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
 | `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |
 | `SLUICE_SUBSCRIBE_RATE` / `SLUICE_PUBLISH_RATE` | `20` / `100` | per second per stream |

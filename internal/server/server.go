@@ -76,7 +76,8 @@ type Server struct {
 	hookRecheck atomic.Bool
 
 	// admission refuses new streams when memory nears the Go memory limit.
-	admission *admission
+	admission   *admission
+	capacityLog capacityLog
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
@@ -158,7 +159,10 @@ func (s *Server) Run(ctx context.Context) { s.wheel.Run(ctx) }
 
 // SetReader wires the reader after construction, because the reader needs the
 // server as its handler.
-func (s *Server) SetReader(r *reader.Reader) { s.reader = r }
+func (s *Server) SetReader(r *reader.Reader) {
+	s.reader = r
+	metrics.SetReaderLag(func() float64 { return r.Lag().Seconds() })
+}
 
 func (s *Server) Registry() *registry.Registry { return s.reg }
 
@@ -255,11 +259,9 @@ type subResult struct {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	id, err := s.identify(r)
-	if err != nil {
-		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
-		return
-	}
+	// Capacity is decided before the token is verified: a refused storm of
+	// reconnects should cost as little as possible, and a 503 says nothing
+	// about the caller.
 	if s.draining.Load() {
 		s.refuse(w, r, http.StatusServiceUnavailable, "server_shutdown",
 			"this node is shutting down; reconnect to another or retry shortly")
@@ -267,19 +269,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	n := s.hub.Count()
 	if s.cfg.MaxStreams > 0 && n >= s.cfg.MaxStreams {
-		metrics.StreamsRefused.WithLabelValues("max_streams").Inc()
-		s.refuse(w, r, http.StatusServiceUnavailable, "too_many_streams",
-			"this node is at its configured stream limit")
+		s.refuseCapacity(w, "max_streams", "this node is at its configured stream limit")
 		return
 	}
 	ok, share := s.admission.admit(n)
 	metrics.AdmissionMemoryShare.Set(share)
 	if !ok {
-		metrics.StreamsRefused.WithLabelValues("memory").Inc()
 		// Spread the retries of a refused storm over a few seconds.
 		w.Header().Set("Retry-After", strconv.Itoa(1+rand.IntN(5)))
-		s.refuse(w, r, http.StatusServiceUnavailable, "too_many_streams",
-			fmt.Sprintf("this node is near its memory limit (%.0f%% in use, refusing new streams from %.0f%%)", share*100, s.cfg.AdmitMemory*100))
+		s.refuseCapacity(w, "memory", fmt.Sprintf("this node is near its memory limit (%.0f%% in use, refusing new streams from %.0f%%)", share*100, s.cfg.AdmitMemory*100))
+		return
+	}
+	id, err := s.identify(r)
+	if err != nil {
+		s.refuse(w, r, http.StatusUnauthorized, "unauthorized", err.Error())
 		return
 	}
 	if !s.checkSession(w, r, id) {
@@ -1261,6 +1264,17 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.reader != nil {
 		body["confirmed_lsn"] = reader.FormatLSN(s.reader.ConfirmedLSN())
+		lag := s.reader.Lag()
+		body["reader_lag_seconds"] = lag.Seconds()
+		// Behind by more than SLUICE_LAG_DEGRADED: still serving, but every
+		// change arrives that late. Not ready only past SLUICE_READY_MAX_LAG,
+		// when set: a single node should not take itself out of its balancer.
+		if s.cfg.LagDegraded > 0 && lag >= s.cfg.LagDegraded {
+			body["degraded"] = "reader_lag"
+		}
+		if s.cfg.ReadyMaxLag > 0 && lag >= s.cfg.ReadyMaxLag {
+			code = http.StatusServiceUnavailable
+		}
 	}
 	writeJSON(w, code, body)
 }

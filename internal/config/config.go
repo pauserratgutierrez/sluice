@@ -104,6 +104,8 @@ type Config struct {
 	ReconnectSpread    time.Duration
 	MaxStreams         int
 	AdmitMemory        float64
+	LagDegraded        time.Duration
+	ReadyMaxLag        time.Duration
 	MaxSubsPerStream   int
 	MaxShapesPerStream int
 	MaxPayloadBytes    int
@@ -210,7 +212,9 @@ func Load() (*Config, error) {
 		WriteTimeout:       envDur("SLUICE_WRITE_TIMEOUT", 10*time.Second),
 		ReconnectSpread:    envDur("SLUICE_RECONNECT_SPREAD", 10*time.Second),
 		MaxStreams:         envInt("SLUICE_MAX_STREAMS", 0),
-		AdmitMemory:        envFloat("SLUICE_ADMIT_MEMORY", 0.85),
+		AdmitMemory:        envFloat("SLUICE_ADMIT_MEMORY", 0.5),
+		LagDegraded:        envDur("SLUICE_LAG_DEGRADED", 5*time.Second),
+		ReadyMaxLag:        envDur("SLUICE_READY_MAX_LAG", 0),
 		MaxSubsPerStream:   envInt("SLUICE_MAX_SUBS_PER_STREAM", 100),
 		MaxShapesPerStream: envInt("SLUICE_MAX_SHAPES_PER_STREAM", 20),
 		MaxPayloadBytes:    envInt("SLUICE_MAX_PAYLOAD_BYTES", 256*1024),

@@ -8,15 +8,16 @@ import (
 )
 
 // admission decides whether a new stream may open from the memory it would
-// leave in use: the live heap the last collection found, plus what the streams
-// opened since are expected to hold, against the Go memory limit
+// leave in use: the memory the last collection could not give back (the live
+// heap and the runtime's memory outside it, goroutine stacks above all), plus
+// what the streams opened since are expected to hold, against the Go memory limit
 // (GOMEMLIMIT, which Sluice sets from the container's limit). Past the
 // threshold it refuses until the projection falls admissionHysteresis below
 // it, so admission does not flap with every collection.
 //
-// The live heap only changes at a collection, and a reconnect storm opens
-// thousands of streams between two. Projecting them at the measured live heap
-// per stream is what keeps a storm from overshooting.
+// That floor only changes at a collection, and a reconnect storm opens
+// thousands of streams between two. Projecting them at the measured floor per
+// stream is what keeps a storm from overshooting.
 type admission struct {
 	threshold float64      // share of the memory limit; 0 turns admission off
 	limit     func() int64 // the Go memory limit, math.MaxInt64 when none
@@ -33,9 +34,9 @@ type admission struct {
 // before streams are admitted again.
 const admissionHysteresis = 0.05
 
-// defaultStreamBytes is the live heap a stream is assumed to hold until enough
-// streams are open to measure it. Measured: 44-49 KiB with seven shapes and a
-// channel; the assumption errs high.
+// defaultStreamBytes is the memory a stream is assumed to hold until enough
+// streams are open to measure it. Measured: 44-49 KiB of live heap with seven
+// shapes and a channel, plus two goroutine stacks; the assumption errs high.
 const (
 	defaultStreamBytes  = 128 << 10
 	minStreamsToMeasure = 100
@@ -49,16 +50,35 @@ func newAdmission(threshold float64) *admission {
 	}
 }
 
-func readLiveHeap() (live, gcs uint64) {
-	s := []metrics.Sample{{Name: "/gc/heap/live:bytes"}, {Name: "/gc/cycles/total:gc-cycles"}}
+// readLiveHeap returns the memory a collection cannot give back, as of the last
+// one: the live heap plus everything the runtime holds outside the heap
+// (goroutine stacks -- two per stream -- buffers, metadata). GOMEMLIMIT bounds
+// all of it, so this is the floor the limit is measured against; the live heap
+// alone left out the stacks of thousands of streams.
+func readLiveHeap() (floor, gcs uint64) {
+	s := []metrics.Sample{
+		{Name: "/gc/heap/live:bytes"},
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/memory/classes/heap/free:bytes"},
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/gc/cycles/total:gc-cycles"},
+	}
 	metrics.Read(s)
-	if s[0].Value.Kind() == metrics.KindUint64 {
-		live = s[0].Value.Uint64()
+	v := make([]uint64, len(s))
+	for i := range s {
+		if s[i].Value.Kind() == metrics.KindUint64 {
+			v[i] = s[i].Value.Uint64()
+		}
 	}
-	if s[1].Value.Kind() == metrics.KindUint64 {
-		gcs = s[1].Value.Uint64()
+	live, total, released, free, objects := v[0], v[1], v[2], v[3], v[4]
+	// total less what is free or returned to the OS, less the garbage among
+	// the heap's objects (objects minus live).
+	reclaimable := released + free + objects - min(live, objects)
+	if total > reclaimable {
+		floor = total - reclaimable
 	}
-	return live, gcs
+	return floor, v[5]
 }
 
 // enabled reports whether there is a limit to measure against.

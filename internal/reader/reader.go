@@ -66,6 +66,11 @@ type Reader struct {
 	confirmed atomic.Uint64
 	received  atomic.Uint64
 	streaming atomic.Bool
+	// dispatching is the commit time (Unix nanoseconds) of the transaction
+	// being dispatched, 0 between transactions. Every transaction not yet
+	// dispatched committed after it, so now minus it is how far behind the
+	// reader is.
+	dispatching atomic.Int64
 
 	// inTxn is true between Begin and Commit; currentCommit carries the
 	// enclosing transaction's LSN and timestamp down to per-row handlers.
@@ -84,6 +89,17 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, h Handler) *R
 // replay floor, which is what closes the subscribe race without gaps.
 func (r *Reader) ConfirmedLSN() uint64 { return r.confirmed.Load() }
 func (r *Reader) ReceivedLSN() uint64  { return r.received.Load() }
+
+// Lag is how long ago the transaction being dispatched committed: how far
+// behind the reader is, in time. 0 between transactions, when it has caught up
+// with what it received. A commit time ahead of this host's clock counts as 0.
+func (r *Reader) Lag() time.Duration {
+	t := r.dispatching.Load()
+	if t == 0 {
+		return 0
+	}
+	return max(0, time.Since(time.Unix(0, t)))
+}
 
 // Streaming reports whether the replication stream is currently running.
 func (r *Reader) Streaming() bool { return r.streaming.Load() }
@@ -337,6 +353,7 @@ func (r *Reader) stream(ctx context.Context) error {
 		return fmt.Errorf("reader: START_REPLICATION: %w", err)
 	}
 	r.inTxn = false
+	r.dispatching.Store(0)
 	r.streaming.Store(true)
 	r.h.OnStart(r.confirmed.Load())
 
@@ -445,6 +462,7 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 		r.inTxn = true
 		r.currentCommit = m.FinalLSN
 		r.currentCommitTime = m.CommitTime
+		r.dispatching.Store(m.CommitTime.UnixNano())
 		r.h.OnBegin(m.FinalLSN, m.CommitTime, m.XID)
 
 	case pgoutput.MsgCommit:
@@ -457,6 +475,7 @@ func (r *Reader) handle(xld pglogrepl.XLogData) error {
 		}
 		r.inTxn = false
 		r.currentCommit, r.currentCommitTime = 0, time.Time{}
+		r.dispatching.Store(0)
 
 	case pgoutput.MsgRelation, pgoutput.MsgType:
 		// Handled through the decoder's OnRelation callback.
