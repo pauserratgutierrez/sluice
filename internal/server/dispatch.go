@@ -56,6 +56,8 @@ func (r tupleRow) Column(name string) (expr.Value, bool) {
 
 // OnStart fixes the start of what the resume buffer can cover.
 func (s *Server) OnStart(lsn uint64) {
+	s.wakeQueued()
+	s.txnBegan = time.Time{}
 	if lsn != 0 {
 		s.hub.Rings().SetStart(lsn)
 	}
@@ -63,10 +65,16 @@ func (s *Server) OnStart(lsn uint64) {
 
 func (s *Server) OnBegin(lsn uint64, commitTime time.Time, xid uint32) {
 	metrics.WALMessages.WithLabelValues("begin").Inc()
+	s.txnBegan = time.Now()
 }
 
 func (s *Server) OnCommit(lsn uint64, commitTime time.Time) {
+	s.wakeQueued()
+	s.txnBegan = time.Time{}
 	metrics.WALMessages.WithLabelValues("commit").Inc()
+	if s.reader == nil {
+		return
+	}
 	metrics.WALLsn.WithLabelValues("confirmed").Set(float64(s.reader.ConfirmedLSN()))
 	metrics.WALLsn.WithLabelValues("received").Set(float64(s.reader.ReceivedLSN()))
 	if r, c := s.reader.ReceivedLSN(), s.reader.ConfirmedLSN(); r > c {
@@ -303,7 +311,37 @@ func (s *Server) sendChange(st *hub.Stream, ev event.Event, backfill bool) {
 		st.SendBackfill(s.ctx, ev)
 		return
 	}
+	// Inside a transaction, a stream's writer is woken at the commit, so that
+	// the events the transaction brings it go out in one write and one flush;
+	// once the transaction has been dispatching for txnWakeDelay, at once.
+	if !s.txnBegan.IsZero() {
+		if time.Since(s.txnBegan) < txnWakeDelay {
+			if st.SendDeferred(ev) && !s.woken[st] {
+				if s.woken == nil {
+					s.woken = map[*hub.Stream]bool{}
+				}
+				s.woken[st] = true
+				s.wakes = append(s.wakes, st)
+			}
+			return
+		}
+		s.wakeQueued()
+	}
 	st.Send(ev)
+}
+
+// txnWakeDelay bounds how long the events of a transaction wait for its
+// commit in a stream's queue.
+const txnWakeDelay = 5 * time.Millisecond
+
+// wakeQueued wakes the writers of the streams the current transaction queued
+// events for.
+func (s *Server) wakeQueued() {
+	for _, st := range s.wakes {
+		st.Wake()
+	}
+	s.wakes = s.wakes[:0]
+	clear(s.woken)
 }
 
 // tuplePair is one change as every subscriber sees it: the tuples the

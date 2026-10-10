@@ -79,6 +79,13 @@ type Server struct {
 	admission   *admission
 	capacityLog capacityLog
 
+	// Reader goroutine only: when the transaction being dispatched began, and
+	// the streams it queued events for without waking their writers, which
+	// its commit wakes (see sendChange).
+	txnBegan time.Time
+	wakes    []*hub.Stream
+	woken    map[*hub.Stream]bool
+
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
 	// draining is set once shutdown begins; see Drain.

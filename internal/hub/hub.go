@@ -99,6 +99,39 @@ func (s *Stream) Send(ev event.Event) bool {
 	return false
 }
 
+// SendDeferred enqueues an event like Send but does not wake the writer, so
+// that the events one transaction brings a stream go out in one write; the
+// caller calls Wake when the transaction is dispatched. It wakes the writer
+// itself once a quarter of the queue is full, so a long transaction cannot
+// fill it unread. Returns false when the event was dropped or the stream is
+// closed, like Send.
+func (s *Stream) SendDeferred(ev event.Event) bool {
+	queued, closed, n := s.pushQuiet(ev, s.limit)
+	if queued {
+		if n >= max(1, s.limit/4) {
+			s.Wake()
+		}
+		return true
+	}
+	if closed {
+		return false
+	}
+	s.Wake()
+	metrics.StreamDropped.WithLabelValues(string(ev.Kind)).Inc()
+	if ev.Kind == event.KindChange || ev.Kind == event.KindSnapshotEnd {
+		s.CloseWith("stream_lagging")
+	}
+	return false
+}
+
+// Wake tells the writer events are waiting.
+func (s *Stream) Wake() {
+	select {
+	case s.ready <- struct{}{}:
+	default:
+	}
+}
+
 // SendBackfill enqueues a snapshot row or a replayed change, waiting while the
 // queue is half full rather than closing the stream. Returns false when the
 // stream or ctx ended first.
@@ -118,25 +151,33 @@ func (s *Stream) SendBackfill(ctx context.Context, ev event.Event) bool {
 	}
 }
 
-// push appends ev while the queue holds fewer than capacity events.
+// push appends ev while the queue holds fewer than capacity events, and wakes
+// the writer.
 func (s *Stream) push(ev event.Event, capacity int) (queued, closed bool) {
+	queued, closed, _ = s.pushQuiet(ev, capacity)
+	if queued {
+		s.Wake()
+	}
+	return queued, closed
+}
+
+// pushQuiet appends ev while the queue holds fewer than capacity events, and
+// returns how many it holds then.
+func (s *Stream) pushQuiet(ev event.Event, capacity int) (queued, closed bool, n int) {
 	select {
 	case <-s.done:
-		return false, true
+		return false, true, 0
 	default:
 	}
 	s.qmu.Lock()
 	if len(s.queue) >= capacity {
 		s.qmu.Unlock()
-		return false, false
+		return false, false, 0
 	}
 	s.queue = append(s.queue, ev)
+	n = len(s.queue)
 	s.qmu.Unlock()
-	select {
-	case s.ready <- struct{}{}:
-	default:
-	}
-	return true, false
+	return true, false, n
 }
 
 // Ready is signalled when events are waiting to be taken.
