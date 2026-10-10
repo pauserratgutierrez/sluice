@@ -135,7 +135,7 @@ func New(ctx context.Context, o Options) *Server {
 		// every stream at once.
 		wheel:           timer.New(o.Config.Heartbeat, 64),
 		snapSem:         make(chan struct{}, max(1, o.Config.SnapshotMaxConc)),
-		hooks:           newHookCache(o.Config.HookTTL, o.Config.HookTimeout, o.Config.HookBearer),
+		hooks:           newHookCache(o.Config.HookTTL, o.Config.HookTimeout, o.Config.IssuerIdleTimeout, o.Config.HookBearer),
 		admission:       newAdmission(o.Config.AdmitMemory),
 		startupWarnings: o.StartupWarnings,
 	}

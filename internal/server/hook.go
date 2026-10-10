@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
+	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/requestid"
 )
 
@@ -91,7 +93,7 @@ type hookCache struct {
 // outage.
 const hookRetryTTL = 2 * time.Second
 
-func newHookCache(ttl, timeout time.Duration, bearer string) *hookCache {
+func newHookCache(ttl, timeout, idle time.Duration, bearer string) *hookCache {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
@@ -102,7 +104,7 @@ func newHookCache(ttl, timeout time.Duration, bearer string) *hookCache {
 		ttl:     ttl,
 		timeout: timeout,
 		bearer:  bearer,
-		client:  &http.Client{Timeout: timeout, CheckRedirect: noHookRedirect, Transport: hookTransport()},
+		client:  &http.Client{Timeout: timeout, CheckRedirect: noHookRedirect, Transport: hookTransport(idle)},
 		now:     time.Now,
 		m:       map[string]hookVerdict{},
 	}
@@ -124,10 +126,12 @@ func hookJitter(ttl time.Duration) time.Duration {
 
 // hookTransport keeps enough idle connections to a hook for the joins of a
 // reconnect wave and for a round of re-checks. The default transport keeps two
-// per host, so the rest of a burst each opened a connection and closed it.
-func hookTransport() *http.Transport {
+// per host, so the rest of a burst each opened a connection and closed it. Idle
+// ones close before the hook's own keep-alive timeout (oracle.DefaultIdleTimeout).
+func hookTransport(idle time.Duration) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxIdleConnsPerHost = 64
+	t.IdleConnTimeout = cmp.Or(idle, oracle.DefaultIdleTimeout)
 	return t
 }
 
@@ -338,6 +342,7 @@ func (h *hookCache) ask(ctx context.Context, ch config.Channel, id authz.Identit
 	if h.bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+h.bearer)
 	}
+	oracle.SetIdempotencyKey(req.Header)
 
 	resp, err := h.client.Do(req)
 	if err != nil {

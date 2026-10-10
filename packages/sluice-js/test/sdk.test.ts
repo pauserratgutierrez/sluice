@@ -457,6 +457,32 @@ test('a shutdown error sets the delay before the reconnect', async () => {
   client.close()
 })
 
+test('a stream refused with 503 and Retry-After waits that long before trying again', async () => {
+  const opened: number[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    onError: () => {},
+    fetch: async () => {
+      opened.push(Date.now())
+      if (opened.length === 1) {
+        return new Response('{"error":"too_many_streams","message":"near its memory limit"}', {
+          status: 503,
+          headers: { 'Retry-After': '1' },
+        })
+      }
+      return sse(openStream('event: ready\ndata: {"stream_id":"n1.x","subscriptions":[{"sub":"s1","ok":true}]}\n\n'))
+    },
+  })
+  const live = client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 1300))
+  await live
+  assert.equal(opened.length, 2)
+  assert.ok(opened[1]! - opened[0]! >= 990, `retried after ${opened[1]! - opened[0]!} ms, want the 1 s Retry-After asked for`)
+  client.close()
+})
+
 /** A ready event for one subscription. */
 const readyFor = (walLsn: string, result: Record<string, unknown>) =>
   'event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', wal_lsn: walLsn, subscriptions: [result] }) + '\n\n'

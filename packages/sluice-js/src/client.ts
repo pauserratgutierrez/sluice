@@ -394,6 +394,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
         code: (parsed.error as string) ?? `http_${res.status}`,
         message: (parsed.message as string) ?? res.statusText,
         retryable: res.status >= 500 || res.status === 429,
+        retry_after_ms: retryAfterMs(res),
       })
     }
     return parsed
@@ -451,6 +452,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
               message: text || res.statusText,
               // 401 means the token is wrong, not that the server is busy.
               retryable: res.status !== 401 && res.status !== 403,
+              retry_after_ms: retryAfterMs(res),
             })
           }
 
@@ -474,6 +476,9 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
             refused = true
             break
           }
+          // A server that refused for capacity (429, 503) says when to come back;
+          // coming back sooner only adds to the load it refused.
+          if (e.retryAfterMs !== undefined) this.retryAfter = e.retryAfterMs
           failed = true
         } finally {
           this.streamId = null
@@ -639,3 +644,18 @@ export function createClient<DB extends GenericDatabase = AnyDatabase>(
 }
 
 export type { ShapeSubscription }
+
+/**
+ * The delay a 429 or 503 asked for in `Retry-After` (seconds or an HTTP date),
+ * in milliseconds, at most a minute, with up to a tenth more at random so that
+ * clients told the same delay do not all return at once. Undefined otherwise.
+ */
+function retryAfterMs(res: Response): number | undefined {
+  if (res.status !== 429 && res.status !== 503) return undefined
+  const h = res.headers.get('Retry-After')
+  if (!h) return undefined
+  let ms = /^\d+$/.test(h.trim()) ? Number(h.trim()) * 1000 : Date.parse(h) - Date.now()
+  if (!Number.isFinite(ms)) return undefined
+  ms = Math.min(Math.max(ms, 0), 60_000)
+  return ms + Math.random() * ms * 0.1
+}

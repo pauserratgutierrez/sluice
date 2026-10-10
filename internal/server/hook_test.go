@@ -26,7 +26,7 @@ func TestHookSendsBearerOnlyWhenConfigured(t *testing.T) {
 			got = r.Header.Values("Authorization")
 			_, _ = w.Write([]byte(`{"allow":true}`))
 		}))
-		h := newHookCache(time.Minute, time.Second, bearer)
+		h := newHookCache(time.Minute, time.Second, 0, bearer)
 		if v := h.Authorize(context.Background(), hookChannel(srv.URL), hookCaller, "billing:1", false); !v.allowed() {
 			t.Fatalf("bearer=%q: denied: %s", bearer, v.reason)
 		}
@@ -54,7 +54,7 @@ func TestHookDoesNotFollowRedirects(t *testing.T) {
 			http.Redirect(w, r, "/allow", code)
 		})
 		srv := httptest.NewServer(mux)
-		h := newHookCache(time.Minute, time.Second, "hook-secret")
+		h := newHookCache(time.Minute, time.Second, 0, "hook-secret")
 		v := h.Authorize(context.Background(), hookChannel(srv.URL+"/authz"), hookCaller, "billing:1", false)
 		srv.Close()
 		if v.allowed() {
@@ -78,7 +78,7 @@ func TestHook401IsRetriedSoonAnd403IsCached(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(tc.status)
 		}))
-		h := newHookCache(time.Minute, time.Second, "hook-secret")
+		h := newHookCache(time.Minute, time.Second, 0, "hook-secret")
 		outcome, reason, ttl := h.ask(context.Background(), hookChannel(srv.URL), hookCaller, "billing:1")
 		srv.Close()
 		if outcome != tc.outcome {
@@ -97,7 +97,7 @@ func TestHookVerdictExpiryIsJitteredWithinTTL(t *testing.T) {
 		_, _ = w.Write([]byte(`{"allow":true}`))
 	}))
 	defer srv.Close()
-	h := newHookCache(time.Minute, time.Second, "")
+	h := newHookCache(time.Minute, time.Second, 0, "")
 	now := time.Now()
 	h.now = func() time.Time { return now }
 	seen := map[time.Time]bool{}

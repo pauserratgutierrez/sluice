@@ -74,7 +74,7 @@ func hookTestServer(t *testing.T, h *fakeHook) (*Server, *fakeClock) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
 	s.cfg.Channels = []config.Channel{{Namespace: "chat", Mode: config.ChannelHook, HookURL: h.srv.URL}}
 	clock := &fakeClock{t: time.Now()}
-	s.hooks = newHookCache(time.Minute, time.Second, "")
+	s.hooks = newHookCache(time.Minute, time.Second, 0, "")
 	s.hooks.now = clock.Now
 	return s, clock
 }

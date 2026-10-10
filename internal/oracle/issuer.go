@@ -2,7 +2,10 @@ package oracle
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,8 +43,11 @@ type IssuerOptions struct {
 	URL     string
 	Bearer  string
 	Timeout time.Duration
-	Client  *http.Client
-	Lookup  func(schema, name string) (*catalog.Relation, bool)
+	// IdleTimeout closes a pooled connection to the issuer that has been idle
+	// this long; 0 uses DefaultIdleTimeout.
+	IdleTimeout time.Duration
+	Client      *http.Client
+	Lookup      func(schema, name string) (*catalog.Relation, bool)
 	// Columns returns (allowed, denied, err) for the pool role's SELECT.
 	Columns func(ctx context.Context, rel *catalog.Relation, requested []string) ([]string, []string, error)
 }
@@ -63,11 +69,12 @@ func NewIssuer(cfg *config.Config, cat *catalog.Cache) (*Issuer, error) {
 		}
 	}
 	return NewIssuerWith(IssuerOptions{
-		URL:     cfg.IssuerURL,
-		Bearer:  cfg.IssuerBearer,
-		Timeout: timeout,
-		Lookup:  lookup,
-		Columns: cols,
+		URL:         cfg.IssuerURL,
+		Bearer:      cfg.IssuerBearer,
+		Timeout:     timeout,
+		IdleTimeout: cfg.IssuerIdleTimeout,
+		Lookup:      lookup,
+		Columns:     cols,
 	})
 }
 
@@ -84,7 +91,7 @@ func NewIssuerWith(o IssuerOptions) (*Issuer, error) {
 	}
 	var client *http.Client
 	if o.Client == nil {
-		client = &http.Client{Timeout: timeout, CheckRedirect: errNoIssuerRedirect, Transport: issuerTransport()}
+		client = &http.Client{Timeout: timeout, CheckRedirect: errNoIssuerRedirect, Transport: issuerTransport(o.IdleTimeout)}
 	} else {
 		c := *o.Client
 		c.CheckRedirect = errNoIssuerRedirect
@@ -102,10 +109,27 @@ func NewIssuerWith(o IssuerOptions) (*Issuer, error) {
 // issuerTransport keeps enough idle connections to the issuer for a reconnect
 // wave, where every stream resubscribes at once. The default transport keeps
 // two per host, so the rest of a burst each opened a connection and closed it.
-func issuerTransport() *http.Transport {
+// DefaultIdleTimeout is how long a connection to the issuer or a hook stays
+// pooled while idle. It must be shorter than the endpoint's own keep-alive
+// timeout (5 s in Node, 10 s in Bun), or Sluice may send a request on a
+// connection the endpoint is closing at that moment. Go's default is 90 s.
+const DefaultIdleTimeout = 4 * time.Second
+
+func issuerTransport(idle time.Duration) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxIdleConnsPerHost = 64
+	t.IdleConnTimeout = cmp.Or(idle, DefaultIdleTimeout)
 	return t
+}
+
+// SetIdempotencyKey marks a request to the issuer or a hook as safe to send
+// twice: both only answer a question. Go's transport then re-sends it on a new
+// connection when the pooled one it used turns out to have been closed by the
+// other end, instead of failing the call.
+func SetIdempotencyKey(h http.Header) {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	h.Set("Idempotency-Key", hex.EncodeToString(b[:]))
 }
 
 // errNoIssuerRedirect stops the client from following a 302 (or any redirect).
@@ -326,6 +350,7 @@ func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPRespons
 	requestid.From(ctx).Set(httpReq.Header)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+i.bearer)
+	SetIdempotencyKey(httpReq.Header)
 
 	resp, err := i.client.Do(httpReq)
 	if err != nil {

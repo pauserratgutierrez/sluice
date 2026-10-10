@@ -93,6 +93,9 @@ type Config struct {
 	IssuerURL     string
 	IssuerBearer  string
 	IssuerTimeout time.Duration
+	// IssuerIdleTimeout closes pooled connections to the issuer and to channel
+	// hooks that have been idle this long.
+	IssuerIdleTimeout time.Duration
 
 	SnapshotEnabled bool
 	SnapshotMaxConc int
@@ -183,15 +186,16 @@ func Load() (*Config, error) {
 		JWTSessionClaim: env("SLUICE_JWT_SESSION_CLAIM", "session_id"),
 		JWTRequireRole:  envBool("SLUICE_JWT_REQUIRE_ROLE", true),
 
-		AuthzLease:     envDur("SLUICE_AUTHZ_LEASE", 60*time.Second),
-		CatalogRefresh: envDur("SLUICE_CATALOG_REFRESH", 30*time.Second),
-		ShapeOracle:    strings.ToLower(env("SLUICE_SHAPE_ORACLE", "rls")),
-		IssuerURL:      env("SLUICE_ISSUER_URL", ""),
-		IssuerBearer:   env("SLUICE_ISSUER_BEARER", ""),
-		IssuerTimeout:  envDur("SLUICE_ISSUER_TIMEOUT", 2*time.Second),
-		TierC:          env("SLUICE_TIER_C", "allow"),
-		TierCMaxProbes: envInt("SLUICE_TIER_C_MAX_PROBES_PER_SECOND", 2000),
-		TierCTimeout:   envDur("SLUICE_TIER_C_TIMEOUT", time.Second),
+		AuthzLease:        envDur("SLUICE_AUTHZ_LEASE", 60*time.Second),
+		CatalogRefresh:    envDur("SLUICE_CATALOG_REFRESH", 30*time.Second),
+		ShapeOracle:       strings.ToLower(env("SLUICE_SHAPE_ORACLE", "rls")),
+		IssuerURL:         env("SLUICE_ISSUER_URL", ""),
+		IssuerBearer:      env("SLUICE_ISSUER_BEARER", ""),
+		IssuerTimeout:     envDur("SLUICE_ISSUER_TIMEOUT", 2*time.Second),
+		IssuerIdleTimeout: envDur("SLUICE_ISSUER_IDLE_TIMEOUT", 4*time.Second),
+		TierC:             env("SLUICE_TIER_C", "allow"),
+		TierCMaxProbes:    envInt("SLUICE_TIER_C_MAX_PROBES_PER_SECOND", 2000),
+		TierCTimeout:      envDur("SLUICE_TIER_C_TIMEOUT", time.Second),
 		// Tier B reimplements PostgreSQL's evaluation semantics in Go, so the
 		// first few decisions on each subscription are cross-checked against
 		// PostgreSQL evaluating the same predicate on the same tuple. A

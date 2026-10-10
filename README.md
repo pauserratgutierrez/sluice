@@ -550,6 +550,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_SHAPE_ORACLE` | `rls` | or `issuer` |
 | `SLUICE_ISSUER_URL` / `SLUICE_ISSUER_BEARER` | empty | required in issuer mode |
 | `SLUICE_ISSUER_TIMEOUT` | `2s` | |
+| `SLUICE_ISSUER_IDLE_TIMEOUT` | `4s` | how long a pooled connection to the shape issuer or a channel hook stays open while idle. Keep it below the endpoint's own keep-alive timeout (Node 5 s, Bun 10 s): a request sent on a connection the endpoint is closing would otherwise fail. Every call also carries an `Idempotency-Key`, so Go's client re-sends it on a new connection when that happens anyway |
 | `SLUICE_AUTHZ_LEASE` | `60s` | re-check of time-dependent and Tier C decisions |
 | `SLUICE_CATALOG_REFRESH` | `30s` | catalog, lease, JWKS and health tick |
 | `SLUICE_TIER_C` | `allow` | or `deny` |
