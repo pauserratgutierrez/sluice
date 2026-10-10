@@ -629,6 +629,15 @@ func roomsMarkdown(r RoomsReport) string {
 	}
 	fmt.Fprintf(&b, "\nArrival: %.1f s to open every stream (complete: %t); %.2f ms of Sluice CPU per open; %.1f KiB of live heap per stream after arrival.\n\n",
 		r.ArrivalSeconds, r.ArrivalComplete, r.Phases[0].CPUMsPerOpen, r.KiBPerStream)
+	var refused int64
+	for k, v := range r.Counters {
+		if strings.HasPrefix(k, "refused_capacity:") {
+			refused += v
+		}
+	}
+	if refused > 0 {
+		fmt.Fprintf(&b, "Opens refused for capacity: %d (`503 too_many_streams` with `Retry-After`: load shed as designed, not counted as failed opens).\n\n", refused)
+	}
 
 	fmt.Fprintf(&b, "## Latency (ms)\n\n| Phase | Kind | Count | p50 | p95 | p99 | max |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, p := range r.Phases {

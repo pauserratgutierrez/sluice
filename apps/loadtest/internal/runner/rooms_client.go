@@ -118,10 +118,11 @@ func (c *rclient) run(ctx context.Context) {
 		schedule := c.e.rc.Backoff
 		wait := schedule[min(c.attempt, len(schedule)-1)]
 		c.attempt++
-		delay := c.retryAfter
-		if delay < 0 {
-			// Full jitter.
-			delay = time.Duration(rand.Float64() * float64(wait))
+		// Full jitter, and as the SDK does, the longer of that and a delay the
+		// server asked for, so a refusal that lasts backs off too.
+		delay := time.Duration(rand.Float64() * float64(wait))
+		if c.retryAfter >= 0 {
+			delay = max(delay, c.retryAfter)
 		}
 		c.retryAfter = -1
 		select {
@@ -204,6 +205,8 @@ func (c *rclient) openOnce(ctx context.Context) {
 		// As the SDK does: a refusal for capacity says when to come back.
 		if d, ok := retryAfterHeader(resp); ok {
 			c.retryAfter = d
+		} else if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+			e.count("refused_without_retry_after")
 		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			// The SDK stops here; for the runner it is a broken setup.

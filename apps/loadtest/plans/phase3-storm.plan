@@ -1,0 +1,8 @@
+# Phase 3: a reconnect storm at the limit, required before 0.9.0. 1 CPU, 512 MB, default admission
+# (SLUICE_MAX_STREAMS=0, SLUICE_ADMIT_MEMORY=0.5), about 6 000 streams offered (the unicorn's mix halved), some
+# 3 000 more than fit; then a network cut through the proxy, all streams dropped at once. Criteria: no kill for
+# memory; refusals are clean 503s with Retry-After; after the cut every stream that fit is back within 30 s;
+# message p95 reasonable. Image: branch phase3 at 95f1ea3 (sluice:p3-final2).
+#
+#   scripts/queue.sh plans/phase3-storm.plan results/phase3/raw
+p3-storm-512m reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final2 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

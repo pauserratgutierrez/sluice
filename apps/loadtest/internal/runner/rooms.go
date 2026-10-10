@@ -85,6 +85,7 @@ type engine struct {
 	firstReady   atomic.Int64
 	openAttempts atomic.Int64
 	openFails    atomic.Int64
+	refusedCapacity atomic.Int64
 	messages     atomic.Int64
 	publishes    atomic.Int64
 
@@ -143,6 +144,17 @@ func (c *counters) snapshot() map[string]int64 {
 func (e *engine) count(k string)           { e.ctr.add(k) }
 func (e *engine) countN(k string, n int64) { e.ctr.addN(k, n) }
 func (e *engine) openFailed(code string) {
+	// A refusal for capacity (503 too_many_streams, or a 429) is Sluice
+	// shedding load as designed, with a Retry-After: counted apart, not as a
+	// failed open.
+	if strings.HasPrefix(code, "http_503:too_many_streams") || strings.HasPrefix(code, "http_429") {
+		e.refusedCapacity.Add(1)
+		e.count("refused_capacity:" + code)
+		if w := e.wave.Load(); w != nil {
+			w.counters.add("refused_capacity:" + code)
+		}
+		return
+	}
 	e.openFails.Add(1)
 	e.count("open_failed:" + code)
 	if w := e.wave.Load(); w != nil {
