@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"weak"
@@ -104,7 +105,7 @@ func ParseOps(list []string) (Ops, error) {
 // The table holds them weakly; a filter nothing uses any more is collected and
 // its entry removed.
 func Parse(raw string, rel *catalog.Relation) (*Filter, error) {
-	k := internKey{rel: rel, raw: raw}
+	k := internKey{rel: relKey(rel), raw: raw}
 	if v, ok := interned.Load(k); ok {
 		if f := v.(weak.Pointer[Filter]).Value(); f != nil {
 			return f, nil
@@ -125,11 +126,34 @@ func Parse(raw string, rel *catalog.Relation) (*Filter, error) {
 	return f, nil
 }
 
-// internKey is a filter's text on one catalog relation: a relation reloaded
-// after DDL is a new pointer, so its filters are parsed again.
+// internKey is a filter's text on one relation definition. The catalog builds
+// new Relation objects at every refresh, so the key is what parsing depends
+// on rather than the pointer: the relation's OID and its columns' names and
+// types. A column added, dropped or retyped gives a new key, and the filter is
+// parsed again.
 type internKey struct {
-	rel *catalog.Relation
+	rel string
 	raw string
+}
+
+func relKey(rel *catalog.Relation) string {
+	if rel == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(strconv.FormatUint(uint64(rel.OID), 10))
+	for _, c := range rel.Columns {
+		b.WriteByte('|')
+		b.WriteString(c.Name)
+		b.WriteByte(':')
+		b.WriteString(c.TypeName)
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatUint(uint64(c.TypeOID), 10))
+		if c.NotNull {
+			b.WriteString(":nn")
+		}
+	}
+	return b.String()
 }
 
 var interned sync.Map // internKey -> weak.Pointer[Filter]

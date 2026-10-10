@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
+	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/hold"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
@@ -19,22 +21,25 @@ import (
 type freshGrantOracle struct {
 	stubOracle
 	project map[string]int // sub -> project
+	// The relations, as the catalog holds them: the same objects from one
+	// grant to the next.
+	docs, members *catalog.Relation
 }
 
 func (o *freshGrantOracle) Refresh(_ context.Context, req oracle.Request) (*oracle.Grant, error) {
 	p := o.project[req.Identity.Sub]
-	f, err := shape.Parse(fmt.Sprintf("project_id=eq.%d", p), docsRel())
+	f, err := shape.Parse(fmt.Sprintf("project_id=eq.%d", p), o.docs)
 	if err != nil {
 		return nil, err
 	}
-	h, err := shape.Parse(fmt.Sprintf("user_id=eq.%s,project_id=eq.%d", req.Identity.Sub, p), membersRel())
+	h, err := shape.Parse(fmt.Sprintf("user_id=eq.%s,project_id=eq.%d", req.Identity.Sub, p), o.members)
 	if err != nil {
 		return nil, err
 	}
 	return &oracle.Grant{
 		Filter:  f,
 		Columns: []string{"id", "project_id", "title"},
-		Holds:   []hold.Spec{{Rel: membersRel(), Filter: h}},
+		Holds:   []hold.Spec{{Rel: o.members, Filter: h}},
 	}, nil
 }
 
@@ -46,7 +51,8 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 		t.Skip("renews tens of thousands of shapes")
 	}
 	const streams, shapes, rounds = 300, 7, 30
-	orc := &freshGrantOracle{stubOracle: stubOracle{name: oracle.NameIssuer}, project: map[string]int{}}
+	orc := &freshGrantOracle{stubOracle: stubOracle{name: oracle.NameIssuer}, project: map[string]int{},
+		docs: docsRel(), members: membersRel()}
 	s := testServer(t, orc)
 	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
 
@@ -60,9 +66,9 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 			g, _ := orc.Refresh(context.Background(), oracle.Request{Identity: st.Identity()})
 			label := fmt.Sprintf("s%d", j)
 			if !s.reg.Add(&registry.Subscription{
-				Label: label, Sink: st, Relation: docsRel(), Filter: g.Filter, Columns: g.Columns,
+				Label: label, Sink: st, Relation: orc.docs, Filter: g.Filter, Columns: g.Columns,
 				Decision:   authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}),
-				RoutingKey: g.Filter.RoutingKey(docsRel()),
+				RoutingKey: g.Filter.RoutingKey(orc.docs),
 			}) || !s.holds.Add(st.StreamID(), label, g.Holds) {
 				t.Fatal("add")
 			}
@@ -78,7 +84,9 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 		}
 	}
 	measure := func() (uint64, hold.Size, registry.IndexSize) {
+		// Cleanups (the shared-filter table's) run after a collection.
 		runtime.GC()
+		time.Sleep(50 * time.Millisecond)
 		runtime.GC()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)

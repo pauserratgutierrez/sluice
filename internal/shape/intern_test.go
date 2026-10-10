@@ -18,7 +18,20 @@ func TestParseSharesIdenticalFilters(t *testing.T) {
 	if a != b {
 		t.Fatal("the same filter on the same relation must be shared")
 	}
-	if c, _ := Parse("title=eq.interned", rel()); c == a {
+	// The catalog builds new Relation objects at every refresh: the same
+	// definition shares.
+	if c, _ := Parse("title=eq.interned", rel()); c != a {
+		t.Fatal("a reloaded relation with the same definition must share the filter")
+	}
+	// A column retyped (DDL) or another relation does not.
+	retyped := rel()
+	retyped.Columns[2].TypeName = "varchar"
+	if c, _ := Parse("title=eq.interned", retyped); c == a {
+		t.Fatal("a relation whose columns changed must get its own filter")
+	}
+	other := rel()
+	other.OID = 99
+	if c, _ := Parse("title=eq.interned", other); c == a {
 		t.Fatal("another relation must get its own filter")
 	}
 }
@@ -31,7 +44,7 @@ func TestParseForgetsFiltersNothingUses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k := internKey{rel: r, raw: "title=eq.forgotten"}
+	k := internKey{rel: relKey(r), raw: "title=eq.forgotten"}
 	if _, ok := interned.Load(k); !ok {
 		t.Fatal("the filter was not recorded")
 	}
