@@ -9,8 +9,11 @@ package shape
 
 import (
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"weak"
 
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
@@ -95,7 +98,43 @@ func ParseOps(list []string) (Ops, error) {
 // Type-checking against pg_attribute here is what stops a malformed value from
 // ever reaching the database, and means the compiled comparison uses the right
 // coercion. The value is never interpolated into SQL.
+// Parse returns the filter for raw on rel. Filters are never changed once parsed,
+// so one with the same text on the same relation is shared: every member of a
+// room subscribes with the same filter, and a stream's holds often repeat one.
+// The table holds them weakly; a filter nothing uses any more is collected and
+// its entry removed.
 func Parse(raw string, rel *catalog.Relation) (*Filter, error) {
+	k := internKey{rel: rel, raw: raw}
+	if v, ok := interned.Load(k); ok {
+		if f := v.(weak.Pointer[Filter]).Value(); f != nil {
+			return f, nil
+		}
+	}
+	f, err := parse(raw, rel)
+	if err != nil {
+		return nil, err
+	}
+	wp := weak.Make(f)
+	if prev, loaded := interned.LoadOrStore(k, wp); loaded {
+		if g := prev.(weak.Pointer[Filter]).Value(); g != nil {
+			return g, nil
+		}
+		interned.Store(k, wp)
+	}
+	runtime.AddCleanup(f, func(k internKey) { interned.CompareAndDelete(k, wp) }, k)
+	return f, nil
+}
+
+// internKey is a filter's text on one catalog relation: a relation reloaded
+// after DDL is a new pointer, so its filters are parsed again.
+type internKey struct {
+	rel *catalog.Relation
+	raw string
+}
+
+var interned sync.Map // internKey -> weak.Pointer[Filter]
+
+func parse(raw string, rel *catalog.Relation) (*Filter, error) {
 	f := &Filter{Raw: raw, Equalities: map[string]expr.Value{}}
 	if strings.TrimSpace(raw) == "" {
 		f.Node = expr.TrueNode
