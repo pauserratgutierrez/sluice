@@ -18,7 +18,8 @@ import (
 // what the streams opened since are expected to hold, against the Go memory limit
 // (GOMEMLIMIT, which Sluice sets from the container's limit). Past the
 // threshold it refuses until the projection falls admissionHysteresis below
-// it, so admission does not flap with every collection.
+// it, or has stayed below the threshold for admissionHold, so admission
+// neither flaps with every collection nor stays shut after a brief peak.
 //
 // That floor only changes at a collection, and a reconnect storm opens
 // thousands of streams between two. Projecting them at the measured floor per
@@ -33,6 +34,7 @@ type admission struct {
 	liveAtGC    uint64
 	streamsAtGC int
 	refusing    bool
+	overAt      time.Time // the last projection at or above the threshold
 
 	now      func() time.Time
 	collect  func()
@@ -40,8 +42,16 @@ type admission struct {
 }
 
 // admissionHysteresis is how far below the threshold the projection must fall
-// before streams are admitted again.
+// before streams are admitted again at once.
 const admissionHysteresis = 0.05
+
+// admissionHold is how long the projection must stay below the threshold,
+// within the hysteresis, before streams are admitted again. A reconnect
+// storm's replays and garbage can lift the floor past the threshold for a few
+// collections and stop admission short of what fits. Measured: the floor then
+// settled between the threshold and the hysteresis, and without this
+// admission stayed shut at 4,853 of the 5,610 streams that had fit.
+const admissionHold = 10 * time.Second
 
 // minFloorShare is the least of the measured floor a projection keeps after
 // streams close: some of it is the process, not the streams.
@@ -102,7 +112,6 @@ func readLiveHeap() (floor, gcs uint64) {
 	return floor, gcs
 }
 
-
 // enabled reports whether there is a limit to measure against.
 func (a *admission) enabled() bool {
 	if a == nil || a.threshold <= 0 {
@@ -143,16 +152,17 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 	projected := float64(a.liveAtGC) + float64(streams-a.streamsAtGC)*perStream
 	projected = max(projected, minFloorShare*float64(a.liveAtGC))
 	share := projected / float64(limit)
+	now := a.now()
 	switch {
-	case a.refusing && share <= a.threshold-admissionHysteresis:
+	case share >= a.threshold:
+		a.refusing, a.overAt = true, now
+	case a.refusing && (share <= a.threshold-admissionHysteresis || now.Sub(a.overAt) >= admissionHold):
 		a.refusing = false
-	case !a.refusing && share >= a.threshold:
-		a.refusing = true
 	}
 	// Refusing with far fewer streams than the last collection saw: the floor
 	// is stale. Ask for a collection, at most one every staleGCInterval.
 	if a.refusing && streams < a.streamsAtGC*9/10 {
-		if now := a.now(); now.Sub(a.forcedGC) >= staleGCInterval {
+		if now.Sub(a.forcedGC) >= staleGCInterval {
 			a.forcedGC = now
 			go a.collect()
 		}

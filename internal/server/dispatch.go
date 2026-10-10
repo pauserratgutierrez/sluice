@@ -284,28 +284,36 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 		s.applyHoldCuts(s.holds.OnChange(rel.OID, m.Type, oldR, newR))
 	}
 
+	// Buffer for reconnect replay regardless of who is currently listening.
+	// Before routing: a subscription installed in between is then either
+	// routed this change or finds it in the buffer when it replays.
+	seq := s.hub.Rings().Append(hub.RingEntry{
+		LSN: commitLSN, CommitTime: commitTime, Op: m.Type,
+		Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
+	})
+
 	// Route on both tuples. Routing only on the new one would miss a row that
 	// left a shape (supabase/walrus#64).
 	candidates := s.reg.Candidates(rel.OID, newRow.Column, oldRow.Column)
 	metrics.RoutingCandidates.WithLabelValues(rel.Namespace, rel.Name).Observe(float64(len(candidates)))
-
-	// Buffer for reconnect replay regardless of who is currently listening.
-	s.hub.Rings().Append(hub.RingEntry{
-		LSN: commitLSN, CommitTime: commitTime, Op: m.Type,
-		Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
-	})
 
 	// Built once per change and shared by every subscriber: the encodings it
 	// memoises are only computed if some subscription actually needs them.
 	tuples := s.newTuples(rel, m)
 
 	for _, sub := range candidates {
-		if !opWanted(sub.Ops, m.Type) && !(sub.Transitions && m.Type == pgoutput.MsgUpdate) {
+		if !wants(sub, m.Type) || !sub.Backfill.Deliver(seq) {
 			continue
 		}
 		s.deliver(sub, m, rel, newRow, oldRow, tuples, commitLSN, commitTime, op, false)
 	}
 	return nil
+}
+
+// wants reports whether a subscription takes changes of this kind: its ops,
+// and updates that may enter or leave it when it asked for transitions.
+func wants(sub *registry.Subscription, typ byte) bool {
+	return opWanted(sub.Ops, typ) || (sub.Transitions && typ == pgoutput.MsgUpdate)
 }
 
 // sendChange queues a change. A live change never waits: the reader serves

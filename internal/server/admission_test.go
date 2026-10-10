@@ -159,6 +159,35 @@ func TestAdmissionAfterAMassDisconnect(t *testing.T) {
 	}
 }
 
+// A reconnect storm's peak stops admission short of what fits, and the floor
+// then settles between the threshold and the hysteresis. Admission opens again
+// once the projection has stayed below the threshold for admissionHold; a
+// projection back at the threshold starts the wait over.
+func TestAdmissionResumesAfterAPeakSettlesWithinTheHysteresis(t *testing.T) {
+	m := &fakeMemory{limit: 1000 * mib, now: time.Unix(1000, 0)}
+	a := m.admission(0.5)
+	m.collect(520 * mib) // the storm's peak, at 4,800 streams
+	if ok, _ := a.admit(4800, 0); ok {
+		t.Fatal("at the peak a new stream must be refused")
+	}
+	m.collect(470 * mib) // settled: 0.47, inside the hysteresis
+	m.now = m.now.Add(admissionHold - time.Second)
+	if ok, _ := a.admit(4800, 0); ok {
+		t.Fatal("within admissionHold of the peak, streams must still be refused")
+	}
+	m.now = m.now.Add(time.Second)
+	if ok, share := a.admit(4800, 0); !ok {
+		t.Fatalf("below the threshold for admissionHold (share %.2f), streams must be admitted again", share)
+	}
+	if ok, _ := a.admit(5200, 0); ok { // projects to 0.509
+		t.Fatal("back at the threshold, streams must be refused")
+	}
+	m.now = m.now.Add(admissionHold / 2)
+	if ok, _ := a.admit(5000, 0); ok { // 0.49, but the threshold was reached since
+		t.Fatal("reaching the threshold again must start the wait over")
+	}
+}
+
 // Refusing with far fewer streams than the last collection saw asks for a
 // collection, at most one every staleGCInterval.
 func TestAdmissionForcesACollectionWhenItsFloorIsStale(t *testing.T) {

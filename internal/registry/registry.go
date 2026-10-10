@@ -58,6 +58,50 @@ type Subscription struct {
 	// seq numbers the subscription's change events. It is shared by every copy
 	// Rebind makes, and advanced by the reader, snapshots and replays alike.
 	seq *atomic.Int64
+
+	// Backfill is set while a resume replays the buffer to the subscription,
+	// and shared by every copy Rebind makes. Nil for every other.
+	Backfill *Backfill
+}
+
+// Backfill keeps the reader's changes from a subscription while a resume
+// replays the buffer to it. The replay delivers those changes too, from the
+// buffer, so they reach the stream after the ones replayed before them, in
+// commit order, and none is missed or repeated out of order.
+type Backfill struct {
+	mu      sync.Mutex
+	live    bool
+	through uint64 // the last change the replay accounted for, in append order
+	done    atomic.Bool
+}
+
+// Deliver reports whether the reader delivers the change it appended to the
+// buffer at seq: not while the replay runs, nor one the replay accounted for.
+func (b *Backfill) Deliver(seq uint64) bool {
+	if b == nil || b.done.Load() {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.live || seq <= b.through {
+		return false
+	}
+	b.done.Store(true) // later changes come after through: no need to look again
+	return true
+}
+
+// CatchUp runs next under the lock Deliver takes, so that no change can be
+// appended and passed over between next's look at the buffer and the reader
+// taking over. next returns the append order it accounted for and whether it
+// found nothing left to replay; then the reader delivers what follows.
+func (b *Backfill) CatchUp(next func() (through uint64, caughtUp bool)) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	through, caughtUp := next()
+	if caughtUp {
+		b.live, b.through = true, through
+	}
+	return caughtUp
 }
 
 // Requested is a client's subscribe request for a shape.

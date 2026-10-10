@@ -924,6 +924,19 @@ func (s *Server) subscribeShape(
 		})
 	}
 
+	// A resume the buffer covers keeps the reader's changes from the
+	// subscription until its replay has caught up (see registry.Backfill).
+	// Decided before the install, so that none goes out ahead of the replay.
+	lsnStr := resume[rel.FullName()]
+	var from uint64
+	var fromErr error
+	if lsnStr != "" {
+		if from, fromErr = reader.ParseLSN(lsnStr); fromErr == nil && s.hub.Rings().Covers(rel.OID, from) {
+			sub.Backfill = &registry.Backfill{}
+		}
+	}
+	installedAt := s.hub.Rings().Seq()
+
 	if err := s.installShape(ctx, sub, grant.Holds); err != nil {
 		if errors.Is(err, errDuplicateSub) {
 			res.Error = &event.Error{Code: "duplicate_sub",
@@ -961,27 +974,61 @@ func (s *Server) subscribeShape(
 	// the position is decided here, so the result tells the client; one it
 	// cannot cover is not silently replaced by a snapshot, because only the
 	// client knows to discard the state it holds.
-	if lsnStr := resume[rel.FullName()]; lsnStr != "" {
-		from, err := reader.ParseLSN(lsnStr)
-		if err != nil {
+	if lsnStr != "" {
+		if fromErr != nil {
 			hub.SendError(st, event.Error{Sub: sub.Label, Code: "invalid_resume",
 				Message: "resume LSN could not be parsed"})
 			return res
 		}
-		entries, ok := s.hub.Rings().Replay(rel.OID, from)
-		res.Resumed = &ok
-		if len(entries) > 0 {
-			// Off the request: a replay waits for the writer to make room, and
-			// on a stream being opened the writer only starts after the ready
-			// event.
-			go s.replay(sub, entries)
+		if sub.Backfill == nil {
+			res.Resumed = new(false)
+			return res
 		}
+		entries, through, ok := s.hub.Rings().ReplayThrough(rel.OID, from)
+		res.Resumed = &ok
+		if !ok {
+			// Removed since Covers looked. The client reads its state again;
+			// it still gets what the reader kept from it since the install.
+			entries, through = nil, installedAt
+		}
+		// Off the request: a replay waits for the writer to make room, and
+		// on a stream being opened the writer only starts after the ready
+		// event.
+		go s.catchUp(sub, entries, through)
 		return res
 	}
 	if wantSnapshot {
 		go s.snapshot(s.ctx, sub)
 	}
 	return res
+}
+
+// catchUp replays a resumed subscription's entries, then what the buffer took
+// since, until nothing is left; from then on the reader delivers to it (see
+// registry.Backfill). A buffer that dropped changes it still had to replay
+// closes the stream as stream_lagging, as a full queue does, and the client
+// resumes.
+func (s *Server) catchUp(sub *registry.Subscription, entries []hub.RingEntry, through uint64) {
+	for {
+		if !s.replay(sub, entries) {
+			return
+		}
+		var ok bool
+		next := through
+		if sub.Backfill.CatchUp(func() (uint64, bool) {
+			entries, next, ok = s.hub.Rings().Since(sub.Relation.OID, through)
+			return next, ok && len(entries) == 0
+		}) {
+			return
+		}
+		if !ok {
+			if st := streamOf(sub); st != nil {
+				st.CloseWith("stream_lagging")
+			}
+			return
+		}
+		through = next
+	}
 }
 
 func errResumeTooOld(label string) event.Error {
@@ -1001,14 +1048,21 @@ func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
 }
 
 // replay re-delivers buffered changes, re-filtered and re-authorized: replay is
-// never trusted to have been authorized on its first pass.
-func (s *Server) replay(sub *registry.Subscription, entries []hub.RingEntry) {
+// never trusted to have been authorized on its first pass. It returns false
+// once the subscription is gone.
+func (s *Server) replay(sub *registry.Subscription, entries []hub.RingEntry) bool {
+	if s.reg.Get(sub.Sink.StreamID(), sub.Label) == nil {
+		return false
+	}
 	for _, e := range entries {
 		// A replay can outlast the subscription, or a /token can rebind it to a
 		// new filter and columns while it runs; follow what is registered now.
 		cur := s.reg.Get(sub.Sink.StreamID(), sub.Label)
 		if cur == nil {
-			return
+			return false
+		}
+		if !wants(cur, e.Op) {
+			continue
 		}
 		m := messageFromRing(e)
 		s.deliver(cur, m, e.Relation,
@@ -1016,6 +1070,7 @@ func (s *Server) replay(sub *registry.Subscription, entries []hub.RingEntry) {
 			s.newTuples(e.Relation, m),
 			e.LSN, e.CommitTime, opName(e.Op), true)
 	}
+	return true
 }
 
 func (s *Server) subscribeChannel(ctx context.Context, st *hub.Stream, id authz.Identity, spec subSpec) subResult {

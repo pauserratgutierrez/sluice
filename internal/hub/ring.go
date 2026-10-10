@@ -81,8 +81,10 @@ type ring struct {
 	buf  []RingEntry
 	head int
 	size int
-	// evicted is the highest commit LSN removed from this ring.
-	evicted uint64
+	// evicted is the highest commit LSN removed from this ring, and
+	// evictedSeq the append order of the last entry removed.
+	evicted    uint64
+	evictedSeq uint64
 }
 
 func (rg *ring) at(i int) *RingEntry { return &rg.buf[(rg.head+i)%len(rg.buf)] }
@@ -93,6 +95,7 @@ func (rg *ring) dropOldest() int {
 	if e.LSN > rg.evicted {
 		rg.evicted = e.LSN
 	}
+	rg.evictedSeq = e.seq
 	freed := e.size
 	*e = RingEntry{}
 	rg.head = (rg.head + 1) % len(rg.buf)
@@ -128,10 +131,21 @@ func (r *Rings) SetStart(lsn uint64) {
 	r.mu.Unlock()
 }
 
-// Append records a change.
-func (r *Rings) Append(e RingEntry) {
+// Enabled reports whether the buffer keeps anything.
+func (r *Rings) Enabled() bool { return r.capacity > 0 }
+
+// Seq returns the append order the buffer has reached.
+func (r *Rings) Seq() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.seq
+}
+
+// Append records a change and returns its place in the append order, 0 when
+// the buffer is disabled.
+func (r *Rings) Append(e RingEntry) uint64 {
 	if r.capacity == 0 {
-		return
+		return 0
 	}
 	e.At = time.Now()
 	e.size = entryOverhead + tupleSize(e.New) + tupleSize(e.Old)
@@ -156,6 +170,7 @@ func (r *Rings) Append(e RingEntry) {
 	for r.bytes > r.maxBytes {
 		r.dropOldestOverall()
 	}
+	return e.seq
 }
 
 // dropOldestOverall removes the entry appended longest ago, whichever relation
@@ -208,22 +223,63 @@ func (r *Rings) Sweep() {
 // disabled, `from` predates the start of replication, or an entry with a commit
 // LSN >= from was removed.
 func (r *Rings) Replay(oid uint32, from uint64) (entries []RingEntry, ok bool) {
+	entries, _, ok = r.ReplayThrough(oid, from)
+	return entries, ok
+}
+
+// ReplayThrough is Replay that also returns the append order the buffer had
+// reached: every change appended up to it is accounted for, and Since takes
+// over from there.
+func (r *Rings) ReplayThrough(oid uint32, from uint64) (entries []RingEntry, through uint64, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.start == 0 || from < r.start {
-		return nil, false
+	if !r.coversLocked(oid, from) {
+		return nil, r.seq, false
 	}
-	rg := r.rings[oid]
-	if rg == nil {
-		return nil, true
-	}
-	if rg.evicted >= from {
-		return nil, false
-	}
-	for i := 0; i < rg.size; i++ {
-		if e := rg.at(i); e.LSN >= from {
-			entries = append(entries, *e)
+	if rg := r.rings[oid]; rg != nil {
+		for i := 0; i < rg.size; i++ {
+			if e := rg.at(i); e.LSN >= from {
+				entries = append(entries, *e)
+			}
 		}
 	}
-	return entries, true
+	return entries, r.seq, true
+}
+
+// Covers reports whether Replay from `from` would return every change.
+func (r *Rings) Covers(oid uint32, from uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.coversLocked(oid, from)
+}
+
+func (r *Rings) coversLocked(oid uint32, from uint64) bool {
+	if r.start == 0 || from < r.start {
+		return false
+	}
+	rg := r.rings[oid]
+	return rg == nil || rg.evicted < from
+}
+
+// Since returns a relation's changes appended after `after`, in append order,
+// and the append order the buffer has reached. ok is false when one of them
+// was already removed.
+func (r *Rings) Since(oid uint32, after uint64) (entries []RingEntry, through uint64, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rg := r.rings[oid]
+	if rg == nil {
+		return nil, r.seq, true
+	}
+	if rg.evictedSeq > after {
+		return nil, r.seq, false
+	}
+	first := rg.size
+	for first > 0 && rg.at(first-1).seq > after {
+		first--
+	}
+	for i := first; i < rg.size; i++ {
+		entries = append(entries, *rg.at(i))
+	}
+	return entries, r.seq, true
 }

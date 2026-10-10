@@ -9,7 +9,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 ### Changed
 
 - **`SLUICE_MAX_STREAMS=0` changes meaning, and is the new default.** It used to refuse every stream, since no stream count is below 0. It now means no fixed cap. The default was `50000`.
-  - New streams are admitted by memory instead. Once the memory a collection cannot give back, plus what the streams opened since the last collection are expected to hold, reaches `SLUICE_ADMIT_MEMORY` (new; default `0.5`) of the Go memory limit, new streams are refused with `503 too_many_streams` and a `Retry-After` of 1 to 5 seconds. That memory is the live heap, the stack space goroutines are using and the runtime's own structures; free and fragmented heap, which later allocations reuse, is left out. Streams are admitted again 5 points below the threshold.
+  - New streams are admitted by memory instead. Once the memory a collection cannot give back, plus what the streams opened since the last collection are expected to hold, reaches `SLUICE_ADMIT_MEMORY` (new; default `0.5`) of the Go memory limit, new streams are refused with `503 too_many_streams` and a `Retry-After` of 1 to 5 seconds. That memory is the live heap, the stack space goroutines are using and the runtime's own structures; free and fragmented heap, which later allocations reuse, is left out. Streams are admitted again 5 points below the threshold, or once the projection has stayed below it for 10 s: a reconnect storm's replays and garbage can lift that memory past the threshold for a few collections, and it can then settle just above the 5 points.
   - Opens in progress count too: each holds a reservation until the hub counts it, so the simultaneous opens of a reconnect storm cannot all pass on the same number of streams.
   - Streams closed since the last collection are taken off the projection, down to 20% of the measured floor, so that after a mass disconnect the memory the departed streams held does not refuse their reconnections until the next collection. When admission still refuses with far fewer streams than that collection saw, it forces one, at most every 5 s.
   - Capacity is decided before the token is verified. Refusals are logged once a second with their count (`streams refused`) instead of once per request.
@@ -31,6 +31,12 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
   - `sluice_streams_refused_total{reason}` and `sluice_admission_memory_share`;
   - `sluice_memory_floor_bytes` and `sluice_heap_live_bytes`;
   - `sluice_index_size{index,kind}`, the sizes of the hold and subscription indexes, set at each scrape.
+
+### Fixed
+
+- **A resumed shape could get changes out of commit order.** Its replay ran off the request while the reader went on delivering, so a change committed during the replay could arrive ahead of older ones being replayed. A client that upserts by key could then apply an older row over a newer one. The load test counted 279 such jumps in a room's message sequence after 4,255 resumes, in a reconnect of 5,610 streams on 1 CPU. Changes committed during a replay now reach the shape after it. Snapshots are unchanged: their rows, and the replay that follows them, are still sent while live changes arrive.
+- A shape installed while the reader was dispatching a change could miss that change: it was routed before the shape existed and buffered after the shape's replay had read the buffer. Changes are now buffered before they are routed.
+- A replay delivered inserts and deletes to shapes whose `ops` left them out. It keeps to the shape's `ops` now, as live delivery does.
 
 ### Performance
 
