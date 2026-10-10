@@ -2,6 +2,13 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## Unreleased
+
+### Changed
+
+- Issuer mode: a hold is listed for routing under whichever of its equally good columns has the shortest lists. Sluice counts, per hold table, how many holds share each value of each column. Before, it took the first in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) put every member of a project in one list, and each change to a member's row was checked against all of them. The order of a hold's columns no longer matters. Microbenchmark at 400 rooms of 28 streams with 7 holds each: a member update went from 107 µs (scope first) to 4.8 µs, and from 3.8 µs to 4.3 µs member first.
+- Hold checks no longer hold up stream opens and `POST /token`. The reader evaluated a change's candidate holds under the hold index's lock, which grants and renewals also need; it now evaluates them with no lock held and locks only to remove a hold that broke.
+
 ## 0.8.2
 
 Issuer mode: `POST /token` no longer grows each shape's filter.
