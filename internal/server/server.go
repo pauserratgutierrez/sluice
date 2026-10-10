@@ -908,7 +908,7 @@ func (s *Server) subscribeShape(
 				Message: "this stream already has a subscription labelled " + spec.Sub}
 			return res
 		}
-		res.Error = &event.Error{Code: "shape_not_authorized", Message: err.Error()}
+		res.Error = holdCheckFailed(err)
 		return res
 	}
 	s.incSubMetric(sub)
@@ -1523,6 +1523,20 @@ const (
 
 // issuerUnavailable is the error for a shape the issuer could not decide:
 // retryable, after the delay the issuer asked for or a spread one.
+// holdCheckFailed is the error for a grant whose holds were not confirmed. A hold
+// row that does not exist denies it. A check that could not be made -- the
+// request was cancelled or timed out, the database failed -- says nothing
+// about the caller, so it is retryable, after a delay spread like the
+// issuer's, rather than a denial the client would give up on.
+func holdCheckFailed(err error) *event.Error {
+	var missing *hold.MissingError
+	if errors.As(err, &missing) || !isHoldQueryError(err) {
+		return &event.Error{Code: "shape_not_authorized", Message: err.Error()}
+	}
+	return &event.Error{Code: "hold_check_unavailable", Message: err.Error(), Retryable: true,
+		RetryAfterMs: (issuerRetryMin + rand.N(issuerRetrySpread)).Milliseconds()}
+}
+
 func issuerUnavailable(e *oracle.ErrUnavailable) event.Error {
 	delay := e.RetryAfter
 	if delay <= 0 {
@@ -1592,7 +1606,8 @@ func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label str
 		return false
 	}
 	if err := s.verifyHolds(ctx, grant.Holds); err != nil {
-		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
+		e := holdCheckFailed(err)
+		s.revokeShape(ctx, st, label, e.Retryable, *e)
 		return false
 	}
 	live := s.reg.Get(st.StreamID(), label)
@@ -1770,4 +1785,11 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func writeErr(w http.ResponseWriter, code int, errCode, msg string) {
 	writeJSON(w, code, map[string]any{"error": errCode, "message": msg})
+}
+
+// isHoldQueryError reports whether a hold check failed to run rather than
+// found a hold missing.
+func isHoldQueryError(err error) bool {
+	var check *hold.CheckError
+	return errors.As(err, &check) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

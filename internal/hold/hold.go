@@ -672,6 +672,26 @@ func ExistsSQL(spec Spec) (string, []any) {
 	return sql, args
 }
 
+// MissingError is a hold row that does not exist: the grant is denied. Any other
+// error from Exists is a check that could not be made.
+type MissingError struct {
+	Rel, Filter string
+}
+
+func (e *MissingError) Error() string {
+	return fmt.Sprintf("hold on %s with filter %s does not exist", e.Rel, e.Filter)
+}
+
+// CheckError is an EXISTS that could not be run or did not finish: it says
+// nothing about the hold.
+type CheckError struct {
+	Rel string
+	Err error
+}
+
+func (e *CheckError) Error() string { return fmt.Sprintf("hold exists on %s: %v", e.Rel, e.Err) }
+func (e *CheckError) Unwrap() error { return e.Err }
+
 // Querier is the subset of pgxpool.Pool Exists needs.
 type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -688,10 +708,10 @@ func Exists(ctx context.Context, q Querier, specs []Spec) error {
 		sql, args := ExistsSQL(spec)
 		var ok bool
 		if err := q.QueryRow(ctx, sql, args...).Scan(&ok); err != nil {
-			return fmt.Errorf("hold exists on %s: %w", spec.Rel.FullName(), err)
+			return &CheckError{Rel: spec.Rel.FullName(), Err: err}
 		}
 		if !ok {
-			return fmt.Errorf("hold on %s with filter %s does not exist", spec.Rel.FullName(), spec.Filter.Describe())
+			return &MissingError{Rel: spec.Rel.FullName(), Filter: spec.Filter.Describe()}
 		}
 	}
 	return nil

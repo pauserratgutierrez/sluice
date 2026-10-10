@@ -308,6 +308,7 @@ When `ready` is written, its subscriptions are installed: every change from then
 | --- | --- | --- |
 | `shape_not_authorized` | subscribe, later | denied, revoked by a policy change or `/token`, hold removed or truncated, or dropped by an operator |
 | `issuer_unavailable` | subscribe, `/token` | the issuer gave no verdict; retryable, subscribe again after `retry_after_ms` |
+| `hold_check_unavailable` | subscribe, `/token` | the check that a hold row exists could not be made (the request was cancelled or timed out, the database failed); retryable, subscribe again after `retry_after_ms`. A hold row that does not exist is `shape_not_authorized` |
 | `column_not_granted` | subscribe | the role may read none of the requested columns |
 | `policy_requires_impersonation` | subscribe | Tier C with `SLUICE_TIER_C=deny` |
 | `relation_not_published`, `relation_unpublished` | subscribe, later | the table (or a hold table) is not, or no longer, in the publication |
