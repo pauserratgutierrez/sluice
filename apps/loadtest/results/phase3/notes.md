@@ -98,3 +98,34 @@ The rule: an UPDATE without an old tuple cuts no hold. It rests on every hold fi
   - The heap profile at 12,000 streams (0.8.1) showed parsed filters at 44% of the heap, and HTTP `bufio` buffers per connection at 22% (about 11 KiB per stream). The buffers are untouched.
 - **Shared filters across catalog refreshes.** The catalog builds new `Relation` objects at every refresh, so the table keys on OID and columns, not on the pointer. Found when the `/token` retention test grew under `-race`: its oracle made new relations per call, so every renewal added table entries that cleanups removed only later.
 - **The aborted 75-minute queue** (`phase3-holds.plan`): stopped at the user's request during its first run (`p3-v081-unicorn-1cpu-roomfirst`). The runner wrote a partial report on the way out: 74 s of steady phase on the released 0.8.1 with holds room first, at the unicorn on 1 CPU. It dispatched 1,503 changes/s of the 2,320 offered at 618 ms of CPU per 1,000 changes and 0.93 cores, falling behind. On the 0.9.0 candidate the order no longer matters (103 ms member first; equal in the microbenchmark).
+
+## Review fixes and the storm at the limit (2026-10-10 ~04:30–07:10 UTC)
+
+The user's review of `phase3` found two admission bugs, both reproduced with unit tests first:
+- opens in progress were not counted, so a storm's simultaneous opens all passed on the same number of streams (fix: a reservation per open, released when the hub counts it);
+- after a mass disconnect the floor still held the departed streams until the next collection (fix: closed streams are taken off the projection, down to 20% of the floor, and a stale floor forces a collection at most every 5 s).
+
+The storm test the user made a condition for tagging: 1 CPU, 512 MB, default admission (`SLUICE_MAX_STREAMS=0`, `SLUICE_ADMIT_MEMORY=0.5`), the rooms profile offering 6,000 streams, a proxy cut 4 minutes into the steady phase (5 s down). Criteria: no kill for memory; refusals are clean `503`s with `Retry-After`; after the cut, every stream that had fit is back within 30 s; a reasonable message p95. Plan: `../../plans/phase3-storm.plan`.
+
+- **`p3-storm-512m`** (image `p3-final2`, floor = everything the runtime could not free, fragmentation included):
+  - 4,209 admitted, 263,109 refusals, every one with `Retry-After`; no kill, RSS peak 386 MiB; message p95 5.9 ms.
+  - Failed the refill: after the cut, 2,647 streams were back at 30 s, 2,911 at 60 s, and 3,475 (82.5%) at 4 minutes, short of 4,209 until the end.
+  - Cause: with fragmentation in it, the floor swung between 216 and 309 MiB at a steady 4,209 streams while the live heap stayed at 140–150 MiB.
+  - Fix (`d12c6cb`): the floor is the live heap, the stack space goroutines use (`/gc/scan/stack`) and the runtime's own structures.
+- **`p3-storm-512m-r2`** (image `p3-final3`):
+  - 5,610 admitted, 78,059 refusals, every one with `Retry-After`; no kill, RSS peak 460 MiB, Go memory 452 of 461 MiB; message p95 8.4 ms.
+  - Failed the refill: 4,177 back at 30 s, then stuck at 4,853 of 5,610 (86.5%) for more than 3 minutes, until the share dipped to 0.45 and it reached 5,402. At 4,853 streams `/metrics` read `sluice_admission_memory_share` 0.456.
+  - Cause: the storm's replays and garbage lifted the floor past 0.5 for a few collections; it then settled at 0.456, above the 0.45 the hysteresis asks for, so admission never reopened.
+  - Fix (`ff7d4ad`): admission also reopens once the projection has stayed below the threshold for 10 s.
+  - New finding: 279 jumps in a room's message sequence after a resume that said `resumed: true` (0 in every earlier run). Cause, in the code since before 0.8: the replay runs on its own goroutine while the reader keeps delivering, so a change committed during the replay could reach the stream ahead of the replayed ones. A unit test reproduced it (the new change arrived before eight replayed ones). Fix in the same commit: a covered resume installs the shape with a `Backfill`; the reader leaves its changes to the replay, which catches up from the buffer by append order and hands over under the lock the reader checks.
+  - Found while fixing it, both in the code before 0.8 too: a change was routed before it was buffered, so a shape installed between the two missed it; and a replay ignored the shape's `ops` for inserts and deletes.
+- **`p3-storm-512m-r3`** (image `p3-final4`, `ff7d4ad`):
+  - 5,767 admitted, 53,621 refusals, every one with `Retry-After`; no kill, RSS peak 452 MiB; message p95 8.9 ms over the run.
+  - 0 jumps after a resume (279 in r2).
+  - Refill after the cut: 3,854 at 20 s, 4,494 at 30 s, 5,096 at 60 s (88%), 5,351 at 2 min, 5,508 at 3 min, 5,528 at 4 min (95.9%). Admission no longer stuck: its share swung between 0.47 and 0.51 as it reopened every 10 s.
+  - Why not all of them: in the minute after the cut the live heap after a collection reached 208 MiB with fewer streams (the storm's replays and garbage), and for minutes after it each stream held more memory: 85 MiB of goroutine stacks for 5,134 streams against 70 MiB for 5,767 before. Go starts new goroutines with stacks sized by the average use it measured, and the storm raised it.
+  - New finding: 405 clients lost their room's hook channel. A join the hook gave no verdict on (the issuer service peaked at 4,733 calls a second) was refused with `channel_not_authorized`, which is not retryable. Fixed in `a692c6e` (`channel_hook_unavailable`, retryable; the SDK's channel recovers when the retried join is accepted).
+- **`p3-storm-512m-cap4900`** (same image, `SLUICE_MAX_STREAMS=4900`, 85% of what r3 admitted): 4,900 open before the cut; 4,350 at 20 s, 4,729 at 30 s (96.5%), 4,853 at 45 s, all 4,900 at 55 s. RSS peak 455 MiB, message p95 7.6 ms.
+- **Decision (user):** accept the refill at the admission threshold and document it, with a cap at about 85% of what admission lets in for operators who need every stream back within a minute.
+- **`p3-storm-512m-r4`** (image `p3-final5`, `a692c6e`, the release candidate): 5,759 admitted, 55,087 refusals with `Retry-After`; no kill, RSS peak 458 MiB; message p95 9.5 ms; 0 jumps after a resume. Back after the cut: 4,545 at 30 s, 4,853 at 60 s (84%), 5,549 at 4 minutes (96%). 16 hook joins were refused with `channel_hook_unavailable` and retried; typing delivery 100.00% (97.68% in r3).
+- **Checks on `d353ba3`:** `go vet`, `go test -race` (Linux), SDK 35 tests, `cmd/smoke` 45/0, `cmd/smoke-issuer` 21/0, `cmd/audit` 200/200, `live.mjs` 19/0.
