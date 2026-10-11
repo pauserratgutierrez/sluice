@@ -55,3 +55,18 @@
 2026-10-11T00:34:32Z skip p3-storm-512m-cap4900 (already measured)
 2026-10-11T00:34:32Z start p3-storm-512m-r4 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final5 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
 2026-10-11T00:48:06Z done p3-storm-512m-r4 status=0 took=814s
+2026-10-11T01:07:34Z skip p3-storm-512m (already measured)
+2026-10-11T01:07:34Z skip p3-storm-512m-r2 (already measured)
+2026-10-11T01:07:34Z skip p3-storm-512m-r3 (already measured)
+2026-10-11T01:07:34Z skip p3-storm-512m-cap4900 (already measured)
+2026-10-11T01:07:34Z skip p3-storm-512m-r4 (already measured)
+2026-10-11T01:07:34Z start p3-storm-512m-r5 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final6 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+2026-10-11T01:21:50Z done p3-storm-512m-r5 status=0 took=856s
+2026-10-11T01:25:22Z skip p3-storm-512m (already measured)
+2026-10-11T01:25:23Z skip p3-storm-512m-r2 (already measured)
+2026-10-11T01:25:23Z skip p3-storm-512m-r3 (already measured)
+2026-10-11T01:25:23Z skip p3-storm-512m-cap4900 (already measured)
+2026-10-11T01:25:23Z skip p3-storm-512m-r4 (already measured)
+2026-10-11T01:25:23Z skip p3-storm-512m-r5 (already measured)
+2026-10-11T01:25:23Z start p3-storm-512m-r6 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final7 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+2026-10-11T01:38:56Z done p3-storm-512m-r6 status=0 took=813s

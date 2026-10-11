@@ -2,7 +2,7 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
-## Unreleased (proposed 0.9.0)
+## 0.9.0
 
 Streams admitted by memory, hold checks that no longer depend on filter order or hold up `/token`, shared filters, and the reader's lag in seconds.
 
@@ -16,7 +16,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
   - A positive `SLUICE_MAX_STREAMS` still caps the count besides, with the same count (open and opening) and the same `Retry-After`.
   - With no memory limit known and `SLUICE_MAX_STREAMS=0`, nothing bounds streams, and the log warns at startup.
   - Why `0.5`: with 6,000 streams offered to 1 CPU and 512 MB, `0.5` admitted 5,767, about 42 KiB each of memory a collection cannot free, and delivered messages at p95 9 ms, with RSS peaking at 452 MiB. A threshold of `0.85` on the live heap alone admitted 7,215 of 12,000, but the collector then ran without pause and messages arrived 30–60 s late. On 0.8.x, with a cap above what fit, the process was killed for memory 11 times in 15 minutes.
-  - After a reconnect of every stream, a node admission filled comes back to 84–88% within a minute and 96% within 4 minutes (two runs), not all the way. For a few minutes each stream holds more memory: the storm's garbage, and goroutine stacks grown during it (85 MiB of stacks for 5,134 streams after the cut, 70 MiB for 5,767 before). With `SLUICE_MAX_STREAMS` at 85% of what admission let in (4,900), 96% were back within 30 s and every stream within 55 s.
+  - After a reconnect of every stream, a node admission filled comes back to 72–79% within 30 s, 84–92% within a minute and 96% within 4 minutes (three runs), not all the way. While the reconnect runs, a collection counts its allocations as live, since they were made during the collection, and lifts the measure to 0.51–0.56 at 2,700–4,900 streams. After it, the node sits at the threshold with 96% of the streams: at 5,465 streams the live heap was 191–195 MiB, against 189–193 MiB at 5,777 before the cut. With `SLUICE_MAX_STREAMS` at 85% of what admission let in (4,900), 96% were back within 30 s and every stream within 55 s.
 - Issuer mode: **a hold is listed under whichever of its equally good columns has the shortest lists.** Sluice counts, per hold table, how many holds share each value of each column. 0.8.1 took the first column in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) checked each change to a member's row against every hold in the project. The order of a hold's columns no longer matters, and holds already listed move at their next `/token`.
 - A hold check that could not be made now drops the shape with the retryable `hold_check_unavailable` and a `retry_after_ms`, at subscribe and at `POST /token`. That covers a request cancelled or timed out, or a database failure. It was `shape_not_authorized`, which clients do not retry, so a `/token` that timed out under load lost its shapes for good. A hold row that does not exist is still `shape_not_authorized`.
 - Calls to the shape issuer and to channel hooks carry an `Idempotency-Key` header. Idle connections to them close after `SLUICE_ISSUER_IDLE_TIMEOUT` (new; default 4 s; Go's default was 90 s).
@@ -47,6 +47,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 - Identical filters are parsed once and shared, and collected with the last subscription or hold that uses one. They are keyed by the relation and its columns, so they are shared across catalog refreshes too. Parsed filters were 44% of the live heap at 12,000 streams.
 - The events one transaction brings a stream are written together. The writer is woken at the commit, or at once when a quarter of its queue fills. Once the transaction has been dispatching for 5 ms, it is woken at the next row the reader dispatches, delivered or not.
 - Hold checks no longer hold up stream opens and `POST /token`. Candidates are evaluated with no lock held, and the lock is taken only to remove a hold that broke.
+- A resume copies from the buffer only the changes routed to its shape (by its routing key), not every change to the table since its position. Thousands of subscriptions resume at once after a cut; each copied about 250 changes for a room's messages and held them while it waited for room in its queue. In the same reconnect at the admission threshold, the streams back after a minute went from 84–88% to 92%.
 
 ### For operators
 

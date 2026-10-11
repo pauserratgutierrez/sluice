@@ -62,6 +62,8 @@ The test the user made a condition for tagging 0.9.0 (`../../plans/phase3-storm.
 | `p3-storm-512m-r3` (admission reopens after 10 s; resumes in order) | 5,767 | 53,621 | 452 MiB | 8.9 ms | 78% / 88% / 96% | 0 |
 | `p3-storm-512m-r4` (release candidate: hook joins retryable) | 5,759 | 55,087 | 458 MiB | 9.5 ms | 79% / 84% / 96% | 0 |
 | `p3-storm-512m-cap4900` (`SLUICE_MAX_STREAMS=4900`) | 4,900 | 137,992 | 455 MiB | 7.6 ms | 96.5% / 100% (at 55 s) | 0 |
+| `p3-storm-512m-r5` (streams that fit come back without the projection; reverted) | 5,755 | 44,520 | 469 MiB, Go memory 848 MiB | 200 s at the end | 1,812 of 5,759 came back | 0 |
+| `p3-storm-512m-r6` (a resume copies only its shape's changes) | 5,777 | 50,549 | 451 MiB | 7.9 ms | 72% / 92% / 96% | 0 |
 
 No run was killed, and every refusal carried `Retry-After`. What each run found:
 - **r1:** the floor counted heap fragmentation and swung between 216 and 309 MiB at a steady 4,209 streams, so admission refused streams that fit. Fixed: the floor leaves fragmentation out.
@@ -69,9 +71,13 @@ No run was killed, and every refusal carried `Retry-After`. What each run found:
 - **r2 also:** 279 jumps in a room's message sequence after resumes that said `resumed: true`. Live changes could overtake a resume's replay, a bug older than 0.8. Fixed, with two more found on the way: a change routed before it was buffered, and a replay ignoring `ops`.
 - **r3:** 405 clients lost their room's hook channel. With the issuer service at 4,733 calls a second, the hook gave no verdict, and the join was refused with the non-retryable `channel_not_authorized`. Fixed: `channel_hook_unavailable`, retryable. In r4, 16 joins were refused that way and retried, and typing delivery was 100.00% (97.68% in r3).
 
-**Verdict:** three criteria pass and the refill does not. At the threshold, 84–88% are back within a minute and 96% within 4 minutes, not all. In the minute after the cut, the storm's replays and garbage lift the memory a collection cannot free, with fewer streams open. For minutes after it, each stream holds more: 85 MiB of goroutine stacks for 5,134 streams in r3, against 70 MiB for 5,767 before. Go sizes new goroutines' stacks by the average use it measured, and the storm raised it. With a cap at 85% of what admission let in, 96.5% were back within 30 s and all within 55 s.
+- **The user's review** asked whether admission followed streams that left (it did, since `95f1ea3`), and set a new criterion: at least 99% back within 30 s at the threshold, with no cap.
+- **r5:** a rule that let streams back up to the most held in the last 5 minutes, asking only that the measured floor stay below 0.6, skipped the projection that spreads a storm's opens. Every client reopened at once, Go memory reached 848 MiB against a limit of 461, the issuer refused 43,311 calls, and 1,812 streams came back. Reverted.
+- **r5 also:** each resumed subscription copied every change to its table since its position, about 250 for a room's messages, and held the copy while it waited for its queue. Fixed in r6: a resume copies only the changes routed to its shape.
 
-**Decision (user):** accept the refill at the threshold and document it, with the cap at about 85% as the sizing advice for operators who need every stream back within a minute.
+**Verdict:** three criteria pass and the refill does not, by either criterion. At the threshold, 72–79% are back within 30 s, 84–92% within a minute and 96% within 4 minutes (r3, r4, r6). While the reconnect runs, a collection counts its allocations as live and lifts the measure to 0.51–0.56 at 2,700–4,900 streams; each lift stops admission for up to 10 s. After it the node sits at the threshold with 96% of the streams: at 5,465 streams in r6 the live heap was 191–195 MiB, against 189–193 MiB at 5,777 before the cut. With a cap at 85% of what admission let in, 96.5% were back within 30 s and all within 55 s.
+
+**Decision (user, before r5):** accept the refill at the threshold and document it, with the cap at about 85% as the sizing advice for operators who need every stream back within a minute. After r6 the 99%-in-30-s criterion is still not met, so the advice stays.
 
 ## Stability
 

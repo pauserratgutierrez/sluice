@@ -18,3 +18,9 @@ p3-storm-512m-cap4900 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.2
 
 # The release candidate: hook joins with no verdict are retryable (phase3 a692c6e).
 p3-storm-512m-r4 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final5 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+
+# The streams that fit come back: up to the most held below the threshold in the last 5 minutes, the measured floor may reach 0.6 (phase3 239cbb8). Criterion: >= 99% back within 30 s, no kill.
+p3-storm-512m-r5 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final6 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+
+# r5 (the reconnect allowance) took Go memory to 848 MiB; reverted. A replay now copies only the shape's changes (phase3 e76279f). Criterion: >= 99% back within 30 s, no kill.
+p3-storm-512m-r6 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-final7 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
