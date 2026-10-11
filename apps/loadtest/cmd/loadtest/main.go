@@ -6,6 +6,7 @@ import (
 
 	"github.com/pauserratgutierrez/sluice/apps/loadtest/internal/issuer"
 	"github.com/pauserratgutierrez/sluice/apps/loadtest/internal/jwks"
+	"github.com/pauserratgutierrez/sluice/apps/loadtest/internal/proxy"
 	"github.com/pauserratgutierrez/sluice/apps/loadtest/internal/runner"
 )
 
@@ -20,6 +21,10 @@ func main() {
 		err = jwks.Main()
 	case "issuer":
 		err = issuer.Main()
+	case "proxy":
+		err = proxy.Main()
+	case "summarize":
+		err = runner.Summarize(os.Stdout, os.Args[2:])
 	case "run":
 		err = runner.Main()
 	default:
@@ -27,7 +32,9 @@ func main() {
 
 commands:
   jwks     mint the ES256 pair if needed, then serve the public JWKS
-  issuer   serve the shape-issuer used by the issuer and kick profiles
+  issuer   serve the shape issuer and channel hook (issuer, kick and the rooms family)
+  proxy    a TCP proxy in front of Sluice that drops every connection on command
+  summarize DIR...  tables of the production-shaped profiles' reports, medians per label
   run      run the configured LOAD_SCENARIO against a live Sluice
 `)
 		if cmd != "help" && cmd != "-h" && cmd != "--help" {

@@ -23,6 +23,10 @@ func Main() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	if isRoomsScenario(cfg.Scenario) {
+		return runRooms(ctx, cfg, log)
+	}
+
 	res := host.Detect()
 	if cfg.Cap <= 0 {
 		cfg.Cap = host.StreamCap(res)

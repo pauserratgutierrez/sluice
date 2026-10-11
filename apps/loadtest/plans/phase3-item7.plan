@@ -1,0 +1,4 @@
+# Phase 3, item 7 (A: wake writers once per transaction; B: share identical filters), short runs: the unicorn at
+# 1 CPU and 4 GB, 5 min steady. Before: sluice:p3-i6 (phase3 3fd5f1c, items 2-6). After: sluice:p3-i7 (41c5cf1).
+p3i6-unicorn-1cpu-5m rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=5m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p3-i6 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+p3i7-unicorn-1cpu-5m rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=5m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p3-i7 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

@@ -1,0 +1,14 @@
+# 0.8.1 against the 0.8.0 baseline (results/phase2), 10 min each, the same mixes and limits as the
+# baseline runs it is compared with. The image is the fix/hold-routing worktree (watches keep where they
+# were indexed; RoutingKey takes the first equally good column; only a stream's current watch cuts):
+#
+#   docker build --build-arg VERSION=0.8.1-rc -t sluice:0.8.1-rc ../sluice-0.8.1
+#   scripts/queue.sh plans/v0.8.1.plan results/phase3/raw
+#
+# LOAD_HOLD_ORDER separates the two effects: user-first gives each member a list of their own in the hold
+# index (what the README now advises); room-first is the order every 0.8.0 baseline run used, so it shows
+# the leak fix alone.
+
+v081-veryhigh-userfirst rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=10m LOAD_ARRIVAL=30s SLUICE_IMAGE=sluice:0.8.1-rc SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+v081-veryhigh-roomfirst rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=10m LOAD_ARRIVAL=30s SLUICE_IMAGE=sluice:0.8.1-rc SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=room-first
+v081-unicorn-2cpu-userfirst rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=10m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_CPUS=2 SLUICE_CPUSET=2-5 SLUICE_IMAGE=sluice:0.8.1-rc SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

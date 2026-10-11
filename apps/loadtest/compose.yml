@@ -13,9 +13,20 @@
 #   docker compose --profile kick      up --build --abort-on-container-exit --exit-code-from runner-kick
 #   docker compose --profile idle      up --build --abort-on-container-exit --exit-code-from runner-idle
 #
+# Production-shaped profiles (issuer mode, hook channels, RLS off):
+#
+#   docker compose --profile rooms     up --build --abort-on-container-exit --exit-code-from runner-rooms
+#   docker compose --profile bigtxn    up --build --abort-on-container-exit --exit-code-from runner-bigtxn
+#   docker compose --profile reconnect up --build --abort-on-container-exit --exit-code-from runner-reconnect
+#   docker compose --profile calibrate up --build --abort-on-container-exit --exit-code-from runner-calibrate
+#
+# Sluice runs with a production container's limits by default: 1 CPU
+# (SLUICE_CPUS), 512 MB (SLUICE_MEM_LIMIT) and SLUICE_MAX_STREAMS=5000. Each
+# service can be pinned to its own cores with *_CPUSET; see README.md.
+#
 # To test the working tree instead of a published image, build it and point the
 # stack at it: docker build -t sluice:local ../.. && SLUICE_IMAGE=sluice:local
-# SLUICE_PULL_POLICY=never docker compose --profile ... (or `make local`).
+# SLUICE_PULL_POLICY=never docker compose --profile ... (or scripts/run.sh).
 
 name: sluice-loadtest
 
@@ -38,7 +49,7 @@ x-runner-env: &runner-env
   LOAD_RESULTS: /results
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
   SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
-  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.5.0}
+  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.8.0}
   LOAD_DB_URL: postgres://postgres:${POSTGRES_PASSWORD:-loadtest-pg}@db:5432/postgres
   ISSUER_URL: http://issuer:8080
   LOAD_AXIS: ${LOAD_AXIS:-all}
@@ -50,15 +61,97 @@ x-runner-env: &runner-env
   LOAD_WAVE: ${LOAD_WAVE:-256}
   LOAD_GRANULARITY: ${LOAD_GRANULARITY:-50}
   LOAD_OPEN_MIN: ${LOAD_OPEN_MIN:-0.95}
-  LOAD_DELIVERY_MIN: ${LOAD_DELIVERY_MIN:-0.90}
+  LOAD_DELIVERY_MIN: ${LOAD_DELIVERY_MIN:-}
   LOAD_CHANNEL: ${LOAD_CHANNEL:-room:load}
+  LOAD_SAMPLE_EVERY: ${LOAD_SAMPLE_EVERY:-}
+  LOAD_IDLE_SHAPES: ${LOAD_IDLE_SHAPES:-}
+  HOST_POWER_PLAN: ${HOST_POWER_PLAN:-}
+
+# The knobs of the production-shaped profiles. Empty means the runner's
+# default (README.md lists them).
+x-rooms-env: &rooms-env
+  <<: *runner-env
+  LOAD_LABEL: ${LOAD_LABEL:-}
+  LOAD_SEED: ${LOAD_SEED:-}
+  LOAD_ROOMS: ${LOAD_ROOMS:-}
+  LOAD_ROOM_MEMBERS: ${LOAD_ROOM_MEMBERS:-}
+  LOAD_ROOM_STREAMS: ${LOAD_ROOM_STREAMS:-}
+  LOAD_ROOM_MIX: ${LOAD_ROOM_MIX:-}
+  LOAD_STREAMS: ${LOAD_STREAMS:-}
+  LOAD_SHAPES: ${LOAD_SHAPES:-}
+  LOAD_TYPING: ${LOAD_TYPING:-}
+  LOAD_TYPING_ENABLED: ${LOAD_TYPING_ENABLED:-}
+  LOAD_TYPING_EVERY: ${LOAD_TYPING_EVERY:-}
+  LOAD_MSG_EVERY: ${LOAD_MSG_EVERY:-}
+  LOAD_DURATION: ${LOAD_DURATION:-}
+  LOAD_ARRIVAL: ${LOAD_ARRIVAL:-}
+  LOAD_ARRIVAL_TRAFFIC: ${LOAD_ARRIVAL_TRAFFIC:-}
+  LOAD_OPEN_TIMEOUT: ${LOAD_OPEN_TIMEOUT:-}
+  LOAD_TOKEN_EVERY: ${LOAD_TOKEN_EVERY:-}
+  LOAD_CHURN: ${LOAD_CHURN:-}
+  LOAD_TOKEN_TTL: ${LOAD_TOKEN_TTL:-}
+  LOAD_REPLICA_IDENTITY: ${LOAD_REPLICA_IDENTITY:-}
+  LOAD_SSE_BUFFER: ${LOAD_SSE_BUFFER:-}
+  LOAD_STATS_EVERY: ${LOAD_STATS_EVERY:-}
+  LOAD_DRAIN: ${LOAD_DRAIN:-}
+  LOAD_BACKOFF: ${LOAD_BACKOFF:-}
+  LOAD_P95_MAX: ${LOAD_P95_MAX:-}
+  LOAD_SLOT_LAG_MAX_MB: ${LOAD_SLOT_LAG_MAX_MB:-}
+  LOAD_BIGTXN_ROWS: ${LOAD_BIGTXN_ROWS:-}
+  LOAD_BIGTXN_STREAMED: ${LOAD_BIGTXN_STREAMED:-}
+  LOAD_BIGTXN_AFTER: ${LOAD_BIGTXN_AFTER:-}
+  LOAD_BIGTXN_EVERY: ${LOAD_BIGTXN_EVERY:-}
+  LOAD_BIGTXN_REPEAT: ${LOAD_BIGTXN_REPEAT:-}
+  LOAD_BIGTXN_BASELINE: ${LOAD_BIGTXN_BASELINE:-}
+  LOAD_BIGTXN_TIMEOUT: ${LOAD_BIGTXN_TIMEOUT:-}
+  LOAD_RECONNECT_MODE: ${LOAD_RECONNECT_MODE:-}
+  LOAD_RECONNECT_AFTER: ${LOAD_RECONNECT_AFTER:-}
+  LOAD_RECONNECT_EVERY: ${LOAD_RECONNECT_EVERY:-}
+  LOAD_RECONNECT_COUNT: ${LOAD_RECONNECT_COUNT:-}
+  LOAD_RECONNECT_TIMEOUT: ${LOAD_RECONNECT_TIMEOUT:-}
+  LOAD_PROXY_DOWN: ${LOAD_PROXY_DOWN:-}
+  LOAD_CALIBRATE_WINDOWS: ${LOAD_CALIBRATE_WINDOWS:-}
+  LOAD_CALIBRATE_WINDOW: ${LOAD_CALIBRATE_WINDOW:-}
+  LOAD_RAMP_STEP: ${LOAD_RAMP_STEP:-}
+  LOAD_RAMP_ARRIVAL: ${LOAD_RAMP_ARRIVAL:-}
+  LOAD_RAMP_SETTLE: ${LOAD_RAMP_SETTLE:-}
+  LOAD_RAMP_HOLD: ${LOAD_RAMP_HOLD:-}
+  LOAD_RAMP_AFTER_FAIL: ${LOAD_RAMP_AFTER_FAIL:-}
+  LOAD_PROBE_EVERY: ${LOAD_PROBE_EVERY:-}
+  LOAD_PROBE_AGES: ${LOAD_PROBE_AGES:-}
+  LOAD_ISSUER_NAME: ${LOAD_ISSUER_NAME:-}
+  LOAD_PPROF_AT: ${LOAD_PPROF_AT:-}
+  LOAD_PPROF_SECONDS: ${LOAD_PPROF_SECONDS:-}
+  LOAD_PPROF_HEAP_AT: ${LOAD_PPROF_HEAP_AT:-}
+  HOST_POWER_PLAN: ${HOST_POWER_PLAN:-}
+  POSTGRES_SYNCHRONOUS_COMMIT: ${POSTGRES_SYNCHRONOUS_COMMIT:-on}
+  SLUICE_GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
+  SLUICE_RING_EVENTS: ${SLUICE_RING_EVENTS:-4096}
+  SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-60s}
+  LOAD_SLOT: load_rooms
+  # Recorded in the report; the containers' limits are set below.
+  SLUICE_CPUS: ${SLUICE_CPUS:-1}
+  SLUICE_MEM_LIMIT: ${SLUICE_MEM_LIMIT:-512m}
+  SLUICE_MAX_STREAMS: ${SLUICE_MAX_STREAMS:-5000}
+  SLUICE_CPUSET: ${SLUICE_CPUSET:-}
+  DB_CPUSET: ${DB_CPUSET:-}
+  ISSUER_CPUSET: ${ISSUER_CPUSET:-}
+  RUNNER_CPUSET: ${RUNNER_CPUSET:-}
+  PROXY_CPUSET: ${PROXY_CPUSET:-}
+  POSTGRES_IMAGE: ${POSTGRES_IMAGE:-postgres:18.6-trixie}
+  LOAD_ISSUER_LATENCY: ${LOAD_ISSUER_LATENCY:-5ms-20ms}
+  LOAD_ISSUER_CONCURRENCY: ${LOAD_ISSUER_CONCURRENCY:-32}
+  LOAD_HOOK_TTL: ${LOAD_HOOK_TTL:-0}
+  LOAD_HOLD_ORDER: ${LOAD_HOLD_ORDER:-user-first}
+  SLUICE_METRICS_URL: http://sluice-rooms:4000/metrics
 
 x-runner: &runner
   <<: *loadtest
   command: ["run"]
   restart: "no"
   user: "0:0"
-  mem_limit: 6g
+  mem_limit: ${RUNNER_MEM_LIMIT:-6g}
+  cpuset: ${RUNNER_CPUSET:-}
   ulimits:
     nofile:
       soft: 1048576
@@ -68,7 +161,7 @@ x-runner: &runner
     net.core.somaxconn: 65535
   volumes:
     - keys_data:/keys:ro
-    - ./results:/results
+    - ${RESULTS_DIR:-./results}:/results
   env_file:
     - path: .env
       required: false
@@ -92,14 +185,35 @@ x-runner-issuer: &runner-issuer
     sluice-issuer: { condition: service_healthy }
   networks: [loadtest]
 
+# The rooms family also mounts the Docker socket: the runner reads every
+# container's CPU and memory from it, and the reconnect profile restarts
+# Sluice through it. That socket is root on the host.
+x-runner-rooms: &runner-rooms
+  <<: *runner
+  depends_on:
+    db: { condition: service_healthy }
+    jwks: { condition: service_healthy }
+    issuer: { condition: service_healthy }
+    sluice-rooms: { condition: service_healthy }
+  volumes:
+    - keys_data:/keys:ro
+    - ${RESULTS_DIR:-./results}:/results
+    - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+  networks: [loadtest]
+
 x-sluice: &sluice
-  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.5.0}
-  pull_policy: ${SLUICE_PULL_POLICY:-always}
+  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.8.0}
+  pull_policy: ${SLUICE_PULL_POLICY:-missing}
   restart: unless-stopped
   logging: *default-logging
   init: true
-  # Set to a production container's limit (e.g. 512m) to find how many streams fit in it.
-  mem_limit: ${SLUICE_MEM_LIMIT:-6g}
+  # A production container's limits. GOMEMLIMIT follows the memory limit
+  # (90% of it) unless SLUICE_GOMEMLIMIT is set.
+  cpus: ${SLUICE_CPUS:-1}
+  cpuset: ${SLUICE_CPUSET:-}
+  mem_limit: ${SLUICE_MEM_LIMIT:-512m}
+  # Above SLUICE_SHUTDOWN_GRACE, so a stop drains the streams.
+  stop_grace_period: 30s
   ulimits:
     nofile:
       soft: 1048576
@@ -130,7 +244,7 @@ x-sluice: &sluice
     SLUICE_REVOCATION_ENABLED: "false"
     SLUICE_CATALOG_REFRESH: 60s
     SLUICE_HEARTBEAT: 30s
-    SLUICE_MAX_STREAMS: "50000"
+    SLUICE_MAX_STREAMS: ${SLUICE_MAX_STREAMS:-5000}
     SLUICE_DB_POOL_MAX_CONNS: "32"
     SLUICE_METRICS_ENABLED: "true"
     SLUICE_DIAGNOSTICS_ENABLED: "true"
@@ -138,15 +252,17 @@ x-sluice: &sluice
     SLUICE_CHANNELS: "room:public"
     SLUICE_PUBLISH_RATE: "1000"
     SLUICE_PRESENCE_MAX_KEYS: "50000"
+    GOMEMLIMIT: ${SLUICE_GOMEMLIMIT:-}
 
 services:
   db:
-    image: postgres:18.4-trixie
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle]
+    image: ${POSTGRES_IMAGE:-postgres:18.6-trixie}
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate, ramp]
     restart: unless-stopped
     logging: *default-logging
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 2500m
+    mem_limit: ${DB_MEM_LIMIT:-2500m}
+    cpuset: ${DB_CPUSET:-}
     shm_size: 1gb
     command: >
       postgres
@@ -158,7 +274,7 @@ services:
       -c logical_decoding_work_mem=64MB
       -c shared_buffers=512MB
       -c max_wal_size=2GB
-      -c synchronous_commit=off
+      -c synchronous_commit=${POSTGRES_SYNCHRONOUS_COMMIT:-on}
       -c max_connections=100
       -c password_encryption=scram-sha-256
       -c log_min_messages=warning
@@ -175,6 +291,7 @@ services:
       - db_data:/var/lib/postgresql/data
       - ./sql/00-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
       - ./sql/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./sql/02-rooms.sql:/docker-entrypoint-initdb.d/02-rooms.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
       interval: 5s
@@ -185,11 +302,12 @@ services:
 
   jwks:
     <<: *loadtest
-    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle]
+    profiles: [rls-a, rls-b, rls-c, issuer, broadcast, presence, mixed, kick, idle, rooms, bigtxn, reconnect, calibrate, ramp]
     command: ["jwks"]
     restart: unless-stopped
     user: "0:0"
     mem_limit: 128m
+    cpuset: ${ISSUER_CPUSET:-}
     environment:
       KEYS_DIR: /keys
       JWKS_LISTEN: 0.0.0.0:8080
@@ -203,19 +321,30 @@ services:
       start_period: 5s
     networks: [loadtest]
 
+  # The shape issuer and channel hook, standing in for an application's
+  # backend: LOAD_ISSUER_LATENCY per call (a duration ± LOAD_ISSUER_JITTER, or
+  # a min-max range), at most LOAD_ISSUER_CONCURRENCY at once (0: no limit),
+  # the rest queued.
   issuer:
     <<: *loadtest
-    profiles: [issuer, kick]
+    profiles: [issuer, kick, rooms, bigtxn, reconnect, calibrate, ramp]
     command: ["issuer"]
     restart: unless-stopped
     user: "65532:65532"
     mem_limit: 512m
+    cpuset: ${ISSUER_CPUSET:-}
     env_file:
       - path: .env
         required: false
     environment:
       ISSUER_LISTEN: 0.0.0.0:8080
       SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+      LOAD_ISSUER_LATENCY: ${LOAD_ISSUER_LATENCY:-5ms-20ms}
+      LOAD_ISSUER_JITTER: ${LOAD_ISSUER_JITTER:-0.2}
+      LOAD_ISSUER_CONCURRENCY: ${LOAD_ISSUER_CONCURRENCY:-32}
+      LOAD_ISSUER_QUEUE_MAX: ${LOAD_ISSUER_QUEUE_MAX:-0}
+      LOAD_HOOK_TTL: ${LOAD_HOOK_TTL:-0}
+      LOAD_HOLD_ORDER: ${LOAD_HOLD_ORDER:-user-first}
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -251,6 +380,92 @@ services:
       SLUICE_PUBLICATION: sluice_issuer
       SLUICE_ISSUER_URL: http://issuer:8080/shapes
       SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+    networks: [loadtest]
+
+  # Issuer mode as a product runs it: RLS off, every shape granted over HTTP
+  # and held by a membership row, the room channel decided by a hook. Sluice's
+  # own defaults everywhere else, overridable with the same variable names.
+  sluice-rooms:
+    <<: *sluice
+    profiles: [rooms, bigtxn, reconnect, calibrate, ramp]
+    depends_on:
+      db: { condition: service_healthy }
+      jwks: { condition: service_healthy }
+      issuer: { condition: service_healthy }
+    environment:
+      SLUICE_LISTEN_ADDR: 0.0.0.0:4000
+      SLUICE_PATH_PREFIX: /sluice/v1
+      SLUICE_LOG_LEVEL: ${SLUICE_LOG_LEVEL:-info}
+      SLUICE_LOG_FORMAT: json
+      SLUICE_DB_REPL_URL: postgres://sluice_repl:${SLUICE_REPL_PASSWORD:-loadtest-repl}@db:5432/postgres?replication=database
+      SLUICE_DB_AUTHZ_URL: postgres://sluice_authz:${SLUICE_AUTHZ_PASSWORD:-loadtest-authz}@db:5432/postgres
+      SLUICE_JWKS_URL: http://jwks:8080/.well-known/jwks.json
+      SLUICE_JWT_ALG: ES256
+      SLUICE_JWT_AUDIENCE: authenticated
+      SLUICE_SHAPE_ORACLE: issuer
+      SLUICE_ISSUER_URL: http://issuer:8080/shapes
+      SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+      SLUICE_ISSUER_TIMEOUT: ${SLUICE_ISSUER_TIMEOUT:-2s}
+      SLUICE_CHANNELS: room:hook:http://issuer:8080/hook
+      SLUICE_CHANNEL_HOOK_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
+      SLUICE_CHANNEL_HOOK_TIMEOUT: ${SLUICE_CHANNEL_HOOK_TIMEOUT:-2s}
+      SLUICE_SLOT_NAME: load_rooms
+      SLUICE_PUBLICATION: sluice_rooms
+      SLUICE_MAX_STREAMS: ${SLUICE_MAX_STREAMS:-5000}
+      SLUICE_CATALOG_REFRESH: ${SLUICE_CATALOG_REFRESH:-30s}
+      SLUICE_HEARTBEAT: ${SLUICE_HEARTBEAT:-20s}
+      SLUICE_DB_POOL_MAX_CONNS: ${SLUICE_DB_POOL_MAX_CONNS:-8}
+      SLUICE_RECONNECT_SPREAD: ${SLUICE_RECONNECT_SPREAD:-10s}
+      SLUICE_SHUTDOWN_GRACE: ${SLUICE_SHUTDOWN_GRACE:-15s}
+      SLUICE_STREAM_QUEUE: ${SLUICE_STREAM_QUEUE:-256}
+      SLUICE_WRITE_TIMEOUT: ${SLUICE_WRITE_TIMEOUT:-10s}
+      SLUICE_RING_EVENTS: ${SLUICE_RING_EVENTS:-4096}
+      SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-60s}
+      SLUICE_RING_MAX_BYTES: ${SLUICE_RING_MAX_BYTES:-67108864}
+      SLUICE_STATUS_INTERVAL: ${SLUICE_STATUS_INTERVAL:-10s}
+      SLUICE_METRICS_ENABLED: "true"
+      SLUICE_DIAGNOSTICS_ENABLED: "true"
+      GOMEMLIMIT: ${SLUICE_GOMEMLIMIT:-}
+      GOGC: ${SLUICE_GOGC:-}
+      GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
+      SLUICE_PPROF_ADDR: ${SLUICE_PPROF_ADDR:-}
+    healthcheck:
+      test: ["CMD", "/sluice", "-readycheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    networks: [loadtest]
+
+  # A TCP proxy between the runner and Sluice, for the reconnect profile's cut
+  # mode: dropping its connections ends every stream without server_shutdown,
+  # as a reverse proxy's reload or restart does.
+  proxy:
+    <<: *loadtest
+    profiles: [reconnect]
+    command: ["proxy"]
+    restart: unless-stopped
+    user: "0:0"
+    mem_limit: 1g
+    cpuset: ${PROXY_CPUSET:-}
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      net.core.somaxconn: 65535
+    environment:
+      PROXY_LISTEN: 0.0.0.0:4000
+      PROXY_UPSTREAM: sluice-rooms:4000
+      PROXY_CONTROL: 0.0.0.0:9000
+    depends_on:
+      sluice-rooms: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9000/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
     networks: [loadtest]
 
   runner-rls-a:
@@ -325,6 +540,55 @@ services:
       LOAD_SCENARIO: idle
       LOAD_IDLE_HOLD: ${LOAD_IDLE_HOLD:-60s}
       SLUICE_URL: http://sluice-rls:4000/sluice/v1
+
+  runner-rooms:
+    <<: *runner-rooms
+    profiles: [rooms]
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: rooms
+      SLUICE_URL: http://sluice-rooms:4000/sluice/v1
+
+  runner-bigtxn:
+    <<: *runner-rooms
+    profiles: [bigtxn]
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: bigtxn
+      SLUICE_URL: http://sluice-rooms:4000/sluice/v1
+
+  runner-reconnect:
+    <<: *runner-rooms
+    profiles: [reconnect]
+    depends_on:
+      db: { condition: service_healthy }
+      jwks: { condition: service_healthy }
+      issuer: { condition: service_healthy }
+      sluice-rooms: { condition: service_healthy }
+      proxy: { condition: service_healthy }
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: reconnect
+      # Streams and control requests go through the proxy, as through a
+      # gateway; metrics are read from Sluice directly.
+      SLUICE_URL: http://proxy:4000/sluice/v1
+      LOAD_PROXY_CONTROL: http://proxy:9000
+
+  runner-calibrate:
+    <<: *runner-rooms
+    profiles: [calibrate]
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: calibrate
+      SLUICE_URL: http://sluice-rooms:4000/sluice/v1
+
+  runner-ramp:
+    <<: *runner-rooms
+    profiles: [ramp]
+    environment:
+      <<: *rooms-env
+      LOAD_SCENARIO: ramp
+      SLUICE_URL: http://sluice-rooms:4000/sluice/v1
 
 volumes:
   db_data:

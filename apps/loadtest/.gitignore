@@ -3,3 +3,12 @@ results/*.json
 results/*.md
 results/*.txt
 !results/.gitkeep
+results/logs/
+.build/
+# Runs kept under results/: Markdown reports in clear, raw JSON reports
+# compressed (gzip -9n → .json.gz). Profiles from the pprof runs are large
+# binaries kept out of git (locally, or attached to a release).
+results/**/*.json
+results/**/*.pprof
+# The queue's console output; queue.log keeps what ran.
+results/**/*-console.log
