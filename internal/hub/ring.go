@@ -223,14 +223,18 @@ func (r *Rings) Sweep() {
 // disabled, `from` predates the start of replication, or an entry with a commit
 // LSN >= from was removed.
 func (r *Rings) Replay(oid uint32, from uint64) (entries []RingEntry, ok bool) {
-	entries, _, ok = r.ReplayThrough(oid, from)
+	entries, _, ok = r.ReplayThrough(oid, from, nil)
 	return entries, ok
 }
 
 // ReplayThrough is Replay that also returns the append order the buffer had
 // reached: every change appended up to it is accounted for, and Since takes
 // over from there.
-func (r *Rings) ReplayThrough(oid uint32, from uint64) (entries []RingEntry, through uint64, ok bool) {
+//
+// match, when not nil, keeps only the changes it accepts. It runs under the
+// buffer's lock, so it must be cheap: it saves copying a whole table's changes
+// for each subscription that resumes, which thousands do at once after a cut.
+func (r *Rings) ReplayThrough(oid uint32, from uint64, match func(*RingEntry) bool) (entries []RingEntry, through uint64, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if !r.coversLocked(oid, from) {
@@ -238,7 +242,7 @@ func (r *Rings) ReplayThrough(oid uint32, from uint64) (entries []RingEntry, thr
 	}
 	if rg := r.rings[oid]; rg != nil {
 		for i := 0; i < rg.size; i++ {
-			if e := rg.at(i); e.LSN >= from {
+			if e := rg.at(i); e.LSN >= from && (match == nil || match(e)) {
 				entries = append(entries, *e)
 			}
 		}
@@ -261,10 +265,11 @@ func (r *Rings) coversLocked(oid uint32, from uint64) bool {
 	return rg == nil || rg.evicted < from
 }
 
-// Since returns a relation's changes appended after `after`, in append order,
-// and the append order the buffer has reached. ok is false when one of them
-// was already removed.
-func (r *Rings) Since(oid uint32, after uint64) (entries []RingEntry, through uint64, ok bool) {
+// Since returns a relation's changes appended after `after` that match keeps
+// (all of them when it is nil, as for ReplayThrough), in append order, and the
+// append order the buffer has reached. ok is false when one of them was
+// already removed.
+func (r *Rings) Since(oid uint32, after uint64, match func(*RingEntry) bool) (entries []RingEntry, through uint64, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rg := r.rings[oid]
@@ -279,7 +284,9 @@ func (r *Rings) Since(oid uint32, after uint64) (entries []RingEntry, through ui
 		first--
 	}
 	for i := first; i < rg.size; i++ {
-		entries = append(entries, *rg.at(i))
+		if e := rg.at(i); match == nil || match(e) {
+			entries = append(entries, *e)
+		}
 	}
 	return entries, r.seq, true
 }

@@ -101,3 +101,36 @@ func TestReplayKeepsToTheShapesOps(t *testing.T) {
 		t.Fatalf("replayed %v to a shape of inserts, want [INSERT]", ops)
 	}
 }
+
+// A resume copies from the buffer only the changes the reader would route to
+// the shape: those holding its routing key's constant in the new or the old
+// row, and those holding the column in neither. Thousands of subscriptions
+// resume at once after a cut, and each copied every change to its table.
+func TestResumeCopiesOnlyTheShapesChanges(t *testing.T) {
+	s, wal := resumeServer(t, 0)
+	unchanged := &pgoutput.Tuple{Columns: []pgoutput.Column{
+		{Kind: pgoutput.ColText, Data: []byte("5")}, {Kind: pgoutput.ColUnchanged}, {Kind: pgoutput.ColText, Data: []byte("t")}}}
+	for i, m := range []*pgoutput.Message{
+		{Type: pgoutput.MsgInsert, New: row("1", "42", "t")},
+		{Type: pgoutput.MsgInsert, New: row("2", "99", "t")},
+		{Type: pgoutput.MsgUpdate, Old: row("3", "99", "t"), New: row("3", "42", "t")}, // enters project 42
+		{Type: pgoutput.MsgUpdate, Old: row("4", "42", "t"), New: row("4", "99", "t")}, // leaves it
+		{Type: pgoutput.MsgUpdate, New: unchanged},                                     // project_id not in the WAL
+		{Type: pgoutput.MsgInsert, New: row("6", "99", "t")},
+	} {
+		m.RelationOID = 100
+		if err := s.OnChange(m, wal, uint64(0x201+i), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := s.hub.Open("n1.copy", "", authz.Identity{Sub: "u1", Role: "authenticated"})
+	resumeDocs(t, s, st, nil)
+	got, _, ok := s.hub.Rings().ReplayThrough(100, 0x201, routedTo(s.reg.Get(st.StreamID(), "docs")))
+	var lsns []string
+	for _, e := range got {
+		lsns = append(lsns, fmt.Sprintf("%x", e.LSN))
+	}
+	if want := "[201 203 204 205]"; !ok || fmt.Sprint(lsns) != want {
+		t.Fatalf("copied %v (ok %v), want %s", lsns, ok, want)
+	}
+}

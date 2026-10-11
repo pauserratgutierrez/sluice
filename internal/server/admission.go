@@ -24,17 +24,6 @@ import (
 // That floor only changes at a collection, and a reconnect storm opens
 // thousands of streams between two. Projecting them at the measured floor per
 // stream is what keeps a storm from overshooting.
-//
-// The streams that fit come back: up to the most streams the node held below
-// the threshold at a collection in the last fitMemory, admission only asks
-// that the floor the last collection measured stay below the threshold plus
-// reconnectMargin. A reconnect measures the floor while it runs, and its own
-// garbage, counted live because it was allocated during the collection, and
-// the connections of clients not yet admitted lift it past the threshold
-// every few collections. Measured: 0.51-0.55 at 4,740-5,134 of the 5,759
-// streams that had fit, which held the refill to 84% after a minute.
-// Projecting the rest at the floor per stream such a collection gives would
-// overshoot the margin too, so up to that count the count is the bound.
 type admission struct {
 	threshold float64      // share of the memory limit; 0 turns admission off
 	limit     func() int64 // the Go memory limit, math.MaxInt64 when none
@@ -46,8 +35,6 @@ type admission struct {
 	streamsAtGC int
 	refusing    bool
 	overAt      time.Time // the last projection at or above the threshold
-	fitStreams  int       // the most streams held below the threshold since fitAt
-	fitAt       time.Time
 
 	now      func() time.Time
 	collect  func()
@@ -65,14 +52,6 @@ const admissionHysteresis = 0.05
 // settled between the threshold and the hysteresis, and without this
 // admission stayed shut at 4,853 of the 5,610 streams that had fit.
 const admissionHold = 10 * time.Second
-
-// fitMemory is how long the node remembers the most streams it held, and
-// reconnectMargin how far past the threshold the measured floor may be while
-// streams come back up to that count.
-const (
-	fitMemory       = 5 * time.Minute
-	reconnectMargin = 0.1
-)
 
 // minFloorShare is the least of the measured floor a projection keeps after
 // streams close: some of it is the process, not the streams.
@@ -153,9 +132,6 @@ func (a *admission) enabled() bool {
 // disconnect the floor that held the departed streams does not refuse their
 // reconnections until the next collection. It never goes below
 // minFloorShare of the measured floor, since part of it is not the streams'.
-//
-// Below the most streams held in the last fitMemory, the measured floor is held
-// to the threshold plus reconnectMargin instead (see admission).
 func (a *admission) admit(open, pending int) (bool, float64) {
 	if !a.enabled() {
 		return true, 0
@@ -165,13 +141,8 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	now := a.now()
 	if gcs != a.lastGC {
 		a.lastGC, a.liveAtGC, a.streamsAtGC = gcs, live, open
-		// Only a count held below the threshold fit.
-		if float64(live)/float64(limit) < a.threshold && (open >= a.fitStreams || now.Sub(a.fitAt) > fitMemory) {
-			a.fitStreams, a.fitAt = open, now
-		}
 	}
 	perStream := float64(defaultStreamBytes)
 	if a.streamsAtGC >= minStreamsToMeasure {
@@ -181,8 +152,7 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 	projected := float64(a.liveAtGC) + float64(streams-a.streamsAtGC)*perStream
 	projected = max(projected, minFloorShare*float64(a.liveAtGC))
 	share := projected / float64(limit)
-	fits := streams < a.fitStreams && now.Sub(a.fitAt) <= fitMemory &&
-		float64(a.liveAtGC)/float64(limit) < a.threshold+reconnectMargin
+	now := a.now()
 	switch {
 	case share >= a.threshold:
 		a.refusing, a.overAt = true, now
@@ -197,7 +167,7 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 			go a.collect()
 		}
 	}
-	return fits || !a.refusing, share
+	return !a.refusing, share
 }
 
 // withIndexGauges sets the gauges of the hold and subscription indexes and

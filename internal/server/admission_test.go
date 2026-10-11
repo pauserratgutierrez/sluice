@@ -188,39 +188,6 @@ func TestAdmissionResumesAfterAPeakSettlesWithinTheHysteresis(t *testing.T) {
 	}
 }
 
-// After a cut the streams that fit come back, though the reconnect's garbage
-// lifts the floor past the threshold: up to the most streams held in the last
-// fitMemory, the floor measured only has to stay below the threshold plus
-// reconnectMargin. Past that count, or that long after, the threshold holds.
-func TestAdmissionLetsTheStreamsThatFitBack(t *testing.T) {
-	m := &fakeMemory{limit: 1000 * mib, now: time.Unix(1000, 0)}
-	a := m.admission(0.5)
-	m.collect(490 * mib) // 5,000 streams: 0.49
-	if ok, _ := a.admit(5000, 0); !ok {
-		t.Fatal("at 0.49 a new stream must be admitted")
-	}
-	m.now = m.now.Add(20 * time.Second)
-	m.collect(550 * mib) // mid-reconnect: 0.55 at 4,000 streams
-	if ok, share := a.admit(4000, 0); !ok {
-		t.Fatalf("4,000 of the 5,000 streams that fit, measured at 0.55 (projected %.2f): must be admitted", share)
-	}
-	if ok, _ := a.admit(4000, 999); !ok {
-		t.Fatal("the 5,000th stream must be admitted")
-	}
-	if ok, _ := a.admit(4000, 1000); ok {
-		t.Fatal("past the 5,000 streams that fit, the threshold holds")
-	}
-	m.collect(610 * mib)
-	if ok, _ := a.admit(4000, 0); ok {
-		t.Fatal("a floor measured past the threshold plus the margin must refuse")
-	}
-	m.now = m.now.Add(fitMemory)
-	m.collect(550 * mib)
-	if ok, _ := a.admit(4000, 0); ok {
-		t.Fatal("fitMemory after the node held 5,000 streams, the threshold holds again")
-	}
-}
-
 // Refusing with far fewer streams than the last collection saw asks for a
 // collection, at most one every staleGCInterval.
 func TestAdmissionForcesACollectionWhenItsFloorIsStale(t *testing.T) {

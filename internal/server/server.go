@@ -41,6 +41,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
+	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 	"github.com/pauserratgutierrez/sluice/internal/reader"
 	"github.com/pauserratgutierrez/sluice/internal/registry"
 	"github.com/pauserratgutierrez/sluice/internal/requestid"
@@ -984,12 +985,17 @@ func (s *Server) subscribeShape(
 			res.Resumed = new(false)
 			return res
 		}
-		entries, through, ok := s.hub.Rings().ReplayThrough(rel.OID, from)
+		entries, through, ok := s.hub.Rings().ReplayThrough(rel.OID, from, routedTo(sub))
 		res.Resumed = &ok
 		if !ok {
 			// Removed since Covers looked. The client reads its state again;
 			// it still gets what the reader kept from it since the install.
 			entries, through = nil, installedAt
+		}
+		if len(entries) == 0 {
+			if _, _, _, done := s.handOver(sub, through); done {
+				return res
+			}
 		}
 		// Off the request: a replay waits for the writer to make room, and
 		// on a stream being opened the writer only starts after the ready
@@ -1013,12 +1019,8 @@ func (s *Server) catchUp(sub *registry.Subscription, entries []hub.RingEntry, th
 		if !s.replay(sub, entries) {
 			return
 		}
-		var ok bool
-		next := through
-		if sub.Backfill.CatchUp(func() (uint64, bool) {
-			entries, next, ok = s.hub.Rings().Since(sub.Relation.OID, through)
-			return next, ok && len(entries) == 0
-		}) {
+		rest, next, ok, done := s.handOver(sub, through)
+		if done {
 			return
 		}
 		if !ok {
@@ -1027,7 +1029,54 @@ func (s *Server) catchUp(sub *registry.Subscription, entries []hub.RingEntry, th
 			}
 			return
 		}
-		through = next
+		entries, through = rest, next
+	}
+}
+
+// handOver lets the reader take a resumed subscription over when the buffer
+// has taken nothing for it since through; otherwise it returns what it took,
+// and the append order reached. done is also true once the subscription is
+// gone.
+func (s *Server) handOver(sub *registry.Subscription, through uint64) (rest []hub.RingEntry, next uint64, ok, done bool) {
+	cur := s.reg.Get(sub.Sink.StreamID(), sub.Label)
+	if cur == nil {
+		return nil, through, true, true
+	}
+	next, ok = through, true
+	done = sub.Backfill.CatchUp(func() (uint64, bool) {
+		rest, next, ok = s.hub.Rings().Since(sub.Relation.OID, through, routedTo(cur))
+		return next, ok && len(rest) == 0
+	})
+	return rest, next, ok, done
+}
+
+// routedTo keeps the buffered changes the reader would route to a subscription,
+// as Registry.Candidates does: those whose new or old row holds its routing
+// key's constant, or that hold that column in neither. Nil, keeping every
+// change, for an unindexed subscription.
+//
+// Measured before it: each subscription that resumed copied every change to
+// its table since its position, 250 of them for a room's messages, and the
+// thousands that resume after a cut held tens of MiB while they waited for
+// their queues; with no admission to spread them, a node of 512 MB went past
+// its memory limit.
+func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
+	col := sub.RoutingKey
+	if col == "" {
+		return nil
+	}
+	want := sub.Filter.Equalities[col].String()
+	return func(e *hub.RingEntry) bool {
+		known := false
+		for _, t := range [2]*pgoutput.Tuple{e.New, e.Old} {
+			if v, ok := (tupleRow{rel: e.Relation, t: t}).Column(col); ok {
+				if v.String() == want {
+					return true
+				}
+				known = true
+			}
+		}
+		return !known
 	}
 }
 
@@ -1040,7 +1089,7 @@ func errResumeTooOld(label string) event.Error {
 // replayFrom re-delivers buffered changes at or after `from`. It returns false,
 // delivering nothing, when the buffer cannot cover it.
 func (s *Server) replayFrom(sub *registry.Subscription, from uint64) bool {
-	entries, ok := s.hub.Rings().Replay(sub.Relation.OID, from)
+	entries, _, ok := s.hub.Rings().ReplayThrough(sub.Relation.OID, from, routedTo(sub))
 	if ok {
 		s.replay(sub, entries)
 	}

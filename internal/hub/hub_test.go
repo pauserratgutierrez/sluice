@@ -436,19 +436,19 @@ func TestRingSinceReturnsWhatWasAppendedAfter(t *testing.T) {
 	r.Append(ringEntry(20))
 	r.Append(other)
 	r.Append(ringEntry(30))
-	got, next, ok := r.Since(1, through)
+	got, next, ok := r.Since(1, through, nil)
 	if !ok || len(got) != 2 || got[0].LSN != 20 || got[1].LSN != 30 {
 		t.Fatalf("since %d = %v ok=%v, want LSNs 20 and 30 of relation 1 only", through, lsns(got), ok)
 	}
 	if next != r.Seq() {
 		t.Fatalf("since returned %d, want the append order reached, %d", next, r.Seq())
 	}
-	if got, _, ok := r.Since(1, next); !ok || len(got) != 0 {
+	if got, _, ok := r.Since(1, next, nil); !ok || len(got) != 0 {
 		t.Fatalf("nothing appended since: %v ok=%v", lsns(got), ok)
 	}
 	r.Append(ringEntry(40))
 	r.Append(ringEntry(50)) // relation 1 holds 3: the change at 10 and then 20 are gone
-	if _, _, ok := r.Since(1, through); ok {
+	if _, _, ok := r.Since(1, through, nil); ok {
 		t.Fatal("the change at 20, appended after the point asked for, was dropped: since must report a gap")
 	}
 }
