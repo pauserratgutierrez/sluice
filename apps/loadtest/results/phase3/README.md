@@ -100,7 +100,7 @@ No run was killed, and every refusal carried `Retry-After`. What each run found:
 - **The indexes end the size they started.** Only a list's spare capacity grew, by 56 slots.
 - **The live heap.** After each collection it stayed between 52.5 and 54.8 MiB, with single readings up to 79 MiB: garbage allocated during a collection, gone at the next. Its per-minute minimum went from 52.3 MiB (minute 1) to 53.3–53.9 MiB (minutes 26–30), 1–1.5 MiB in 30 minutes.
   - On 0.8.1, the same tier with tokens every 15 minutes grew 39% in 29 minutes (`../phase2/README.md`).
-  - Whether the 1–1.5 MiB is warm-up or a small retention cannot be told from 30 minutes. The overnight run is prepared for that.
+  - Whether the 1–1.5 MiB was warm-up or a small retention could not be told from 30 minutes. The overnight run below says warm-up.
 - **The memory a collection cannot free** went from 92–105 MiB (minutes 1–14) to 105–118 MiB (minutes 16–30). It is noisy, since it includes heap fragmentation, and it stepped up after the cut. Goroutines (~3,080) and RSS (175–230 MiB) stayed flat.
 - **Counters:**
   - 900 `churned`;
@@ -109,7 +109,15 @@ No run was killed, and every refusal carried `Retry-After`. What each run found:
   - 2,469 `msg_duplicate` (at-least-once delivery on resume).
 - **Resume after the cut.** `room_members` resumed 3,884 times and could not resume 8,116 times. At 337 changes a second, its 4,096-event buffer covers about 12 s, less than the cut plus backoff. `room_messages` and `notifications` always resumed.
 
-**Overnight run, prepared and not run** (about 8 h 10 min): `scripts/queue.sh plans/phase3-stability-night.plan results/phase3/raw`, after `docker build --build-arg VERSION=0.9.0-rc -t sluice:p3-final ../sluice-0.8.1` (branch `phase3`). It has tokens every 15 min, the same churn, and a cut every hour.
+**Overnight run** (`p3-stability-8h`, `../../plans/phase3-stability-night.plan`, image `sluice:p3-final7` = branch `phase3` at `e76279f`):
+- the same tier and limits (1,500 streams, 1 CPU, 512 MB, automatic admission), for 8 h 0 min of steady phase;
+- tokens renewed every 15 minutes (47,902 renewals), 2% of the streams ended and reopened every minute (14,400), and a network cut every hour (7).
+
+**Verdict:** pass.
+- **Memory.** The live heap after collections, with all 1,500 streams open, had a median of 53.6 MiB in the first hour and 54.1–54.2 MiB in every hour after; its 10th percentile went from 52.9 to 53.4 MiB in 8 hours. The memory a collection cannot free stayed at 69–70 MiB, RSS at 166–170 MiB, Go memory at 156–159 of 461 MiB, and goroutines at about 3,025. The indexes ended the size they started (10,500 holds and subscriptions); only a hold list's spare capacity grew, by 168 slots. The 1–1.5 MiB the 30-minute run left open was warm-up.
+- **Lag.** No backlog at any point; the slot's lag peaked at 2.15 MiB. Message p95 9.5 ms and p99 17.8 ms over the 8 hours (2.87 million messages); `/token` p95 130 ms. Collector pauses reached 48–51 ms at four of the seven reconnects, and stayed under 7 ms otherwise.
+- **Errors.** 6 `issuer_unavailable` (one cut), 2 `/token` calls cut by a reconnect, none refused for capacity, no stream closed as lagging. Every message, member update and typing event arrived (100–101%: replays after a cut count twice).
+- **Reconnections.** All 7 cuts brought every one of the 1,500 streams back, within 14.6–15.1 s (median 8.3–8.6 s). `room_messages` and `notifications` resumed every time (24,900 each); `room_members`, at 337 changes a second, resumed 70,037 times and could not 54,463 times, as its buffer covers about 12 s.
 
 
 ## Not done in this phase
@@ -130,7 +138,7 @@ No run was killed, and every refusal carried `Retry-After`. What each run found:
   - `phase3-token.plan`, `v0.8.2.plan`;
   - `phase3-holds.plan` (stopped during its first run, whose partial report is kept);
   - `phase3-admission.plan`, `phase3-item7.plan`;
-  - `phase3-stability.plan`, and `phase3-stability-night.plan` (prepared, not run);
+  - `phase3-stability.plan` and `phase3-stability-night.plan`;
   - `phase3-storm.plan` (the storm at the limit).
 - Sluice branches:
   - `fix/token-filter`: 0.8.2, merged and released.
