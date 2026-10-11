@@ -249,15 +249,23 @@ func TestHookRecheckWithoutVerdictKeepsTheJoin(t *testing.T) {
 // channel up; a denial is still final.
 func TestHookJoinWithoutVerdictIsRetryable(t *testing.T) {
 	h := newFakeHook(t, nil)
-	s, _ := hookTestServer(t, h)
+	s, clock := hookTestServer(t, h)
 	h.status.Store(http.StatusServiceUnavailable)
 	_, res := joinChat(t, s, alice)
 	if res.OK || res.Error == nil || res.Error.Code != "channel_hook_unavailable" || !res.Error.Retryable {
 		t.Fatalf("a join during an endpoint outage: %+v, want a retryable channel_hook_unavailable", res.Error)
 	}
-	if ms := res.Error.RetryAfterMs; ms < hookRetryTTL.Milliseconds() || ms > (issuerRetryMin+issuerRetrySpread).Milliseconds() {
-		t.Fatalf("retry_after_ms %d, want between the cached answer's %d and %d", ms,
-			hookRetryTTL.Milliseconds(), (issuerRetryMin + issuerRetrySpread).Milliseconds())
+	// The cached answer lasts hookRetryTTL less up to a fifth (hookJitter).
+	ms := res.Error.RetryAfterMs
+	if lo, hi := (hookRetryTTL - hookRetryTTL/5).Milliseconds(), (issuerRetryMin + issuerRetrySpread).Milliseconds(); ms < lo || ms > hi {
+		t.Fatalf("retry_after_ms %d, want between %d and %d", ms, lo, hi)
+	}
+	// By then the cached answer has expired, so the retry asks the endpoint
+	// again. One millisecond more for the truncation to whole milliseconds.
+	calls := h.calls.Load()
+	clock.Advance(time.Duration(ms+1) * time.Millisecond)
+	if _, res := joinChat(t, s, alice); res.OK || h.calls.Load() != calls+1 {
+		t.Fatalf("the retry after retry_after_ms: ok %v, %d endpoint calls, want %d", res.OK, h.calls.Load(), calls+1)
 	}
 
 	h.status.Store(http.StatusForbidden)
