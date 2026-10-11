@@ -15,7 +15,8 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
   - Capacity is decided before the token is verified. Refusals are logged once a second with their count (`streams refused`) instead of once per request.
   - A positive `SLUICE_MAX_STREAMS` still caps the count besides, with the same count (open and opening) and the same `Retry-After`.
   - With no memory limit known and `SLUICE_MAX_STREAMS=0`, nothing bounds streams, and the log warns at startup.
-  - Why `0.5`: with 12,000 streams offered to 1 CPU and 512 MB, `0.5` admitted 3,022 and delivered messages at p95 5 ms. A threshold of `0.85` on the live heap alone admitted 7,215, but the collector then ran without pause and messages arrived 30–60 s late. On 0.8.x, with a cap above what fit, the process was killed for memory 11 times in 15 minutes.
+  - Why `0.5`: with 6,000 streams offered to 1 CPU and 512 MB, `0.5` admitted 5,767, about 42 KiB each of memory a collection cannot free, and delivered messages at p95 9 ms, with RSS peaking at 452 MiB. A threshold of `0.85` on the live heap alone admitted 7,215 of 12,000, but the collector then ran without pause and messages arrived 30–60 s late. On 0.8.x, with a cap above what fit, the process was killed for memory 11 times in 15 minutes.
+  - After a reconnect of every stream, a node admission filled comes back to 88% within a minute and 96% within 4 minutes, not all the way. For a few minutes each stream holds more memory: the storm's garbage, and goroutine stacks grown during it (85 MiB of stacks for 5,134 streams after the cut, 70 MiB for 5,767 before). With `SLUICE_MAX_STREAMS` at 85% of what admission let in (4,900), 96% were back within 30 s and every stream within 55 s.
 - Issuer mode: **a hold is listed under whichever of its equally good columns has the shortest lists.** Sluice counts, per hold table, how many holds share each value of each column. 0.8.1 took the first column in the filter, so a membership written scope first (`project_id=eq.42,user_id=eq.<sub>`) checked each change to a member's row against every hold in the project. The order of a hold's columns no longer matters, and holds already listed move at their next `/token`.
 - A hold check that could not be made now drops the shape with the retryable `hold_check_unavailable` and a `retry_after_ms`, at subscribe and at `POST /token`. That covers a request cancelled or timed out, or a database failure. It was `shape_not_authorized`, which clients do not retry, so a `/token` that timed out under load lost its shapes for good. A hold row that does not exist is still `shape_not_authorized`.
 - Calls to the shape issuer and to channel hooks carry an `Idempotency-Key` header. Idle connections to them close after `SLUICE_ISSUER_IDLE_TIMEOUT` (new; default 4 s; Go's default was 90 s).
@@ -37,6 +38,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 - **A resumed shape could get changes out of commit order.** Its replay ran off the request while the reader went on delivering, so a change committed during the replay could arrive ahead of older ones being replayed. A client that upserts by key could then apply an older row over a newer one. The load test counted 279 such jumps in a room's message sequence after 4,255 resumes, in a reconnect of 5,610 streams on 1 CPU. Changes committed during a replay now reach the shape after it. Snapshots are unchanged: their rows, and the replay that follows them, are still sent while live changes arrive.
 - A shape installed while the reader was dispatching a change could miss that change: it was routed before the shape existed and buffered after the shape's replay had read the buffer. Changes are now buffered before they are routed.
 - A replay delivered inserts and deletes to shapes whose `ops` left them out. It keeps to the shape's `ops` now, as live delivery does.
+- A channel join the hook gave no verdict on (a timeout, a `5xx`, an unreadable body) was refused with `channel_not_authorized`, which clients do not retry, so the channel was lost until the client joined again. In the same reconnect, 405 clients lost their room's channel this way. It is now `channel_hook_unavailable`, retryable, with a `retry_after_ms` of 1 to 5 s and never before the cached answer expires. A denial is still `channel_not_authorized`.
 
 ### Performance
 
@@ -48,6 +50,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 
 - If you set `SLUICE_MAX_STREAMS=0`, it now admits streams instead of refusing them all.
 - Give the container a memory limit (or set `GOMEMLIMIT`) so that automatic admission has something to measure against. Watch `sluice_streams_refused_total` and `sluice_reader_lag_seconds`.
+- To have every stream back within a minute of a reconnect, cap streams (`SLUICE_MAX_STREAMS`) at about 85% of what admission lets in under your load. Admission alone runs a full node at its threshold, where a reconnect leaves about a tenth waiting for minutes.
 
 ### For issuers
 
@@ -59,6 +62,7 @@ Streams admitted by memory, hold checks that no longer depend on filter order or
 - The SDK waits for the longer of a `429` or `503`'s `Retry-After` (plus up to a tenth at random) and its own backoff step before opening the stream again. Before, it applied only its backoff, which could come back after a few milliseconds; a refusal that lasts is now retried less and less often.
 - `resumed: false` can follow a short disconnect too, for a table busy enough that the resume buffer, which counts every change to it, reaches back only seconds. The READMEs say so now, with measured coverage.
 - `hold_check_unavailable` is a new retryable code, handled like `issuer_unavailable`.
+- `channel_hook_unavailable` is too, for a channel join the hook gave no verdict on. The SDK's channel asks again after `retry_after_ms` and can send once the join is accepted. A channel that a retryable refusal ended did not recover before.
 
 ### Measured
 
@@ -70,7 +74,7 @@ The load test's rooms workload: 7 shapes and a hook channel per stream, membersh
 | Holds written room first | 365 ms per 1,000 changes (1,500 streams, 1 CPU) | the same as member first (microbenchmark below) |
 | Live heap at 12,000 streams | 546–572 MiB (46–48 KiB per stream) | 419 MiB (36 KiB per stream) |
 | Go memory at 12,000 streams | 1,291 MiB | 1,027 MiB |
-| 12,000 streams offered to 1 CPU and 512 MB | killed for memory 11 times (cap 15,000) | 3,022 admitted, message p95 5 ms, no kill |
+| More streams offered than fit in 1 CPU and 512 MB | 12,000 offered, cap 15,000: killed for memory 11 times | 6,000 offered: 5,767 admitted, message p95 9 ms, no kill, RSS peak 452 MiB |
 | A member's update checked against holds (microbenchmark, 400 rooms × 28 streams × 7 holds) | 107 µs room first, 3.8 µs member first | 4.8 µs, 4.3 µs |
 | `/token` (`Replace`) while the reader checks holds back to back (microbenchmark, Linux) | mean 12 µs, p99.9 2.1 ms (with item 2 only) | mean 2.4 µs, p99.9 0.35 ms |
 

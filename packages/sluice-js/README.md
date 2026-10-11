@@ -209,6 +209,7 @@ Subscription errors go to that subscription's `onError`; stream errors go to the
 | `invalid_filter`, `invalid_columns` | unknown column or bad value |
 | `unknown_namespace` | the channel's namespace is not configured |
 | `channel_not_authorized` | the channel was refused, or its join was revoked later |
+| `channel_hook_unavailable` | the channel's hook gave no verdict on the join (retryable); the client asks again after `retryAfterMs`, and `send` works once the join is accepted |
 | `resume_too_old` | the buffer no longer reaches an initial snapshot's floor; resnapshot |
 | `snapshot_failed` | the initial snapshot failed (retryable) |
 | `stream_lagging` | the client did not keep up; the stream reconnects with a resume |

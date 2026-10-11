@@ -798,6 +798,45 @@ test('a channel refused when a reconnect resends it reports the error', async ()
   client.close()
 })
 
+// A hook that gave no verdict refuses the join retryably: the client asks
+// again after retry_after_ms, and the channel sends once it is accepted, both
+// for the first join and for one a reconnect resent.
+test('a channel join the hook could not decide is asked for again and then sends', async () => {
+  let streams = 0
+  const calls: string[] = []
+  const unavailable = (sub: string) =>
+    ({ sub, ok: false, error: { code: 'channel_hook_unavailable', message: 'no verdict', retryable: true, retry_after_ms: 10 } })
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    fetch: async (input, init) => {
+      const path = new URL(String(input)).pathname.replace('/sluice/v1', '')
+      calls.push(path)
+      if (path === '/publish') return new Response(JSON.stringify({ delivered: 1 }))
+      const sub = JSON.parse(String(init?.body)).subscriptions[0].sub
+      if (path === '/subscribe') return new Response(JSON.stringify({ results: [{ sub, ok: true }] }))
+      streams++
+      const ready = 'event: ready\ndata: ' + JSON.stringify({ stream_id: 'n1.x', subscriptions: [unavailable(sub)] }) + '\n\n'
+      // The first stream ends after the retry, so a reconnect resends the join.
+      return sse(streams === 1 ? ready : openStream(ready))
+    },
+  })
+  const channel = client.channel('chat:1')
+  const errors: string[] = []
+  channel.onError((e) => errors.push(e.code))
+  const first = await channel.subscribe()
+  assert.equal(first.ok, false)
+  assert.equal(first.error?.retryable, true)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.ok(calls.includes('/subscribe'), 'asked for again')
+  assert.ok(streams >= 2, 'reconnected')
+  assert.deepEqual(errors, ['channel_hook_unavailable'], 'the refusal after the reconnect is reported')
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(await channel.send('typing', {}), 1)
+  client.close()
+})
+
 // The server closes a stream whose token expired; the reconnect with the same
 // token is refused, so the client stops. A refreshed token brings it back.
 test('setAuth reconnects a stream that stopped on an expired token', async () => {

@@ -88,6 +88,10 @@ export class Channel<M = Json> {
    * The server may later remove the join, for example when a hook no longer
    * allows it (`channel_not_authorized`). `onError` then receives the error,
    * `send` rejects, and `subscribe()` may be called again to rejoin.
+   *
+   * A join refused retryably (`channel_hook_unavailable`: the hook gave no
+   * verdict) is asked for again after `retry_after_ms`, and `send` works once
+   * it is accepted.
    */
   async subscribe(): Promise<ChannelSubscription> {
     let resolved: SubscriptionResult | undefined
@@ -97,8 +101,12 @@ export class Channel<M = Json> {
       onResult: (r) => {
         if (!settled) {
           resolved = r
-        } else if (!r.ok) {
-          // Refused when a reconnect resent the join.
+        } else if (r.ok) {
+          // A join refused retryably, asked for again and accepted.
+          this.subscribed = true
+        } else {
+          // Refused when a reconnect resent the join. A retryable refusal is
+          // asked for again after retry_after_ms.
           this.ended(new SluiceError(r.error ?? { code: 'channel_not_authorized', message: 'the channel join was refused' }))
         }
       },

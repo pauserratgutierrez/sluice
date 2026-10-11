@@ -244,6 +244,29 @@ func TestHookRecheckWithoutVerdictKeepsTheJoin(t *testing.T) {
 	}
 }
 
+// A join the endpoint gave no verdict on is refused retryably, not before the
+// cached answer expires, so the client asks again rather than giving the
+// channel up; a denial is still final.
+func TestHookJoinWithoutVerdictIsRetryable(t *testing.T) {
+	h := newFakeHook(t, nil)
+	s, _ := hookTestServer(t, h)
+	h.status.Store(http.StatusServiceUnavailable)
+	_, res := joinChat(t, s, alice)
+	if res.OK || res.Error == nil || res.Error.Code != "channel_hook_unavailable" || !res.Error.Retryable {
+		t.Fatalf("a join during an endpoint outage: %+v, want a retryable channel_hook_unavailable", res.Error)
+	}
+	if ms := res.Error.RetryAfterMs; ms < hookRetryTTL.Milliseconds() || ms > (issuerRetryMin+issuerRetrySpread).Milliseconds() {
+		t.Fatalf("retry_after_ms %d, want between the cached answer's %d and %d", ms,
+			hookRetryTTL.Milliseconds(), (issuerRetryMin + issuerRetrySpread).Milliseconds())
+	}
+
+	h.status.Store(http.StatusForbidden)
+	_, res = joinChat(t, s, bob)
+	if res.OK || res.Error == nil || res.Error.Code != "channel_not_authorized" || res.Error.Retryable {
+		t.Fatalf("a denied join: %+v, want channel_not_authorized, not retryable", res.Error)
+	}
+}
+
 // The periodic tick runs the re-checks.
 func TestRefreshLeasesRechecksHookChannels(t *testing.T) {
 	zero := 0

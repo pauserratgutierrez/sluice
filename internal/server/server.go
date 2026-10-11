@@ -1098,9 +1098,18 @@ func (s *Server) subscribeChannel(ctx context.Context, st *hub.Stream, id authz.
 		// cached for the session, so the caller going away must not leave a
 		// failed one behind. The call still carries the request's ID.
 		v := s.hooks.Authorize(requestid.With(s.ctx, requestid.From(ctx)), ch, id, spec.Channel, false)
+		if v.outcome == hookUnavailable {
+			// No verdict says nothing about the caller. The join is refused for
+			// now (fail closed) and retryable, like a shape the issuer could
+			// not decide, once the cached answer has expired.
+			delay := max(issuerRetryMin+rand.N(issuerRetrySpread), v.expires.Sub(s.hooks.now()))
+			res.Error = &event.Error{Code: "channel_hook_unavailable", Message: v.reason,
+				Retryable: true, RetryAfterMs: delay.Milliseconds()}
+			res.warn = true
+			return res
+		}
 		if !v.allowed() {
 			res.Error = &event.Error{Code: "channel_not_authorized", Message: v.reason}
-			res.warn = v.outcome == hookUnavailable
 			return res
 		}
 		recheckAt = v.expires
