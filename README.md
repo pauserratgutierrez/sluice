@@ -4,7 +4,7 @@ A realtime data-streaming server for PostgreSQL. It reads the write-ahead log th
 
 It is built to replace `supabase/realtime` in a self-hosted stack. It is not protocol-compatible with it, and it installs **nothing in the database**: no extensions, tables, functions or schemas.
 
-> **Status: working prototype.** Everything below is implemented and exercised by the suites in this repository against PostgreSQL 18.4, GoTrue, PostgREST and Caddy. It has not been burned in under production traffic. Planned work and known gaps are in [ROADMAP.md](ROADMAP.md).
+> **Status: working prototype.** Everything below is implemented and exercised by the suites in this repository against PostgreSQL 18.6, GoTrue, PostgREST and Caddy. It has not been burned in under production traffic. Planned work and known gaps are in [ROADMAP.md](ROADMAP.md).
 
 ## Contents
 
@@ -39,7 +39,7 @@ Two process-wide **shape oracles** decide what a shape may see:
 
 ## What PostgreSQL must provide
 
-Tested with PostgreSQL 18.4. The default `SLUICE_PROTO_VERSION=4` needs PostgreSQL 16 or newer; older versions are untested.
+Tested with PostgreSQL 18.6. The default `SLUICE_PROTO_VERSION=4` needs PostgreSQL 16 or newer; older versions are untested.
 
 ```sql
 -- server settings (wal_level needs a restart)
@@ -68,7 +68,7 @@ ALTER PUBLICATION sluice ADD TABLE public.documents;
 
 ### Harness
 
-`deploy/compose.yml` runs the plain `postgres:18.4-trixie` image, GoTrue (real ES256 tokens), PostgREST (the oracle the tests compare against), Caddy, the RLS-mode Sluice, and an issuer-mode Sluice with its stub issuer.
+`deploy/compose.yml` runs the plain `postgres:18.6-trixie` image, GoTrue (real ES256 tokens), PostgREST (the oracle the tests compare against), Caddy, the RLS-mode Sluice, and an issuer-mode Sluice with its stub issuer.
 
 ```bash
 cp .env.example .env

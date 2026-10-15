@@ -19,7 +19,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - **Snapshots are one query.** At most `SLUICE_SNAPSHOT_MAX_ROWS` rows, with `truncated` set when more matched; there is no paging.
 - **Snapshots for `BYPASSRLS` roles** need `sluice_authz` to be granted that role.
 - **Publication column lists are not validated.**
-- **Only PostgreSQL 18.4 is tested.** The default `SLUICE_PROTO_VERSION=4` needs 16 or newer.
+- **Only PostgreSQL 18.6 is tested.** The default `SLUICE_PROTO_VERSION=4` needs 16 or newer.
 - **`/metrics` is unauthenticated.**
 - **`/token` may change a stream's role** (the `sub` may not change, except from none).
 

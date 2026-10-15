@@ -2,6 +2,12 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.9.1
+
+### Fixed
+
+- **Creating the replication slot no longer holds back `VACUUM` on every table.** Sluice asked PostgreSQL for an exported snapshot it never read. While the slot was being created, which waits for every transaction open when it started, `VACUUM` could then neither remove nor freeze, in any table, rows newer than the oldest of those transactions. Sluice now asks for none (`NOEXPORT_SNAPSHOT`), so only the catalogs are held, as for any logical slot. The slot is created at the first start and when `SLUICE_SLOT_RECREATE` replaces it; it starts at the same point as before. On PostgreSQL 18.6, a `VACUUM (FREEZE)` run while the slot was being created froze 0 of 863 pages of a table written just before; it now freezes 863 of 863.
+
 ## 0.9.0
 
 Streams admitted by memory, hold checks that no longer depend on filter order or hold up `/token`, shared filters, and the reader's lag in seconds.

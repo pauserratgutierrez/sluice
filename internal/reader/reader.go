@@ -244,9 +244,14 @@ func (r *Reader) prepareSlot(ctx context.Context) error {
 	return nil
 }
 
+// createSlot asks for no exported snapshot, since Sluice never reads one. With
+// one, PostgreSQL holds back VACUUM on every table, not only the catalogs,
+// while it creates the slot, and creating it waits for every transaction open
+// when it started. NOEXPORT_SNAPSHOT is the legacy spelling of
+// (SNAPSHOT 'nothing'), which needs PostgreSQL 15 or newer.
 func (r *Reader) createSlot(ctx context.Context, conn *pgconn.PgConn) error {
 	if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.cfg.SlotName, "pgoutput",
-		pglogrepl.CreateReplicationSlotOptions{Temporary: false}); err != nil {
+		pglogrepl.CreateReplicationSlotOptions{Temporary: false, SnapshotAction: "NOEXPORT_SNAPSHOT"}); err != nil {
 		return fmt.Errorf("reader: create slot %q: %w", r.cfg.SlotName, err)
 	}
 	return nil
