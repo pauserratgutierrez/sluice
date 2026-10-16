@@ -250,11 +250,51 @@ func (r *Reader) prepareSlot(ctx context.Context) error {
 // when it started. NOEXPORT_SNAPSHOT is the legacy spelling of
 // (SNAPSHOT 'nothing'), which needs PostgreSQL 15 or newer.
 func (r *Reader) createSlot(ctx context.Context, conn *pgconn.PgConn) error {
+	done := make(chan struct{})
+	defer close(done)
+	go r.warnSlowCreate(ctx, conn.PID(), done)
 	if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.cfg.SlotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false, SnapshotAction: "NOEXPORT_SNAPSHOT"}); err != nil {
 		return fmt.Errorf("reader: create slot %q: %w", r.cfg.SlotName, err)
 	}
 	return nil
+}
+
+// slowCreateAfter is how long creating the slot may take before the log says
+// what it is waiting for, and how often it says so again after that.
+const (
+	slowCreateAfter = 10 * time.Second
+	slowCreateEvery = time.Minute
+)
+
+// warnSlowCreate logs, while the slot is being created, the sessions that
+// creating it waits for. It waits for every transaction that had an xid when
+// it started, so one long transaction, or one left idle in transaction, holds
+// it up, and every new stream is refused until replication starts.
+func (r *Reader) warnSlowCreate(ctx context.Context, pid uint32, done <-chan struct{}) {
+	started := time.Now()
+	t := time.NewTimer(slowCreateAfter)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		// A query that fails only leaves the pids out.
+		var blocking []int32
+		_ = r.pool.QueryRow(ctx, `SELECT pg_blocking_pids($1)`, int32(pid)).Scan(&blocking)
+		select {
+		case <-done:
+			return
+		default:
+		}
+		r.log.Warn("creating the replication slot is waiting for transactions open when it started; new streams are refused until it finishes",
+			"slot", r.cfg.SlotName, "waited", time.Since(started).Round(time.Second), "blocking_pids", blocking)
+		t.Reset(slowCreateEvery)
+	}
 }
 
 // slotGone checks, after a failed stream, whether the slot itself is the

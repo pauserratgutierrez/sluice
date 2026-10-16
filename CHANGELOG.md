@@ -2,6 +2,28 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.10.0
+
+A stream opened while the replication slot was being created could miss changes. A process now refuses new streams until it replicates. Tested with PostgreSQL 18.6.
+
+### Fixed
+
+- **A stream opened while the slot was being created no longer misses changes.** The process opened streams before its reader had created the slot. Creating it waits for every transaction that had an xid when it started, and a transaction that commits before the slot is ready is never decoded.
+  - A stream opened during that wait got its `ready`, and the SDK's `onLive`, with `wal_lsn` `0/0`. A client that then read its state, as it should after `resumed: false`, or that asked for an initial snapshot, missed every change committed between that read and the end of the wait, until its next read.
+  - That happened at the first start, and when a lost slot is created again, just as every client reconnects.
+  - On PostgreSQL 18.6, with a transaction holding the creation for 3 s, a row committed after the `ready` of two streams, one with an initial snapshot, reached neither. A row committed once replication had started reached both.
+
+### Changed
+
+- **New streams are refused with `503 not_replicating` and a `Retry-After` of 1 to 5 s until the process starts replicating**, both while it creates the slot and while it stands by for the reader lock.
+  - A process standing by used to accept streams and deliver nothing until it took over.
+  - Once replication has started, streams keep opening while the reader reconnects: it resumes from the slot's confirmed position and loses nothing.
+  - The SDK retries it as it retries `too_many_streams`. Refusals are logged as `streams refused` with `code=not_replicating`, at most once a second, and counted in `sluice_streams_refused_total{reason="not_replicating"}`.
+
+### Added
+
+- When creating the slot has taken 10 s, and every minute after, the log says what it waits for: `creating the replication slot is waiting for transactions open when it started`, with `waited` and `blocking_pids`.
+
 ## 0.9.1
 
 Creating the replication slot no longer holds back `VACUUM` on every table. Tested with PostgreSQL 18.6.

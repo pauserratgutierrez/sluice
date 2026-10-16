@@ -54,13 +54,15 @@ func (r tupleRow) Column(name string) (expr.Value, bool) {
 	return expr.Null, false
 }
 
-// OnStart fixes the start of what the resume buffer can cover.
+// OnStart fixes the start of what the resume buffer can cover, and lets
+// streams open from the first start on.
 func (s *Server) OnStart(lsn uint64) {
 	s.wakeQueued()
 	s.txnBegan = time.Time{}
 	if lsn != 0 {
 		s.hub.Rings().SetStart(lsn)
 	}
+	s.replicated.Store(true)
 }
 
 func (s *Server) OnBegin(lsn uint64, commitTime time.Time, xid uint32) {

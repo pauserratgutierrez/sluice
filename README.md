@@ -261,7 +261,7 @@ Accept: text/event-stream
   "resume": { "public.documents": "0/1A2B3C4" } }
 ```
 
-The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`, or memory near its limit: `SLUICE_ADMIT_MEMORY`, with `Retry-After`), `503 server_shutdown` (the process is stopping) or `503 session_check_unavailable` (the session lookup could not reach the database; retry). Closing the response is how a client leaves: everything the stream held, presence included, is released.
+The response is `200` with `Content-Type: text/event-stream`, `X-Accel-Buffering: no` and `Sluice-Stream-Id: <node>.<n>-<n>`. It fails with `401 unauthorized`, `400 bad_request` (malformed JSON), `503 too_many_streams` (`SLUICE_MAX_STREAMS`, or memory near its limit: `SLUICE_ADMIT_MEMORY`, with `Retry-After`), `503 not_replicating` (this process has not started replicating yet: it is creating the slot or standing by for the reader lock; with `Retry-After`), `503 server_shutdown` (the process is stopping) or `503 session_check_unavailable` (the session lookup could not reach the database; retry). Closing the response is how a client leaves: everything the stream held, presence included, is released.
 
 Control requests name the stream with `stream_id` in the body, the `Sluice-Stream-Id` header, or both; if both are present and differ the request is rejected (`400 stream_id_mismatch`). The token must name the same `sub` and `role` as the stream (`403 forbidden`); stream ids are not secrets. A stream id from another process is `404 unknown_stream`.
 
@@ -414,7 +414,7 @@ Streams are also closed with `token_expired` at the first heartbeat after the to
 
 **Memory.** Unless `GOMEMLIMIT` is set, Sluice sets the Go heap's soft limit to 90% of the container's cgroup memory limit at startup, so garbage is collected before the container is OOM-killed. Automatic admission (`SLUICE_ADMIT_MEMORY`) refuses new streams near that limit, and a node it fills runs at its threshold. A reconnect of every stream then comes back to 84–92% within a minute and 96% within 4 minutes: while it runs, collections count its allocations as live, and after it the clients still waiting hold memory too. To have every stream back within a minute, cap streams with `SLUICE_MAX_STREAMS` at about 85% of what admission lets in under your load. Measured on 1 CPU and 512 MB with the load test's rooms workload: admission let in 5,767 streams; capped at 4,900, 96% were back within 30 s of a cut and all of them within 55 s.
 
-**One reader per slot.** At startup a process takes a session advisory lock keyed by the slot name (on a pool connection it keeps for its lifetime). A second process with the same slot stands by: it retries every 5 seconds, reports `503` on `/readyz`, and starts replicating when the lock is released. The slot itself allows only one streaming connection. The standby does not share the load; a takeover is a reconnect of every client.
+**One reader per slot.** At startup a process takes a session advisory lock keyed by the slot name (on a pool connection it keeps for its lifetime). A second process with the same slot stands by: it retries every 5 seconds, reports `503` on `/readyz`, refuses new streams with `503 not_replicating`, and starts replicating when the lock is released. The slot itself allows only one streaming connection. The standby does not share the load; a takeover is a reconnect of every client.
 
 **Startup validation.** Sluice refuses to start when:
 
@@ -465,6 +465,7 @@ Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers.
 | `sluice_authz_lease_refreshes_total` | `result` = held, revoked, unavailable |
 | `sluice_channel_hook_rechecks_total` (per joined channel) | `result` = held, revoked, unavailable |
 | `sluice_streams` (gauge) | |
+| `sluice_streams_refused_total` | `reason` = max_streams, memory, not_replicating |
 | `sluice_stream_dropped_events_total` | `kind` |
 | `sluice_stream_closed_total` | `reason` |
 | `sluice_broadcast_published_total` | `namespace`, `origin` |
@@ -478,7 +479,7 @@ The slot, warning and resume buffer metrics refresh every `SLUICE_CATALOG_REFRES
 **Failures.**
 
 - **PostgreSQL restart or dropped replication connection:** the reader reconnects with backoff (1 s, doubling to about 30 s) from the slot's confirmed position; streams stay open.
-- **Slot gone** (invalidated — `max_slot_wal_keep_size` exceeded, `idle_replication_slot_timeout` — or dropped, as after restoring the database): after a failed stream the reader reads the slot from `pg_replication_slots`, and when it can no longer stream every change since its confirmed position the process exits with an error, because streaming on would hide a gap. Every stream ends with `server_shutdown`, and the container's restart policy brings the process back. A missing slot is created again at startup. An invalidated one stops the process at startup until it is dropped (`SELECT pg_drop_replication_slot('<slot>')`), unless `SLUICE_SLOT_RECREATE=true`: then the process holding the reader lock drops and recreates it, never while another process is streaming it, logs a warning and counts `sluice_slot_recreated_total`. Either way the changes made while the slot was unusable are never delivered, so clients must read their state again; a client that does so whenever a subscription goes live without `resumed: true` (the SDK's `onLive`) needs nothing more.
+- **Slot gone** (invalidated — `max_slot_wal_keep_size` exceeded, `idle_replication_slot_timeout` — or dropped, as after restoring the database): after a failed stream the reader reads the slot from `pg_replication_slots`, and when it can no longer stream every change since its confirmed position the process exits with an error, because streaming on would hide a gap. Every stream ends with `server_shutdown`, and the container's restart policy brings the process back. A missing slot is created again at startup. Until replication starts, new streams are refused with `503 not_replicating`: a transaction that commits before the new slot is ready is never decoded, so a stream told it was live then would miss it. Creating the slot waits for every transaction that had an xid when it started; past 10 s, and every minute after, the log says so with the `blocking_pids` it waits for. An invalidated one stops the process at startup until it is dropped (`SELECT pg_drop_replication_slot('<slot>')`), unless `SLUICE_SLOT_RECREATE=true`: then the process holding the reader lock drops and recreates it, never while another process is streaming it, logs a warning and counts `sluice_slot_recreated_total`. Either way the changes made while the slot was unusable are never delivered, so clients must read their state again; a client that does so whenever a subscription goes live without `resumed: true` (the SDK's `onLive`) needs nothing more.
 - **Sluice restart:** streams are closed; clients reconnect, and their resume positions are no longer buffered, so their results say `resumed: false` and they read their state again.
 - **A table leaves the publication:** its shapes are dropped with `relation_unpublished`.
 - **A table's definition changes:** its subscriptions get `schema_changed`; dropped columns disappear from events, and new columns are not added until the client resubscribes.
@@ -492,6 +493,8 @@ Every HTTP request has an ID: the value of the `SLUICE_REQUEST_ID_HEADER` header
 | `msg` | Level | Logged when |
 | --- | --- | --- |
 | `request refused` | info; warn for a `5xx` other than `server_shutdown` | any error response: `path`, `status`, `code`, `reason` |
+| `streams refused` | warn | new streams refused with `503 too_many_streams` or `503 not_replicating`, at most once a second per code: `code`, `reason`, `refused` (how many since the last line) |
+| `creating the replication slot is waiting for transactions open when it started; …` | warn | creating the slot has taken 10 s, then every minute: `slot`, `waited`, `blocking_pids` |
 | `subscription refused` | info; warn when the issuer or hook gave no verdict, or a node-wide limit refused it | a shape or channel of `/stream` or `/subscribe` is refused: `sub`, `table` or `channel`, `code`, `reason`. At most 20 per request, then one `more subscriptions refused` with `count` |
 | `subscription revoked` | info; warn for `issuer_unavailable` | `POST /token` drops a shape or hook channel |
 | `channel hook re-check got no verdict; …` | warn | on `POST /token`; the stream keeps the channel |
@@ -610,7 +613,7 @@ docker run --rm --network deploy_private_net -v "$PWD/.bin:/b:ro" \
 
 | Tool | What it checks |
 | --- | --- |
-| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, value encoding vs `to_jsonb`, evaluator vs PostgreSQL, security negatives, a small fan-out, and last the loss of the slot (it restarts Sluice) |
+| `cmd/smoke` | the RLS critical path: tiers, delivery and withholding, `DELETE`, TOAST, broadcasts, PostgREST agreement, snapshots, resume, value encoding vs `to_jsonb`, evaluator vs PostgreSQL, security negatives, a small fan-out, and last the loss of the slot (it restarts Sluice, holding up the new slot's creation to check that streams are refused until replication starts) |
 | `cmd/smoke-issuer` | the issuer process: grants, narrowing, hold cut, `/token` refresh, an issuer outage, session revocation with only `SELECT (id)` on the sessions table (run after `cmd/smoke`) |
 | `cmd/audit` | a broad policy spectrum, DML and WAL edge cases, revocation, `/diagnostics`; needs `SERVICE_ROLE_KEY` and writes a JSON report to `/out` |
 | `cmd/load` | a fan-out soak on the harness (`LOAD_SCENARIO`, `LOAD_STREAMS`, `LOAD_CHANGES`, `LOAD_USERS`) |

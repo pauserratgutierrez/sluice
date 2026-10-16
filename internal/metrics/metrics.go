@@ -46,7 +46,7 @@ var (
 
 	StreamsRefused = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_streams_refused_total",
-		Help: "New streams refused, by reason: max_streams (SLUICE_MAX_STREAMS) or memory (SLUICE_ADMIT_MEMORY).",
+		Help: "New streams refused, by reason: max_streams (SLUICE_MAX_STREAMS), memory (SLUICE_ADMIT_MEMORY) or not_replicating (the process has not started replicating).",
 	}, []string{"reason"})
 
 	AdmissionMemoryShare = promauto.NewGauge(prometheus.GaugeOpts{

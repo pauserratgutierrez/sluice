@@ -130,30 +130,34 @@ func (s *Server) logStreamEnd(ctx context.Context, st *hub.Stream, code string, 
 	s.logRequest(ctx, slog.LevelInfo, "stream ended", st, args...)
 }
 
-// capacityLog counts streams refused for capacity between log lines: a refused
-// reconnect storm is thousands of requests a second, so it is logged at most
-// once a second, with how many there were.
-type capacityLog struct {
+// refusalLog counts streams refused with one code between log lines: a
+// refused reconnect storm is thousands of requests a second, so it is logged
+// at most once a second, with how many there were.
+type refusalLog struct {
 	mu      sync.Mutex
 	last    time.Time
 	refused int
 }
 
-// refuseCapacity answers 503 too_many_streams with a Retry-After of 1 to 5
-// seconds, spreading a refused storm's retries, and logs it sampled.
+// refuseCapacity answers 503 too_many_streams.
 func (s *Server) refuseCapacity(w http.ResponseWriter, reason, msg string) {
+	s.refuseLater(w, &s.capacityLog, "too_many_streams", reason, msg)
+}
+
+// refuseLater answers 503 with a Retry-After of 1 to 5 seconds, spreading a
+// refused storm's retries, and logs it sampled.
+func (s *Server) refuseLater(w http.ResponseWriter, l *refusalLog, code, reason, msg string) {
 	metrics.StreamsRefused.WithLabelValues(reason).Inc()
 	w.Header().Set("Retry-After", strconv.Itoa(1+rand.IntN(5)))
-	writeErr(w, http.StatusServiceUnavailable, "too_many_streams", msg)
-	c := &s.capacityLog
-	c.mu.Lock()
-	c.refused++
-	if time.Since(c.last) < time.Second {
-		c.mu.Unlock()
+	writeErr(w, http.StatusServiceUnavailable, code, msg)
+	l.mu.Lock()
+	l.refused++
+	if time.Since(l.last) < time.Second {
+		l.mu.Unlock()
 		return
 	}
-	n := c.refused
-	c.refused, c.last = 0, time.Now()
-	c.mu.Unlock()
-	s.log.Warn("streams refused", "code", "too_many_streams", "reason", reason, "refused", n, "detail", msg)
+	n := l.refused
+	l.refused, l.last = 0, time.Now()
+	l.mu.Unlock()
+	s.log.Warn("streams refused", "code", code, "reason", reason, "refused", n, "detail", msg)
 }

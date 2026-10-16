@@ -21,6 +21,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/auth"
 	"github.com/pauserratgutierrez/sluice/internal/event"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
+	"github.com/pauserratgutierrez/sluice/internal/reader"
 )
 
 // streamServer serves the whole HTTP surface with a real token verifier, and
@@ -169,4 +170,28 @@ func TestDrainEndsStreams(t *testing.T) {
 	if res.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("POST /stream while draining = %d, want 503", res.StatusCode)
 	}
+}
+
+// A stream is live from its ready, so a process that has not started
+// replicating -- creating the slot, or standing by for the reader lock --
+// refuses streams with a Retry-After. From the first start on they open, even
+// while the reader is not streaming, as when it reconnects.
+func TestStreamRefusedUntilReplicating(t *testing.T) {
+	s, srv, token := streamServer(t)
+	s.SetReader(reader.New(s.cfg, nil, s.log, s))
+
+	res := postStream(t, srv, token)
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"not_replicating"`) {
+		t.Fatalf("POST /stream before replication started = %d %s, want 503 not_replicating", res.StatusCode, body)
+	}
+	if ra := res.Header.Get("Retry-After"); ra < "1" || ra > "5" || len(ra) != 1 {
+		t.Fatalf("Retry-After = %q, want 1-5 seconds", ra)
+	}
+
+	s.OnStart(1)
+	if s.reader.Streaming() {
+		t.Fatal("the test reader should not be streaming")
+	}
+	openReady(t, s, srv, token)
 }

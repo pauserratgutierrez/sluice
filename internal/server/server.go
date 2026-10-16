@@ -77,9 +77,14 @@ type Server struct {
 
 	// admission refuses new streams when memory nears the Go memory limit.
 	admission   *admission
-	capacityLog capacityLog
+	capacityLog refusalLog
 	// opening counts the stream opens admitted but not yet in the hub.
 	opening atomic.Int64
+
+	// replicated is set the first time this process starts replicating, and
+	// never cleared. Until then, new streams are refused; see handleStream.
+	replicated        atomic.Bool
+	notReplicatingLog refusalLog
 
 	// Reader goroutine only: when the transaction being dispatched began, and
 	// the streams it queued events for without waking their writers, which
@@ -275,6 +280,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if s.draining.Load() {
 		s.refuse(w, r, http.StatusServiceUnavailable, "server_shutdown",
 			"this node is shutting down; reconnect to another or retry shortly")
+		return
+	}
+	// A stream is live from its ready, so it opens only once this process
+	// replicates. While the slot is being created, a transaction that commits
+	// before the slot's consistent point is never decoded: a client told it
+	// was live would read its state, then miss every change committed between
+	// that read and the consistent point, with nothing to say so. A process
+	// standing by for the reader lock would accept streams and deliver nothing
+	// until it took over. Once replication has started, a reader reconnecting
+	// later resumes from the slot's confirmed position and loses nothing, so
+	// streams keep opening.
+	if s.reader != nil && !s.replicated.Load() {
+		s.refuseLater(w, &s.notReplicatingLog, "not_replicating", "not_replicating",
+			"this node is not replicating yet; retry shortly")
 		return
 	}
 	// Opens in progress hold a reservation from here until hub.Open counts them,
