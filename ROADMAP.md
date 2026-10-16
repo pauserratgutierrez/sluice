@@ -8,7 +8,6 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 
 - **One process serves every stream.** A second process on the same slot only stands by. There is no bus to share fan-out across processes, so capacity is one process's, and a takeover or restart reconnects every client.
 - **Resume does not survive a Sluice restart.** The resume buffer is in memory, so after a restart every subscription comes back `resumed: false` and its client reads its state again.
-- **A replay runs beside live delivery.** A live change can reach the client before older replayed ones, and the client's position moves to it. If the stream drops again before the replay finishes, the next resume starts past what was not yet replayed. It takes a second drop within the replay, which lasts as long as the client takes to read it.
 - **Revocation of a policy is bounded, not instant.** Policy, RLS, role and membership changes reach open streams on the next `SLUICE_CATALOG_REFRESH` tick; PostgreSQL emits no notification for them.
 - **Column grants are not re-checked.** `REVOKE SELECT (column)` does not reach open streams; privileges are checked at subscribe time only, against answers cached until the next catalog refresh.
 - **Tier C reads live tables.** A policy with a subquery is evaluated against the database's current state, not the state at commit time, and the probe runs on the replication path (bounded by `SLUICE_TIER_C_TIMEOUT`).
@@ -39,6 +38,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - Model the table-owner bypass using the role memberships the catalog already loads.
 - Detect column-grant revocation (it costs a query per subscription per tick rather than a hash comparison).
 - Batch hook re-checks: one endpoint call for several channels whose verdicts expire on the same tick (needs a multi-channel hook request).
+- Check a request's holds together. Each shape checks its holds with one `EXISTS` each, after installing their watches, and the shapes of a stream often share a hold. One check per request needs every shape's watches installed first, so a `DELETE` between two installs is still caught.
 - Per-namespace hook secrets, or signed hook requests (HMAC over the body with a timestamp) instead of a static bearer.
 - Cap the `ttl` a hook may return.
 - Move Tier C probes off the replication path, so one slow policy does not delay every subscriber. Today each probe is bounded by `SLUICE_TIER_C_TIMEOUT`, which caps the delay but does not remove it.
