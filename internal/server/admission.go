@@ -17,13 +17,18 @@ import (
 // heap and the runtime's memory outside it, goroutine stacks above all), plus
 // what the streams opened since are expected to hold, against the Go memory limit
 // (GOMEMLIMIT, which Sluice sets from the container's limit). Past the
-// threshold it refuses until the projection falls admissionHysteresis below
-// it, or has stayed below the threshold for admissionHold, so admission
-// neither flaps with every collection nor stays shut after a brief peak.
+// threshold it refuses.
 //
 // That floor only changes at a collection, and a reconnect storm opens
 // thousands of streams between two. Projecting them at the measured floor per
 // stream is what keeps a storm from overshooting.
+//
+// A reconnect also lifts the floor it is measured by: streams still being
+// set up, and the garbage of setting them up, counted live because it was
+// allocated during the collection. Up to the most streams admitted below the
+// threshold in the last fitWindow, the projection may therefore go a share of
+// the way from the threshold to the limit (reconnectHeadroom), so the streams
+// that fit come back; past that ceiling a flood is still refused.
 type admission struct {
 	threshold float64      // share of the memory limit; 0 turns admission off
 	limit     func() int64 // the Go memory limit, math.MaxInt64 when none
@@ -33,25 +38,28 @@ type admission struct {
 	lastGC      uint64
 	liveAtGC    uint64
 	streamsAtGC int
-	refusing    bool
-	overAt      time.Time // the last projection at or above the threshold
+	fit         int       // the most streams admitted below the threshold
+	fitAt       time.Time // the last time that many were open; fit lapses fitWindow after
 
 	now      func() time.Time
 	collect  func()
 	forcedGC time.Time
 }
 
-// admissionHysteresis is how far below the threshold the projection must fall
-// before streams are admitted again at once.
-const admissionHysteresis = 0.05
+// reconnectHeadroom is the share of the way from the threshold to the limit
+// that the projection may go while fewer streams are open than fit: 0.6 of
+// the limit at the default threshold of 0.5. Measured at that threshold, a
+// reconnect of every stream read 0.51-0.56 at 2,700-4,900 of the 5,770 that
+// had fit, and the refill stopped short at 96%. A stream admitted below the
+// threshold counts toward fit when admitted: the node fills to the threshold,
+// so the collections after the last streams of a fill read at or past it.
+const reconnectHeadroom = 0.2
 
-// admissionHold is how long the projection must stay below the threshold,
-// within the hysteresis, before streams are admitted again. A reconnect
-// storm's replays and garbage can lift the floor past the threshold for a few
-// collections and stop admission short of what fits. Measured: the floor then
-// settled between the threshold and the hysteresis, and without this
-// admission stayed shut at 4,853 of the 5,610 streams that had fit.
-const admissionHold = 10 * time.Second
+// fitWindow is how long the count that fit below the threshold is remembered
+// after the node last held that many streams. It is seen only when a stream
+// opens or is refused, so a node no client opened a stream on for that long
+// before a reconnect refills with the threshold alone.
+const fitWindow = 5 * time.Minute
 
 // minFloorShare is the least of the measured floor a projection keeps after
 // streams close: some of it is the process, not the streams.
@@ -141,6 +149,7 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := a.now()
 	if gcs != a.lastGC {
 		a.lastGC, a.liveAtGC, a.streamsAtGC = gcs, live, open
 	}
@@ -152,22 +161,29 @@ func (a *admission) admit(open, pending int) (bool, float64) {
 	projected := float64(a.liveAtGC) + float64(streams-a.streamsAtGC)*perStream
 	projected = max(projected, minFloorShare*float64(a.liveAtGC))
 	share := projected / float64(limit)
-	now := a.now()
-	switch {
-	case share >= a.threshold:
-		a.refusing, a.overAt = true, now
-	case a.refusing && (share <= a.threshold-admissionHysteresis || now.Sub(a.overAt) >= admissionHold):
-		a.refusing = false
+	// fit is remembered for fitWindow after the node last held that many.
+	if streams >= a.fit {
+		a.fitAt = now
+		if share < a.threshold {
+			a.fit = streams + 1
+		}
+	} else if now.Sub(a.fitAt) > fitWindow {
+		a.fit = 0
 	}
+	ceiling := a.threshold
+	if streams < a.fit {
+		ceiling += reconnectHeadroom * (1 - a.threshold)
+	}
+	refuse := share >= ceiling
 	// Refusing with far fewer streams than the last collection saw: the floor
 	// is stale. Ask for a collection, at most one every staleGCInterval.
-	if a.refusing && streams < a.streamsAtGC*9/10 {
+	if refuse && streams < a.streamsAtGC*9/10 {
 		if now.Sub(a.forcedGC) >= staleGCInterval {
 			a.forcedGC = now
 			go a.collect()
 		}
 	}
-	return !a.refusing, share
+	return !refuse, share
 }
 
 // withIndexGauges sets the gauges of the hold and subscription indexes and

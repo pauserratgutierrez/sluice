@@ -44,14 +44,9 @@ func TestAdmissionRefusesNearTheLimitAndResumesBelowIt(t *testing.T) {
 	if ok, _ := a.admit(1720, 0); ok {
 		t.Fatal("at 86% of the limit a new stream must be refused")
 	}
-	// Hysteresis: refusing goes on until the projection is 5 points lower.
-	m.collect(820 * mib)
-	if ok, _ := a.admit(1640, 0); ok {
-		t.Fatal("at 82%, within the hysteresis, streams must still be refused")
-	}
-	m.collect(790 * mib)
-	if ok, _ := a.admit(1580, 0); !ok {
-		t.Fatal("at 79% streams must be admitted again")
+	m.collect(840 * mib)
+	if ok, _ := a.admit(1680, 0); !ok {
+		t.Fatal("back below the threshold, at 84%, streams must be admitted again")
 	}
 }
 
@@ -159,32 +154,45 @@ func TestAdmissionAfterAMassDisconnect(t *testing.T) {
 	}
 }
 
-// A reconnect storm's peak stops admission short of what fits, and the floor
-// then settles between the threshold and the hysteresis. Admission opens again
-// once the projection has stayed below the threshold for admissionHold; a
-// projection back at the threshold starts the wait over.
-func TestAdmissionResumesAfterAPeakSettlesWithinTheHysteresis(t *testing.T) {
+// A reconnect lifts the floor it is measured by. Up to the most streams
+// admitted below the threshold, the projection may go a fifth of the way to
+// the limit, so they come back; past that count, or past that ceiling, or once
+// the node has not held that many for fitWindow, the threshold applies.
+func TestAdmissionLetsTheStreamsThatFitComeBack(t *testing.T) {
 	m := &fakeMemory{limit: 1000 * mib, now: time.Unix(1000, 0)}
 	a := m.admission(0.5)
-	m.collect(520 * mib) // the storm's peak, at 4,800 streams
-	if ok, _ := a.admit(4800, 0); ok {
-		t.Fatal("at the peak a new stream must be refused")
+	m.collect(490 * mib) // at 4,999 streams, one more fits below the threshold
+	if ok, _ := a.admit(4999, 0); !ok {
+		t.Fatal("below the threshold a new stream must be admitted")
 	}
-	m.collect(470 * mib) // settled: 0.47, inside the hysteresis
-	m.now = m.now.Add(admissionHold - time.Second)
-	if ok, _ := a.admit(4800, 0); ok {
-		t.Fatal("within admissionHold of the peak, streams must still be refused")
+	// The collections after a fill read at or past the threshold.
+	m.collect(505 * mib)
+	if ok, _ := a.admit(5000, 0); ok {
+		t.Fatal("past the threshold a new stream must be refused")
 	}
-	m.now = m.now.Add(time.Second)
-	if ok, share := a.admit(4800, 0); !ok {
-		t.Fatalf("below the threshold for admissionHold (share %.2f), streams must be admitted again", share)
+	if ok, _ := a.admit(0, 0); !ok {
+		t.Fatal("every stream gone: their reconnections must be admitted")
 	}
-	if ok, _ := a.admit(5200, 0); ok { // projects to 0.509
-		t.Fatal("back at the threshold, streams must be refused")
+
+	m.collect(540 * mib) // the reconnect, at 4,000 streams
+	if ok, share := a.admit(4000, 0); !ok {
+		t.Fatalf("at %.2f with 4,000 of the 5,000 streams that fit, streams must be admitted", share)
 	}
-	m.now = m.now.Add(admissionHold / 2)
-	if ok, _ := a.admit(5000, 0); ok { // 0.49, but the threshold was reached since
-		t.Fatal("reaching the threshold again must start the wait over")
+	if ok, share := a.admit(4000, 600); ok {
+		t.Fatalf("600 opens in progress project to %.2f, past the ceiling of 0.6, and must be refused", share)
+	}
+	m.collect(520 * mib) // 4,990 back
+	if ok, share := a.admit(4990, 0); !ok {
+		t.Fatalf("at %.2f with 4,990 of the 5,000 streams that fit, streams must be admitted", share)
+	}
+	if ok, share := a.admit(5000, 0); ok {
+		t.Fatalf("at the count that fit the threshold applies again, and %.3f is past it", share)
+	}
+
+	m.now = m.now.Add(fitWindow + time.Second)
+	m.collect(540 * mib)
+	if ok, _ := a.admit(4000, 0); ok {
+		t.Fatal("once the node has not held the count that fit for fitWindow, the threshold applies")
 	}
 }
 
@@ -197,7 +205,7 @@ func TestAdmissionForcesACollectionWhenItsFloorIsStale(t *testing.T) {
 	a.admit(3000, 0) // refusing from here
 	for range 10 {
 		if ok, _ := a.admit(2600, 0); ok {
-			t.Fatal("at 2,600 streams the projection (0.45) is still past 0.35")
+			t.Fatal("at 2,600 streams the projection (0.45) is still past the threshold")
 		}
 	}
 	waitFor(t, func() bool { return m.forced.Load() == 1 })

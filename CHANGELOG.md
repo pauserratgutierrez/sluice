@@ -4,7 +4,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ## 0.10.0
 
-A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode every shape of a request goes to the issuer in one call (breaking for issuers). Tested with PostgreSQL 18.6.
+A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode every shape of a request goes to the issuer in one call (breaking for issuers), and after a reconnect of every stream the streams that fit are back within seconds. Tested with PostgreSQL 18.6.
 
 ### Fixed
 
@@ -20,6 +20,11 @@ A stream opened while the replication slot was being created could miss changes;
   - A result with `allow: false` denies its shape only. A call that gets no verdict (unreachable, a timeout, a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each shape) leaves every shape of the call `issuer_unavailable`; a redirect or another `4xx` denies them all.
   - Before: a stream with 7 shapes made 7 calls, 4 at a time, and `POST /token` renewed them in turn, one after the other. In a reconnect of every stream, the calls queued at the issuer, timed out, and were retried.
   - Measured on 1 CPU and 512 MB in a reconnect of all of a full node's 5,775 streams, with a test issuer charging 5–20 ms per call plus 2 ms per shape: no `issuer_unavailable` (938 before), a third less CPU in the reconnect (31 s against 44), opens at p50 0.24 s instead of 2.7 s, and message p99 18 ms instead of 95 ms on the streams already back.
+- **After a reconnect of every stream, the streams that fit come back.** A reconnect lifts the memory admission measures: streams still being set up, and the garbage of setting them up, counted live because it was allocated during a collection. 0.9 stopped short, at 84% within 30 s and 96% after 4 minutes, and advised capping `SLUICE_MAX_STREAMS` at about 85% of what admission let in; that advice is withdrawn.
+  - Up to the most streams admitted below `SLUICE_ADMIT_MEMORY`, for 5 minutes after the node last held that many, the projection may go a fifth of the way from the threshold to the Go memory limit: 0.6 at the default 0.5. Past that count the threshold applies, and past that ceiling a flood is still refused.
+  - The 5-point hysteresis and the 10 s hold are gone: admission refuses while the projection is past its ceiling.
+  - Measured on 1 CPU and 512 MB, issuer mode, with the single issuer call: all 5,773 streams were back within 10 s of a cut, the clients that had them within 14.3 s, with no `issuer_unavailable` and Go memory at its peak before the cut (442 of 461 MiB). With one call per shape the same change was not reliable: the issuer's queue lifted memory past the limit in one of two runs.
+  - A node no client opened a stream on for 5 minutes before a reconnect refills with the threshold alone.
 - **New streams are refused with `503 not_replicating` and a `Retry-After` of 1 to 5 s until the process starts replicating**, both while it creates the slot and while it stands by for the reader lock.
   - A process standing by used to accept streams and deliver nothing until it took over.
   - Once replication has started, streams keep opening while the reader reconnects: it resumes from the slot's confirmed position and loses nothing.
