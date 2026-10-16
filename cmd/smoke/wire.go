@@ -42,8 +42,14 @@ func phaseWireEncoding(ctx context.Context, tok, userID string) {
 	must(err, "open the wire stream")
 	defer st.Close()
 
-	records := map[int64]json.RawMessage{}
-	snapshotOf := map[int64]bool{}
+	// The snapshot row can arrive more than once: if the reader dispatches it
+	// only after the subscription exists, it also arrives live, and again in
+	// the replay after the snapshot. Arrivals are kept apart by origin.
+	type arrival struct {
+		id       int64
+		snapshot bool
+	}
+	records := map[arrival]json.RawMessage{}
 	var seen []string
 	// until reads events until done reports true or 10s pass.
 	until := func(done func(name string, id int64) bool) {
@@ -59,11 +65,12 @@ func phaseWireEncoding(ctx context.Context, tok, userID string) {
 				Record   json.RawMessage `json:"record"`
 			}
 			_ = json.Unmarshal(e.Data, &c)
-			seen = append(seen, e.Name)
 			var id struct{ ID int64 }
 			if e.Name == "change" && c.Sub == "wire" && json.Unmarshal(c.Record, &id) == nil {
-				records[id.ID] = c.Record
-				snapshotOf[id.ID] = c.Snapshot
+				records[arrival{id.ID, c.Snapshot}] = c.Record
+				seen = append(seen, fmt.Sprintf("change(%d, snapshot=%v)", id.ID, c.Snapshot))
+			} else {
+				seen = append(seen, e.Name)
 			}
 			if done(e.Name, id.ID) {
 				return
@@ -83,8 +90,8 @@ func phaseWireEncoding(ctx context.Context, tok, userID string) {
 		{snapID, true, "a snapshot row is encoded exactly as to_jsonb encodes it"},
 		{liveID, false, "a live change is encoded exactly as to_jsonb encodes it"},
 	} {
-		got, ok := records[tc.id]
-		if !ok || snapshotOf[tc.id] != tc.snapshot {
+		got, ok := records[arrival{tc.id, tc.snapshot}]
+		if !ok {
 			check(false, tc.what, fmt.Sprintf("row %d did not arrive with snapshot=%v; events seen: %v", tc.id, tc.snapshot, seen))
 			continue
 		}
