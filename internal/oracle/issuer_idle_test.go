@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pauserratgutierrez/sluice/internal/authz"
 )
 
 // closingAfterOne answers one request per connection and keeps it open, then
@@ -45,7 +47,7 @@ func closingAfterOne(t *testing.T) (url string, seenKey *atomic.Bool) {
 					if n == 1 {
 						return // the second request on a connection: close, no answer
 					}
-					body := `{"allow":false}`
+					body := `{"results":[{"allow":false}]}`
 					fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
 				}
 			}(conn)
@@ -67,7 +69,7 @@ func TestIssuerRetriesARequestOnAConnectionTheIssuerClosed(t *testing.T) {
 	}
 	req := Request{Relation: docsRel()}
 	for i := range 3 {
-		_, err := iss.Resolve(context.Background(), req)
+		err := iss.Resolve(context.Background(), ActionSubscribe, authz.Identity{}, []Request{req})[0].Err
 		// allow:false is a denial; a failed call would be ErrUnavailable.
 		var unavailable *ErrUnavailable
 		if errors.As(err, &unavailable) {

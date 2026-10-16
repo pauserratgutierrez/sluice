@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,12 +77,35 @@ func clientFilter(t *testing.T, rel *catalog.Relation, raw string) *shape.Filter
 	return f
 }
 
+// shapeReq is one shape with the action and identity it is asked about for,
+// as most tests ask about one shape at a time.
+type shapeReq struct {
+	Action   Action
+	Identity authz.Identity
+	Relation *catalog.Relation
+	Filter   *shape.Filter
+	Columns  []string
+	Ops      []string
+}
+
+func resolveOne(iss *Issuer, r shapeReq) (*Grant, error) {
+	res := iss.Resolve(context.Background(), r.Action, r.Identity, []Request{{
+		Relation: r.Relation, Filter: r.Filter, Columns: r.Columns, Ops: r.Ops,
+	}})
+	return res[0].Grant, res[0].Err
+}
+
+// writeResult answers a call about one shape.
+func writeResult(w http.ResponseWriter, result map[string]any) {
+	_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{result}})
+}
+
 func issuerOK(w http.ResponseWriter, allowlist []string) {
 	cols := any(nil)
 	if allowlist != nil {
 		cols = allowlist
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	writeResult(w, map[string]any{
 		"allow": true,
 		"shape": map[string]any{
 			"schema": "public", "table": "documents",
@@ -130,7 +154,7 @@ func TestIssuerTimeoutIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = iss.Resolve(context.Background(), Request{
+	_, err = resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.42"),
 	})
@@ -156,7 +180,7 @@ func TestIssuerStatusClassification(t *testing.T) {
 			w.WriteHeader(tc.status)
 			_, _ = io.WriteString(w, "nope")
 		})
-		_, err := iss.Resolve(context.Background(), Request{
+		_, err := resolveOne(iss, shapeReq{
 			Identity: identity(), Relation: docsRel(),
 		})
 		var unavailable *ErrUnavailable
@@ -175,7 +199,7 @@ func TestIssuerRetryAfter(t *testing.T) {
 		w.Header().Set("Retry-After", "3")
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	_, err := iss.Resolve(context.Background(), Request{Identity: identity(), Relation: docsRel()})
+	_, err := resolveOne(iss, shapeReq{Identity: identity(), Relation: docsRel()})
 	var unavailable *ErrUnavailable
 	if !errors.As(err, &unavailable) || unavailable.RetryAfter != 3*time.Second {
 		t.Fatalf("got %v, want unavailable with a 3s Retry-After", err)
@@ -219,7 +243,7 @@ func TestIssuerFailClosedOnRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = iss.Resolve(context.Background(), Request{
+	_, err = resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.42"),
 	})
@@ -235,7 +259,7 @@ func TestIssuerUnreadableBodyIsUnavailable(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "not-json")
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if _, ok := err.(*ErrUnavailable); !ok {
@@ -245,9 +269,9 @@ func TestIssuerUnreadableBodyIsUnavailable(t *testing.T) {
 
 func TestIssuerDenyAllowFalse(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"allow": false})
+		writeResult(w, map[string]any{"allow": false})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if _, ok := err.(*ErrDenied); !ok {
@@ -257,13 +281,13 @@ func TestIssuerDenyAllowFalse(t *testing.T) {
 
 func TestIssuerRejectsDifferentRelation(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeResult(w, map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "other", "filter": "id=eq.1"},
 			"holds": []map[string]any{{"schema": "public", "table": "project_members", "filter": "user_id=eq.user-1"}},
 		})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "not the requested") {
@@ -273,13 +297,13 @@ func TestIssuerRejectsDifferentRelation(t *testing.T) {
 
 func TestIssuerRejectsWholeTableFilter(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeResult(w, map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "documents", "filter": ""},
 			"holds": []map[string]any{{"schema": "public", "table": "project_members", "filter": "user_id=eq.user-1"}},
 		})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "whole table") {
@@ -291,7 +315,7 @@ func TestIssuerRejectsWiden(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		issuerOK(w, []string{"id", "title"})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.99"),
 	})
@@ -304,7 +328,7 @@ func TestIssuerNarrowsClientTerms(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		issuerOK(w, []string{"id", "title", "body"})
 	})
-	g, err := iss.Resolve(context.Background(), Request{
+	g, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Filter:  clientFilter(t, docsRel(), "project_id=eq.42,status=eq.open"),
 		Columns: []string{"id", "title"},
@@ -339,7 +363,7 @@ func TestIssuerEmptyShapeIsNotAnError(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		issuerOK(w, []string{"id", "title"})
 	})
-	g, err := iss.Resolve(context.Background(), Request{
+	g, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.42"),
 	})
@@ -353,12 +377,12 @@ func TestIssuerEmptyShapeIsNotAnError(t *testing.T) {
 
 func TestIssuerRequiresHoldAndPublishedTable(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeResult(w, map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "documents", "filter": "project_id=eq.42"},
 		})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "hold") {
@@ -366,13 +390,13 @@ func TestIssuerRequiresHoldAndPublishedTable(t *testing.T) {
 	}
 
 	iss = newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeResult(w, map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "documents", "filter": "project_id=eq.42"},
 			"holds": []map[string]any{{"schema": "public", "table": "not_published", "filter": "id=eq.1"}},
 		})
 	})
-	_, err = iss.Resolve(context.Background(), Request{
+	_, err = resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "publication") {
@@ -397,7 +421,7 @@ func TestIssuerDeniesHoldWithoutReplicaIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = iss.Resolve(context.Background(), Request{
+	_, err = resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "REPLICA IDENTITY") {
@@ -413,7 +437,7 @@ func TestIssuerSendsBearerNotUserToken(t *testing.T) {
 		gotBody = string(b)
 		issuerOK(w, []string{"id", "title"})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Action:   ActionSubscribe,
 		Identity: identity(),
 		Relation: docsRel(),
@@ -445,9 +469,9 @@ func TestIssuerRefreshDeny(t *testing.T) {
 		if req["action"] != "refresh" {
 			t.Errorf("action = %v, want refresh", req["action"])
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"allow": false})
+		writeResult(w, map[string]any{"allow": false})
 	})
-	_, err := iss.Refresh(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{Action: ActionRefresh,
 		Identity: identity(), Relation: docsRel(),
 		Filter: clientFilter(t, docsRel(), "project_id=eq.42"),
 	})
@@ -470,7 +494,7 @@ func TestIssuerEmptyColumnIntersectionDenies(t *testing.T) {
 	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		issuerOK(w, []string{"secret"})
 	})
-	_, err := iss.Resolve(context.Background(), Request{
+	_, err := resolveOne(iss, shapeReq{
 		Identity: identity(), Relation: docsRel(),
 		Columns: []string{"id", "title"},
 	})
@@ -491,4 +515,65 @@ func TestIssuerDoesNotImpersonate(t *testing.T) {
 
 func issuerOKHandler(w http.ResponseWriter, r *http.Request) {
 	issuerOK(w, []string{"id", "title"})
+}
+
+// Every shape of a request goes to the issuer in one call, each with its
+// label, and each result is checked on its own: one shape denied does not
+// take the others with it.
+func TestIssuerAsksAboutEveryShapeInOneCall(t *testing.T) {
+	var calls atomic.Int32
+	var got issuerHTTPRequest
+	iss := newIssuer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		grant := map[string]any{
+			"allow": true,
+			"shape": map[string]any{"schema": "public", "table": "documents", "filter": "project_id=eq.42"},
+			"holds": []map[string]any{{"schema": "public", "table": "project_members",
+				"filter": "project_id=eq.42,user_id=eq.user-1"}},
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{grant, map[string]any{"allow": false}, grant}})
+	})
+	reqs := []Request{
+		{Label: "a", Relation: docsRel(), Filter: clientFilter(t, docsRel(), "project_id=eq.42")},
+		{Label: "b", Relation: docsRel(), Filter: clientFilter(t, docsRel(), "project_id=eq.7")},
+		{Label: "c", Relation: docsRel(), Columns: []string{"id", "title"}},
+	}
+	res := iss.Resolve(context.Background(), ActionSubscribe, identity(), reqs)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d calls to the issuer, want 1", n)
+	}
+	if len(got.Requested) != 3 || got.Requested[0].Sub != "a" || got.Requested[1].Filter != "project_id=eq.7" ||
+		got.Requested[2].Sub != "c" || len(got.Requested[2].Columns) != 2 {
+		t.Fatalf("requested = %+v", got.Requested)
+	}
+	var denied *ErrDenied
+	if res[0].Err != nil || res[0].Grant == nil || !errors.As(res[1].Err, &denied) || res[2].Err != nil || res[2].Grant == nil {
+		t.Fatalf("results = %+v, want grant, deny, grant", res)
+	}
+}
+
+// Results that do not answer each shape, or a call that fails, are no verdict
+// on any of them.
+func TestIssuerResultsThatDoNotAnswerEveryShapeAreUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer func(w http.ResponseWriter)
+	}{
+		{"one result for two shapes", func(w http.ResponseWriter) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"allow": false}}})
+		}},
+		{"no results", func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(map[string]any{"allow": true}) }},
+		{"503", func(w http.ResponseWriter) { w.WriteHeader(http.StatusServiceUnavailable) }},
+	} {
+		iss := newIssuer(t, func(w http.ResponseWriter, _ *http.Request) { tc.answer(w) })
+		res := iss.Resolve(context.Background(), ActionSubscribe, identity(),
+			[]Request{{Label: "a", Relation: docsRel()}, {Label: "b", Relation: docsRel()}})
+		for i, r := range res {
+			var unavailable *ErrUnavailable
+			if !errors.As(r.Err, &unavailable) {
+				t.Fatalf("%s: result %d = %+v, want unavailable", tc.name, i, r)
+			}
+		}
+	}
 }

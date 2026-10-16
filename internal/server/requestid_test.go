@@ -130,7 +130,7 @@ func newTraced(t *testing.T) *traced {
 	t.Helper()
 	s, srv, token := streamServer(t)
 	tr := &traced{s: s, srv: srv, token: token, logs: logTo(s),
-		issuer: newEndpoint(t, `{"allow": false}`),
+		issuer: newEndpoint(t, `{"results": [{"allow": false}]}`),
 		hook:   newEndpoint(t, `{"allow": false, "reason": "not a member", "ttl": 0}`),
 	}
 	orc, err := oracle.NewIssuerWith(oracle.IssuerOptions{

@@ -120,30 +120,38 @@ Tier C evaluates the policy under the caller's role and claims against the WAL t
 
 ### Issuer oracle
 
-`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to a shape, Sluice POSTs to `SLUICE_ISSUER_URL` with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded) and the client request's ID in `SLUICE_REQUEST_ID_HEADER` (see [Logs](#logs)). Redirects are not followed.
-
-Only an allow grants. `"allow": false`, a redirect or a `4xx` other than `408` and `429` denies, with `shape_not_authorized`. No verdict at all — unreachable, a timeout (`SLUICE_ISSUER_TIMEOUT`), a `5xx`, `408` or `429`, or an unreadable body — refuses the shape with `issuer_unavailable`, which is retryable: `retry_after_ms` is the issuer's `Retry-After` (seconds or an HTTP date, at most 60 s) or, without one, a delay spread between 1 and 5 s. The SDK asks again after it on its own.
+`SLUICE_SHAPE_ORACLE=issuer`. When a client subscribes to shapes — a stream opening, `POST /subscribe` — Sluice POSTs every shape of the request in one call to `SLUICE_ISSUER_URL`, with `Authorization: Bearer <SLUICE_ISSUER_BEARER>` (the user's access token is never forwarded) and the client request's ID in `SLUICE_REQUEST_ID_HEADER` (see [Logs](#logs)). Redirects are not followed.
 
 ```json
 {
   "action": "subscribe",
   "identity": { "role": "authenticated", "sub": "…", "session_id": "…", "claims": { } },
-  "requested": { "schema": "public", "table": "documents",
-                 "filter": "project_id=eq.42", "columns": ["id", "title"], "ops": ["INSERT"] }
+  "requested": [
+    { "sub": "docs", "schema": "public", "table": "documents",
+      "filter": "project_id=eq.42", "columns": ["id", "title"], "ops": ["INSERT"] },
+    { "sub": "tasks", "schema": "public", "table": "tasks", "filter": "project_id=eq.42" }
+  ]
 }
 ```
 
-`action` is `refresh` when the stream presents a new token (`POST /token`), with `requested` as on `subscribe`: what the client asked for, not the shape a grant made of it. There, a shape the issuer denies is dropped with `shape_not_authorized`, and one it gives no verdict on is dropped with `issuer_unavailable`, so a new token never keeps a grant made for the previous one; the client subscribes again. A grant:
+`sub` is the client's label for the shape, for the issuer's logs. The response has one result per requested shape, in the same order:
 
 ```json
 {
-  "allow": true,
-  "shape": { "schema": "public", "table": "documents",
-             "filter": "project_id=eq.42", "columns": ["id", "title", "body"] },
-  "holds": [ { "schema": "public", "table": "project_members",
-               "filter": "user_id=eq.<sub>,project_id=eq.42" } ]
+  "results": [
+    { "allow": true,
+      "shape": { "schema": "public", "table": "documents",
+                 "filter": "project_id=eq.42", "columns": ["id", "title", "body"] },
+      "holds": [ { "schema": "public", "table": "project_members",
+                   "filter": "user_id=eq.<sub>,project_id=eq.42" } ] },
+    { "allow": false }
+  ]
 }
 ```
+
+Only an allow grants. A result with `"allow": false` denies its shape, with `shape_not_authorized`; the others are decided on their own. A redirect or a `4xx` other than `408` and `429` denies every shape of the call. No verdict at all — unreachable, a timeout (`SLUICE_ISSUER_TIMEOUT`), a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each requested shape — refuses every shape of the call with `issuer_unavailable`, which is retryable: `retry_after_ms` is the issuer's `Retry-After` (seconds or an HTTP date, at most 60 s) or, without one, a delay spread between 1 and 5 s. The SDK asks again after it on its own.
+
+`action` is `refresh` when the stream presents a new token (`POST /token`): `requested` lists every shape of the stream, as the client asked for it, not the shape a grant made of it. There, a shape the issuer denies is dropped with `shape_not_authorized`, and one it gives no verdict on is dropped with `issuer_unavailable`, so a new token never keeps a grant made for the previous one; the client subscribes again.
 
 Sluice checks the grant before using it:
 
@@ -336,7 +344,7 @@ Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insuf
 | `/presence` `{ "stream_id", "channel", "action": "track" \| "update" \| "untrack", "meta" }` | `{ "ok": true }`; `403 presence_key_not_allowed`, `403 channel_not_subscribed`, `429 rate_limited`, `429 presence_too_many_keys` |
 | `/token` `{ "stream_id", "access_token" }` | `{ "ok": true, "revoked_subscriptions": n }`; `403 subject_mismatch`, `503 session_check_unavailable` |
 
-`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call per shape, asking about the shape as the client subscribed to it), and every hook channel is asked about again; `revoked_subscriptions` counts both, including shapes dropped with `issuer_unavailable`.
+`/token` needs no `Authorization` header: the body's token is verified. It may not change the stream's `sub` (a stream opened without one may gain one). Every shape is re-resolved with the new claims (issuer: one `refresh` call for all of the stream's shapes, asking about each as the client subscribed to it), and every hook channel is asked about again; `revoked_subscriptions` counts both, including shapes dropped with `issuer_unavailable`.
 
 ### Resume
 
@@ -555,7 +563,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_JWT_SESSION_CLAIM` | `session_id` | claim holding the session row's `id` (e.g. `sid`) |
 | `SLUICE_SHAPE_ORACLE` | `rls` | or `issuer` |
 | `SLUICE_ISSUER_URL` / `SLUICE_ISSUER_BEARER` | empty | required in issuer mode |
-| `SLUICE_ISSUER_TIMEOUT` | `2s` | |
+| `SLUICE_ISSUER_TIMEOUT` | `2s` | how long one call to the issuer may take; it asks about every shape of a request, and past it they are all `issuer_unavailable` |
 | `SLUICE_ISSUER_IDLE_TIMEOUT` | `4s` | how long a pooled connection to the shape issuer or a channel hook stays open while idle. Keep it below the endpoint's own keep-alive timeout (Node 5 s, Bun 10 s): a request sent on a connection the endpoint is closing would otherwise fail. Every call also carries an `Idempotency-Key`, so Go's client re-sends it on a new connection when that happens anyway |
 | `SLUICE_AUTHZ_LEASE` | `60s` | re-check of time-dependent and Tier C decisions |
 | `SLUICE_CATALOG_REFRESH` | `30s` | catalog, lease, JWKS and health tick |

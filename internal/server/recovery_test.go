@@ -67,8 +67,10 @@ type unavailableOracle struct {
 	retryAfter time.Duration
 }
 
-func (o unavailableOracle) Resolve(context.Context, oracle.Request) (*oracle.Grant, error) {
-	return nil, &oracle.ErrUnavailable{Reason: "shape issuer returned HTTP 503", RetryAfter: o.retryAfter}
+func (o unavailableOracle) Resolve(_ context.Context, _ oracle.Action, _ authz.Identity, reqs []oracle.Request) []oracle.Result {
+	return eachShape(reqs, func(oracle.Request) (*oracle.Grant, error) {
+		return nil, &oracle.ErrUnavailable{Reason: "shape issuer returned HTTP 503", RetryAfter: o.retryAfter}
+	})
 }
 
 // An issuer that gives no verdict refuses the shape, but retryably, with the
@@ -125,7 +127,7 @@ func TestTokenIssuerUnavailableDropsShapeRetryably(t *testing.T) {
 	sub := issuerLiveSub(t, s, st, f, []string{"id", "project_id"}, holdF)
 
 	ctx := requestid.With(context.Background(), requestid.ID{Header: "X-Request-ID", Value: "gw-token"})
-	if got := s.refreshIssuerShape(ctx, st, sub, st.Identity()); got != "unavailable" {
+	if got := refreshOne(s, ctx, st, sub, st.Identity()); got != "unavailable" {
 		t.Fatalf("outcome = %q, want unavailable", got)
 	}
 	logs.one(t, "subscription revoked", map[string]string{"level": "WARN", "request_id": "gw-token",
@@ -205,9 +207,9 @@ type countingOracle struct {
 	asked atomic.Int32
 }
 
-func (o *countingOracle) Resolve(ctx context.Context, req oracle.Request) (*oracle.Grant, error) {
-	o.asked.Add(1)
-	return o.slowOracle.Resolve(ctx, req)
+func (o *countingOracle) Resolve(ctx context.Context, action oracle.Action, id authz.Identity, reqs []oracle.Request) []oracle.Result {
+	o.asked.Add(int32(len(reqs)))
+	return o.slowOracle.Resolve(ctx, action, id, reqs)
 }
 
 // With the lookup on, a token whose session row is gone cannot open a stream,

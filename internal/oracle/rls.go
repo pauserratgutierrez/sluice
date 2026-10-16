@@ -3,6 +3,8 @@ package oracle
 import (
 	"context"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/expr"
@@ -23,19 +25,30 @@ func NewRLS(az *authz.Authorizer, cat *catalog.Cache) *RLS {
 func (r *RLS) Name() string              { return NameRLS }
 func (r *RLS) SnapshotImpersonate() bool { return true }
 
-func (r *RLS) Resolve(ctx context.Context, req Request) (*Grant, error) {
-	return r.decide(ctx, req)
-}
+// rlsConcurrency bounds how many shapes of one request are decided at once:
+// a decision is catalog work and, in Tier C, probes.
+const rlsConcurrency = 4
 
-func (r *RLS) Refresh(ctx context.Context, req Request) (*Grant, error) {
-	return r.decide(ctx, req)
+// Resolve decides each shape locally, the same for subscribe and refresh.
+func (r *RLS) Resolve(ctx context.Context, _ Action, id authz.Identity, reqs []Request) []Result {
+	out := make([]Result, len(reqs))
+	var g errgroup.Group
+	g.SetLimit(rlsConcurrency)
+	for i, req := range reqs {
+		g.Go(func() error {
+			out[i].Grant, out[i].Err = r.decide(ctx, id, req)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return out
 }
 
 func (r *RLS) LeaseTick(ctx context.Context, h *authz.Handle, rel *catalog.Relation, id authz.Identity, eqs map[string]expr.Value) (bool, error) {
 	return r.az.Refresh(ctx, h, rel, id, eqs)
 }
 
-func (r *RLS) decide(ctx context.Context, req Request) (*Grant, error) {
+func (r *RLS) decide(ctx context.Context, id authz.Identity, req Request) (*Grant, error) {
 	rel := req.Relation
 	filter := req.Filter
 	if filter == nil {
@@ -47,7 +60,7 @@ func (r *RLS) decide(ctx context.Context, req Request) (*Grant, error) {
 	}
 
 	columns := projection(rel, req.Columns)
-	granted, err := r.cat.HasColumnPrivilege(ctx, req.Identity.Role, rel, columns)
+	granted, err := r.cat.HasColumnPrivilege(ctx, id.Role, rel, columns)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +75,7 @@ func (r *RLS) decide(ctx context.Context, req Request) (*Grant, error) {
 	if len(allowed) == 0 {
 		return nil, &ErrDenied{
 			Code:   "column_not_granted",
-			Reason: "role " + req.Identity.Role + " may not select any of the requested columns on " + rel.FullName(),
+			Reason: "role " + id.Role + " may not select any of the requested columns on " + rel.FullName(),
 		}
 	}
 
@@ -70,7 +83,7 @@ func (r *RLS) decide(ctx context.Context, req Request) (*Grant, error) {
 	if filter != nil {
 		eqs = filter.Equalities
 	}
-	d, err := r.az.Resolve(ctx, rel, req.Identity, eqs)
+	d, err := r.az.Resolve(ctx, rel, id, eqs)
 	if err != nil {
 		return nil, err
 	}

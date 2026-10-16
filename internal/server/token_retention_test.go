@@ -26,13 +26,17 @@ type freshGrantOracle struct {
 	docs, members *catalog.Relation
 }
 
-func (o *freshGrantOracle) Refresh(_ context.Context, req oracle.Request) (*oracle.Grant, error) {
-	p := o.project[req.Identity.Sub]
+func (o *freshGrantOracle) Resolve(_ context.Context, _ oracle.Action, id authz.Identity, reqs []oracle.Request) []oracle.Result {
+	return eachShape(reqs, func(oracle.Request) (*oracle.Grant, error) { return o.grant(id.Sub) })
+}
+
+func (o *freshGrantOracle) grant(sub string) (*oracle.Grant, error) {
+	p := o.project[sub]
 	f, err := shape.Parse(fmt.Sprintf("project_id=eq.%d", p), o.docs)
 	if err != nil {
 		return nil, err
 	}
-	h, err := shape.Parse(fmt.Sprintf("user_id=eq.%s,project_id=eq.%d", req.Identity.Sub, p), o.members)
+	h, err := shape.Parse(fmt.Sprintf("user_id=eq.%s,project_id=eq.%d", sub, p), o.members)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +67,7 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 		st := s.hub.Open(fmt.Sprintf("n1.%d", i), "", authz.Identity{Sub: sub, Role: "authenticated"})
 		all = append(all, st)
 		for j := range shapes {
-			g, _ := orc.Refresh(context.Background(), oracle.Request{Identity: st.Identity()})
+			g, _ := orc.grant(sub)
 			label := fmt.Sprintf("s%d", j)
 			if !s.reg.Add(&registry.Subscription{
 				Label: label, Sink: st, Relation: orc.docs, Filter: g.Filter, Columns: g.Columns,
@@ -76,9 +80,10 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 	}
 	renewAll := func() {
 		for _, st := range all {
-			for _, sub := range s.reg.StreamSubscriptions(st.StreamID()) {
-				if got := s.refreshIssuerShape(context.Background(), st, sub, st.Identity()); got != "held" {
-					t.Fatalf("refresh of %s/%s: %s", st.StreamID(), sub.Label, got)
+			subs := s.reg.StreamSubscriptions(st.StreamID())
+			for k, got := range s.refreshIssuerShapes(context.Background(), st, subs, st.Identity()) {
+				if got != "held" {
+					t.Fatalf("refresh of %s/%s: %s", st.StreamID(), subs[k].Label, got)
 				}
 			}
 		}

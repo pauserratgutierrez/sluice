@@ -35,8 +35,13 @@ func Main() error {
 	if err != nil {
 		return err
 	}
+	shapeLat, err := ParseLatency(os.Getenv("LOAD_ISSUER_SHAPE_LATENCY"), envFloat("LOAD_ISSUER_JITTER", 0.2))
+	if err != nil {
+		return err
+	}
 	s := newServer(bearer, lat, envInt("LOAD_ISSUER_CONCURRENCY", 0), envInt("LOAD_ISSUER_QUEUE_MAX", 0),
 		envInt("LOAD_HOOK_TTL", 0))
+	s.shapeLat = shapeLat
 	switch order := envOr("LOAD_HOLD_ORDER", "user-first"); order {
 	case "user-first":
 	case "room-first":
@@ -53,8 +58,8 @@ func Main() error {
 	mux.HandleFunc("GET /stats", s.statsHandler)
 
 	addr := envOr("ISSUER_LISTEN", "0.0.0.0:8080")
-	fmt.Printf("issuer: listening on %s (latency %s, concurrency %d, queue max %d, hook ttl %d)\n",
-		addr, lat, s.limit, s.queueMax, s.hookTTL)
+	fmt.Printf("issuer: listening on %s (latency %s per call and %s per shape, concurrency %d, queue max %d, hook ttl %d)\n",
+		addr, lat, shapeLat, s.limit, s.queueMax, s.hookTTL)
 	hs := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -66,6 +71,9 @@ func Main() error {
 type server struct {
 	bearer string
 	lat    Latency
+	// shapeLat is added for each shape a call asks about: a backend answers
+	// several shapes in one call for less than one call each, but not for free.
+	shapeLat Latency
 	// limit is how many requests are served at once; 0 is unlimited. Past it
 	// they queue, up to queueMax (0: no bound), and are refused with 503 and
 	// Retry-After beyond that, the way a backend sheds load.
@@ -106,11 +114,15 @@ type issuerRequest struct {
 	Identity struct {
 		Sub string `json:"sub"`
 	} `json:"identity"`
-	Requested struct {
-		Schema string `json:"schema"`
-		Table  string `json:"table"`
-		Filter string `json:"filter"`
-	} `json:"requested"`
+	Requested []requested `json:"requested"`
+}
+
+// requested is one shape of a call; the response answers each, in order.
+type requested struct {
+	Sub    string `json:"sub"`
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	Filter string `json:"filter"`
 }
 
 type hookRequest struct {
@@ -231,18 +243,26 @@ func (s *server) shapes(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	s.lat.Sleep()
-	writeJSON(w, http.StatusOK, s.decide(req))
+	for range req.Requested {
+		s.shapeLat.Sleep()
+	}
+	results := make([]map[string]any, len(req.Requested))
+	for i, q := range req.Requested {
+		results[i] = s.decide(req.Identity.Sub, q)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
-func (s *server) decide(req issuerRequest) map[string]any {
+// decide answers one requested shape for the caller sub.
+func (s *server) decide(sub string, q requested) map[string]any {
 	deny := map[string]any{"allow": false}
-	sub := strings.ToLower(strings.TrimSpace(req.Identity.Sub))
+	sub = strings.ToLower(strings.TrimSpace(sub))
 	if sub == "" {
 		return deny
 	}
-	switch req.Requested.Table {
+	switch q.Table {
 	case "project_docs":
-		projectID := parseEq(req.Requested.Filter, "project_id")
+		projectID := parseEq(q.Filter, "project_id")
 		if projectID == "" {
 			return deny
 		}
@@ -255,7 +275,7 @@ func (s *server) decide(req issuerRequest) map[string]any {
 		return grant("project_docs", "project_id=eq."+projectID, []string{"id", "project_id", "title", "body"},
 			"project_members", "project_id=eq."+projectID+",user_id=eq."+sub)
 	case "room_messages":
-		room, err := strconv.ParseInt(parseEq(req.Requested.Filter, "room_id"), 10, 64)
+		room, err := strconv.ParseInt(parseEq(q.Filter, "room_id"), 10, 64)
 		if err != nil {
 			return deny
 		}
@@ -270,7 +290,7 @@ func (s *server) decide(req issuerRequest) map[string]any {
 	case "room_members", "notifications":
 		// A member's own rows: their memberships, their notifications. The
 		// grant is held by their membership of the first room they joined.
-		if strings.ToLower(parseEq(req.Requested.Filter, "user_id")) != sub {
+		if strings.ToLower(parseEq(q.Filter, "user_id")) != sub {
 			return deny
 		}
 		s.mu.RLock()
@@ -279,7 +299,7 @@ func (s *server) decide(req issuerRequest) map[string]any {
 		if !ok {
 			return deny
 		}
-		return grant(req.Requested.Table, "user_id=eq."+sub, nil,
+		return grant(q.Table, "user_id=eq."+sub, nil,
 			"room_members", s.memberHold(room, sub))
 	}
 	return deny

@@ -30,7 +30,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/pauserratgutierrez/sluice/internal/auth"
 	"github.com/pauserratgutierrez/sluice/internal/authz"
@@ -698,44 +697,60 @@ func (s *Server) applySubscriptions(
 	return out
 }
 
-// resolveConcurrency bounds how many shapes of one request are resolved at once.
-const resolveConcurrency = 4
-
-// prepareShapes resolves, concurrently, the first `room` shapes of a request:
-// as many as the stream's limits could admit. Resolving is the slow part of a
-// subscribe -- an issuer round trip, or catalog work and probes in RLS mode --
-// and touches nothing of the stream's, so a stream reopened after a restart
-// waits for its slowest shape rather than for all of them in turn. Admission,
-// limits and installation stay in request order in applySubscriptions, which
-// resolves any later shape itself if an earlier one fails and leaves room.
+// prepareShapes checks the first `room` shapes of a request -- as many as the
+// stream's limits could admit -- and resolves them with one oracle call: in
+// issuer mode, one round trip for all of them. Resolving is the slow part of a
+// subscribe and touches nothing of the stream's. Admission, limits and
+// installation stay in request order in applySubscriptions, which resolves any
+// later shape itself if an earlier one fails and leaves room.
 func (s *Server) prepareShapes(ctx context.Context, id authz.Identity, specs []subSpec, room int) map[int]preparedShape {
+	out := map[int]preparedShape{}
 	var idx []int
+	var reqs []oracle.Request
 	for i, spec := range specs {
-		if len(idx) >= room {
+		if len(out) >= room {
 			break
 		}
-		if spec.Sub != "" && spec.Shape != nil {
+		if spec.Sub == "" || spec.Shape == nil {
+			continue
+		}
+		p := s.checkShape(spec)
+		out[i] = p
+		if p.res.Error == nil {
 			idx = append(idx, i)
+			reqs = append(reqs, oracle.Request{Label: spec.Sub, Relation: p.rel,
+				Filter: p.requested.Filter, Columns: p.requested.Columns, Ops: p.requested.Ops})
 		}
 	}
-	if len(idx) < 2 {
-		return nil
+	if len(reqs) == 0 {
+		return out
 	}
-	out := make([]preparedShape, len(idx))
-	var g errgroup.Group
-	g.SetLimit(resolveConcurrency)
+	start := time.Now()
+	results := s.oracle.Resolve(ctx, oracle.ActionSubscribe, id, reqs)
+	elapsed := time.Since(start)
 	for j, i := range idx {
-		g.Go(func() error {
-			out[j] = s.prepareShape(ctx, id, specs[i])
-			return nil
-		})
+		p := out[i]
+		if err := results[j].Err; err != nil {
+			s.mapOracleErr(&p.res, err)
+			out[i] = p
+			continue
+		}
+		grant := results[j].Grant
+		tierLabel := s.tierLabel(grant.Decision)
+		metrics.AuthzResolveSeconds.WithLabelValues(tierLabel).Observe(elapsed.Seconds())
+		metrics.AuthzResolutions.WithLabelValues(tierLabel, "granted").Inc()
+		if d := grant.Decision; d != nil && d.Tier == authz.TierC && s.oracle.Name() == oracle.NameRLS {
+			metrics.AuthzCompileFailures.WithLabelValues(p.rel.Schema, p.rel.Name, truncate(d.Reason, 60)).Inc()
+		}
+		p.grant = grant
+		out[i] = p
 	}
-	_ = g.Wait()
-	m := make(map[int]preparedShape, len(idx))
-	for j, i := range idx {
-		m[i] = out[j]
-	}
-	return m
+	return out
+}
+
+// prepareShape checks and resolves one shape, which has a label.
+func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSpec) preparedShape {
+	return s.prepareShapes(ctx, id, []subSpec{spec}, 1)[0]
 }
 
 // preparedShape is a shape request validated and resolved by the oracle, not
@@ -748,7 +763,9 @@ type preparedShape struct {
 	requested registry.Requested
 }
 
-func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSpec) preparedShape {
+// checkShape validates a shape request against the catalog, before the oracle
+// is asked about it.
+func (s *Server) checkShape(spec subSpec) preparedShape {
 	p := preparedShape{res: subResult{Sub: spec.Sub}}
 	sp := spec.Shape
 
@@ -792,27 +809,7 @@ func (s *Server) prepareShape(ctx context.Context, id authz.Identity, spec subSp
 		p.res.warn = true
 		return p
 	}
-
-	start := time.Now()
-	grant, err := s.oracle.Resolve(ctx, oracle.Request{
-		Action:   oracle.ActionSubscribe,
-		Identity: id,
-		Relation: rel,
-		Filter:   filter,
-		Columns:  sp.Columns,
-		Ops:      sp.Ops,
-	})
-	if err != nil {
-		s.mapOracleErr(&p.res, err)
-		return p
-	}
-	tierLabel := s.tierLabel(grant.Decision)
-	metrics.AuthzResolveSeconds.WithLabelValues(tierLabel).Observe(time.Since(start).Seconds())
-	metrics.AuthzResolutions.WithLabelValues(tierLabel, "granted").Inc()
-	if d := grant.Decision; d != nil && d.Tier == authz.TierC && s.oracle.Name() == oracle.NameRLS {
-		metrics.AuthzCompileFailures.WithLabelValues(rel.Schema, rel.Name, truncate(d.Reason, 60)).Inc()
-	}
-	p.rel, p.ops, p.grant = rel, ops, grant
+	p.rel, p.ops = rel, ops
 	p.requested = registry.Requested{Filter: filter, Columns: sp.Columns, Ops: sp.Ops}
 	return p
 }
@@ -1348,15 +1345,17 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	st.SetIdentity(newID)
 
 	revoked := 0
-	for _, sub := range s.reg.StreamSubscriptions(st.StreamID()) {
-		if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
-			result := s.refreshIssuerShape(r.Context(), st, sub, newID)
+	subs := s.reg.StreamSubscriptions(st.StreamID())
+	if s.oracle != nil && s.oracle.Name() == oracle.NameIssuer {
+		for _, result := range s.refreshIssuerShapes(r.Context(), st, subs, newID) {
 			metrics.AuthzLeaseRefreshes.WithLabelValues(result).Inc()
 			if result != "held" {
 				revoked++
 			}
-			continue
 		}
+		subs = nil
+	}
+	for _, sub := range subs {
 		eqs := sub.Filter.Equalities
 		held, err := s.oracle.LeaseTick(r.Context(), sub.Decision, sub.Relation, newID, eqs)
 		if err != nil || !held {
@@ -1711,44 +1710,48 @@ func issuerUnavailable(e *oracle.ErrUnavailable) event.Error {
 		Retryable: true, RetryAfterMs: delay.Milliseconds()}
 }
 
-// refreshIssuerShape is the /token path for the issuer oracle: re-ask the
-// issuer, then apply the grant without a window where the shape is live and
-// unwatched. It returns the lease-refresh outcome: held, revoked or unavailable.
+// refreshIssuerShapes is the /token path for the issuer oracle: re-ask the
+// issuer about every shape of the stream in one call, then apply each grant
+// without a window where the shape is live and unwatched. It returns each
+// shape's lease-refresh outcome: held, revoked or unavailable.
 //
 // An issuer that gives no verdict fails closed: the shape is dropped with the
 // retryable issuer_unavailable, and the client subscribes again. Keeping the
 // previous grant instead would let a token that changed what its holder may see
 // keep the old view for as long as the issuer is down.
-func (s *Server) refreshIssuerShape(ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) string {
-	// Ask about what the client requested, as at subscribe. The effective filter
-	// already holds the previous grant's terms; narrowing it again would add
-	// them once more on every renewal, and a grant could never widen back.
-	req := sub.Requested
-	if req.Filter == nil {
-		req = registry.Requested{Filter: sub.Filter, Columns: sub.Columns}
+func (s *Server) refreshIssuerShapes(ctx context.Context, st *hub.Stream, subs []*registry.Subscription, id authz.Identity) []string {
+	reqs := make([]oracle.Request, len(subs))
+	for k, sub := range subs {
+		// Ask about what the client requested, as at subscribe. The effective
+		// filter already holds the previous grant's terms; narrowing it again
+		// would add them once more on every renewal, and a grant could never
+		// widen back.
+		req := sub.Requested
+		if req.Filter == nil {
+			req = registry.Requested{Filter: sub.Filter, Columns: sub.Columns}
+		}
+		reqs[k] = oracle.Request{Label: sub.Label, Relation: sub.Relation,
+			Filter: req.Filter, Columns: req.Columns, Ops: req.Ops}
 	}
-	grant, err := s.oracle.Refresh(ctx, oracle.Request{
-		Action:   oracle.ActionRefresh,
-		Identity: id,
-		Relation: sub.Relation,
-		Filter:   req.Filter,
-		Columns:  req.Columns,
-		Ops:      req.Ops,
-	})
-	var unavailable *oracle.ErrUnavailable
-	if errors.As(err, &unavailable) {
-		s.revokeShape(ctx, st, sub.Label, true, issuerUnavailable(unavailable))
-		return "unavailable"
+	out := make([]string, len(subs))
+	for k, res := range s.oracle.Resolve(ctx, oracle.ActionRefresh, id, reqs) {
+		label := subs[k].Label
+		var unavailable *oracle.ErrUnavailable
+		switch {
+		case errors.As(res.Err, &unavailable):
+			s.revokeShape(ctx, st, label, true, issuerUnavailable(unavailable))
+			out[k] = "unavailable"
+		case res.Err != nil || res.Grant == nil:
+			s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized",
+				Message: "the refreshed token no longer grants access to this shape"})
+			out[k] = "revoked"
+		case !s.applyIssuerGrant(ctx, st, label, res.Grant):
+			out[k] = "revoked"
+		default:
+			out[k] = "held"
+		}
 	}
-	if err != nil || grant == nil {
-		s.revokeShape(ctx, st, sub.Label, false, event.Error{Code: "shape_not_authorized",
-			Message: "the refreshed token no longer grants access to this shape"})
-		return "revoked"
-	}
-	if !s.applyIssuerGrant(ctx, st, sub.Label, grant) {
-		return "revoked"
-	}
-	return "held"
+	return out
 }
 
 // applyIssuerGrant installs a refresh grant on a live shape. Holds are

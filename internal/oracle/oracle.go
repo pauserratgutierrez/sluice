@@ -35,12 +35,18 @@ const (
 
 // Request is one shape the caller wants to subscribe to or refresh.
 type Request struct {
-	Action   Action
-	Identity authz.Identity
+	Label    string // the client's label for it, `sub`
 	Relation *catalog.Relation
 	Filter   *shape.Filter // client-requested; may be empty
 	Columns  []string      // client-requested; empty means all columns
 	Ops      []string
+}
+
+// Result is the decision on one Request: a grant, or the error that says why
+// there is none.
+type Result struct {
+	Grant *Grant
+	Err   error
 }
 
 // Grant is the mechanical result of a decision. Decision is internal and is
@@ -57,8 +63,11 @@ type Grant struct {
 // Oracle resolves shapes at subscribe and token-refresh time.
 type Oracle interface {
 	Name() string
-	Resolve(ctx context.Context, req Request) (*Grant, error)
-	Refresh(ctx context.Context, req Request) (*Grant, error)
+	// Resolve decides every shape of one request at once, for one identity,
+	// and returns a result per shape, in order. A stream opens, subscribes
+	// and presents a new token with several shapes together, and an issuer
+	// answers them in one round trip.
+	Resolve(ctx context.Context, action Action, id authz.Identity, reqs []Request) []Result
 	LeaseTick(ctx context.Context, h *authz.Handle, rel *catalog.Relation, id authz.Identity, eqs map[string]expr.Value) (held bool, err error)
 	SnapshotImpersonate() bool
 }
@@ -79,8 +88,9 @@ func (e *ErrDenied) WireCode() string {
 }
 
 // ErrUnavailable is an issuer that gave no verdict: it was unreachable, timed
-// out, answered 5xx, 408 or 429, or sent a body that could not be read. It is
-// not a denial, and the shape may be asked for again.
+// out, answered 5xx, 408 or 429, sent a body that could not be read, or sent
+// results that did not answer each shape. It is not a denial, and the shape
+// may be asked for again.
 type ErrUnavailable struct {
 	Reason string
 	// RetryAfter is the delay the issuer asked for with Retry-After, or zero.

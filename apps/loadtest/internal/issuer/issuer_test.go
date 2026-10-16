@@ -30,12 +30,8 @@ func TestDecideRooms(t *testing.T) {
 	s.rooms[3] = map[string]bool{"u1": true}
 	s.userRm["u1"] = 3
 
-	req := func(table, filter, sub string) issuerRequest {
-		var r issuerRequest
-		r.Identity.Sub = sub
-		r.Requested.Table = table
-		r.Requested.Filter = filter
-		return r
+	req := func(table, filter, sub string) (string, requested) {
+		return sub, requested{Table: table, Filter: filter}
 	}
 	allow := func(m map[string]any) bool { return m["allow"] == true }
 

@@ -589,7 +589,8 @@ func roomsMarkdown(r RoomsReport) string {
 	if holdOrder == "" {
 		holdOrder = "room-first"
 	}
-	fmt.Fprintf(&b, "- Issuer: %slatency %s, %s calls at once, hook ttl %s, membership holds %s\n", issuerName, orDash(r.Env["LOAD_ISSUER_LATENCY"]),
+	fmt.Fprintf(&b, "- Issuer: %slatency %s per call and %s per shape, %s calls at once, hook ttl %s, membership holds %s\n", issuerName,
+		orDash(r.Env["LOAD_ISSUER_LATENCY"]), orDash(r.Env["LOAD_ISSUER_SHAPE_LATENCY"]),
 		orDash(r.Env["LOAD_ISSUER_CONCURRENCY"]), orDash(r.Env["LOAD_HOOK_TTL"]), holdOrder)
 	fmt.Fprintf(&b, "- Host power plan: %s\n", orDash(r.Env["HOST_POWER_PLAN"]))
 	if v := r.Env["SLUICE_GOMAXPROCS"]; v != "" {

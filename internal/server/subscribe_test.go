@@ -12,34 +12,36 @@ import (
 )
 
 // slowOracle grants every shape after a delay, except the filters in deny, and
-// records how many resolutions overlapped.
+// records how many calls it got and the most shapes one call asked about.
 type slowOracle struct {
 	stubOracle
-	delay        time.Duration
-	deny         map[string]bool
-	active, peak atomic.Int32
+	delay       time.Duration
+	deny        map[string]bool
+	calls, most atomic.Int32
 }
 
-func (o *slowOracle) Resolve(_ context.Context, req oracle.Request) (*oracle.Grant, error) {
-	n := o.active.Add(1)
-	defer o.active.Add(-1)
-	for p := o.peak.Load(); n > p && !o.peak.CompareAndSwap(p, n); p = o.peak.Load() {
+func (o *slowOracle) Resolve(_ context.Context, _ oracle.Action, _ authz.Identity, reqs []oracle.Request) []oracle.Result {
+	o.calls.Add(1)
+	for n, m := int32(len(reqs)), o.most.Load(); n > m && !o.most.CompareAndSwap(m, n); m = o.most.Load() {
 	}
 	time.Sleep(o.delay)
-	if o.deny[req.Filter.Raw] {
-		return nil, &oracle.ErrDenied{Reason: "denied for the test"}
-	}
-	return &oracle.Grant{
-		Decision: authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}).Load(),
-		Filter:   req.Filter,
-		Columns:  []string{"id", "project_id", "title"},
-	}, nil
+	return eachShape(reqs, func(req oracle.Request) (*oracle.Grant, error) {
+		if o.deny[req.Filter.Raw] {
+			return nil, &oracle.ErrDenied{Reason: "denied for the test"}
+		}
+		return &oracle.Grant{
+			Decision: authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}).Load(),
+			Filter:   req.Filter,
+			Columns:  []string{"id", "project_id", "title"},
+		}, nil
+	})
 }
 
-// A stream opened with several shapes resolves them together, but admits and
-// installs them in request order with the same limits as one at a time: a
-// shape that fails leaves its place to a later one.
-func TestShapesResolveConcurrentlyAndInstallInOrder(t *testing.T) {
+// A stream opened with several shapes resolves the ones that fit in one oracle
+// call, but admits and installs them in request order with the same limits as
+// one at a time: a shape that fails leaves its place to a later one, which is
+// resolved on its own.
+func TestShapesResolveTogetherAndInstallInOrder(t *testing.T) {
 	orc := &slowOracle{
 		stubOracle: stubOracle{name: oracle.NameRLS},
 		delay:      30 * time.Millisecond,
@@ -75,7 +77,7 @@ func TestShapesResolveConcurrentlyAndInstallInOrder(t *testing.T) {
 	if got := len(s.reg.StreamSubscriptions(st.StreamID())); got != 3 {
 		t.Fatalf("%d shapes installed, want 3", got)
 	}
-	if orc.peak.Load() < 2 {
-		t.Fatal("the shapes were resolved one at a time")
+	if most, calls := orc.most.Load(), orc.calls.Load(); most != 3 || calls != 2 {
+		t.Fatalf("%d oracle calls, the largest for %d shapes; want 2, the first for the 3 that fit", calls, most)
 	}
 }

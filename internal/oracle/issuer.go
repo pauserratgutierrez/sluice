@@ -23,11 +23,13 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
-// Issuer asks an application endpoint to authorize a shape. Fail closed: only an
-// allow grants. `allow: false`, a redirect or a 4xx other than 408 and 429 is a
-// deny; no verdict at all (unreachable, timeout, 5xx, 408, 429, an unreadable
-// body) is ErrUnavailable, which grants nothing either but may be retried.
-// There is no allow cache.
+// Issuer asks an application endpoint to authorize shapes, every shape of a
+// request in one call. Fail closed: only an allow grants. A result with
+// `allow: false` denies its shape; a redirect or a 4xx other than 408 and 429
+// denies every shape of the call. No verdict at all (unreachable, timeout,
+// 5xx, 408, 429, an unreadable body, results that do not answer each shape)
+// is ErrUnavailable for every shape of the call, which grants nothing either
+// but may be retried. There is no allow cache.
 type Issuer struct {
 	url    string
 	bearer string
@@ -143,16 +145,28 @@ func errNoIssuerRedirect(*http.Request, []*http.Request) error {
 func (i *Issuer) Name() string              { return NameIssuer }
 func (i *Issuer) SnapshotImpersonate() bool { return false }
 
-func (i *Issuer) Resolve(ctx context.Context, req Request) (*Grant, error) {
-	if req.Action == "" {
-		req.Action = ActionSubscribe
+// Resolve asks the issuer about every shape in one call. A call that gets no
+// verdict -- unreachable, a timeout, a 5xx, 408 or 429, an unreadable body, or
+// results that do not answer each shape -- leaves every shape unavailable;
+// otherwise each result is checked on its own.
+func (i *Issuer) Resolve(ctx context.Context, action Action, id authz.Identity, reqs []Request) []Result {
+	out := make([]Result, len(reqs))
+	if len(reqs) == 0 {
+		return out
 	}
-	return i.decide(ctx, req)
-}
-
-func (i *Issuer) Refresh(ctx context.Context, req Request) (*Grant, error) {
-	req.Action = ActionRefresh
-	return i.decide(ctx, req)
+	body, err := i.roundTrip(ctx, cmp.Or(action, ActionSubscribe), id, reqs)
+	if err == nil && len(body.Results) != len(reqs) {
+		err = &ErrUnavailable{Reason: fmt.Sprintf(
+			"the shape issuer returned %d results for %d shapes", len(body.Results), len(reqs))}
+	}
+	for k, req := range reqs {
+		if err != nil {
+			out[k].Err = err
+			continue
+		}
+		out[k].Grant, out[k].Err = i.decide(ctx, req, body.Results[k])
+	}
+	return out
 }
 
 func (i *Issuer) LeaseTick(context.Context, *authz.Handle, *catalog.Relation, authz.Identity, map[string]expr.Value) (bool, error) {
@@ -160,9 +174,9 @@ func (i *Issuer) LeaseTick(context.Context, *authz.Handle, *catalog.Relation, au
 }
 
 type issuerHTTPRequest struct {
-	Action    string          `json:"action"`
-	Identity  issuerIdentity  `json:"identity"`
-	Requested issuerRequested `json:"requested"`
+	Action    string            `json:"action"`
+	Identity  issuerIdentity    `json:"identity"`
+	Requested []issuerRequested `json:"requested"`
 }
 
 type issuerIdentity struct {
@@ -173,6 +187,7 @@ type issuerIdentity struct {
 }
 
 type issuerRequested struct {
+	Sub     string   `json:"sub"`
 	Schema  string   `json:"schema"`
 	Table   string   `json:"table"`
 	Filter  string   `json:"filter,omitempty"`
@@ -180,7 +195,12 @@ type issuerRequested struct {
 	Ops     []string `json:"ops,omitempty"`
 }
 
+// issuerHTTPResponse answers each requested shape, in order.
 type issuerHTTPResponse struct {
+	Results []issuerResult `json:"results"`
+}
+
+type issuerResult struct {
 	Allow bool         `json:"allow"`
 	Shape *issuerShape `json:"shape"`
 	Holds []issuerHold `json:"holds"`
@@ -199,11 +219,8 @@ type issuerHold struct {
 	Filter string `json:"filter"`
 }
 
-func (i *Issuer) decide(ctx context.Context, req Request) (*Grant, error) {
-	body, err := i.roundTrip(ctx, req)
-	if err != nil {
-		return nil, err
-	}
+// decide checks the issuer's answer to one requested shape.
+func (i *Issuer) decide(ctx context.Context, req Request, body issuerResult) (*Grant, error) {
 	if !body.Allow {
 		return nil, &ErrDenied{Reason: "the shape issuer denied this subscription"}
 	}
@@ -308,36 +325,41 @@ func (i *Issuer) parseHolds(raw []issuerHold) ([]hold.Spec, error) {
 	return out, nil
 }
 
-func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPResponse, error) {
+func (i *Issuer) roundTrip(ctx context.Context, action Action, id authz.Identity, reqs []Request) (*issuerHTTPResponse, error) {
 	claims := json.RawMessage([]byte("{}"))
-	if req.Identity.ClaimsRaw != "" && json.Valid([]byte(req.Identity.ClaimsRaw)) {
-		claims = json.RawMessage(req.Identity.ClaimsRaw)
+	if id.ClaimsRaw != "" && json.Valid([]byte(id.ClaimsRaw)) {
+		claims = json.RawMessage(id.ClaimsRaw)
 	}
-	filter := ""
-	if req.Filter != nil {
-		filter = req.Filter.Raw
-		if filter == "" {
-			filter = req.Filter.Describe()
-			if filter == "(none)" {
-				filter = ""
+	requested := make([]issuerRequested, len(reqs))
+	for k, req := range reqs {
+		filter := ""
+		if req.Filter != nil {
+			filter = req.Filter.Raw
+			if filter == "" {
+				filter = req.Filter.Describe()
+				if filter == "(none)" {
+					filter = ""
+				}
 			}
 		}
-	}
-	payload, err := json.Marshal(issuerHTTPRequest{
-		Action: string(cmpOr(string(req.Action), string(ActionSubscribe))),
-		Identity: issuerIdentity{
-			Role:      req.Identity.Role,
-			Sub:       req.Identity.Sub,
-			SessionID: req.Identity.SessionID,
-			Claims:    claims,
-		},
-		Requested: issuerRequested{
+		requested[k] = issuerRequested{
+			Sub:     req.Label,
 			Schema:  req.Relation.Schema,
 			Table:   req.Relation.Name,
 			Filter:  filter,
 			Columns: req.Columns,
 			Ops:     req.Ops,
+		}
+	}
+	payload, err := json.Marshal(issuerHTTPRequest{
+		Action: string(action),
+		Identity: issuerIdentity{
+			Role:      id.Role,
+			Sub:       id.Sub,
+			SessionID: id.SessionID,
+			Claims:    claims,
 		},
+		Requested: requested,
 	})
 	if err != nil {
 		return nil, &ErrDenied{Reason: "could not encode the shape-issuer request"}
@@ -358,7 +380,7 @@ func (i *Issuer) roundTrip(ctx context.Context, req Request) (*issuerHTTPRespons
 	}
 	defer resp.Body.Close()
 
-	limited := io.LimitReader(resp.Body, 64<<10)
+	limited := io.LimitReader(resp.Body, int64(len(reqs))*64<<10)
 	switch code := resp.StatusCode; {
 	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
 		_, _ = io.Copy(io.Discard, limited)

@@ -1,9 +1,10 @@
 // Command issuer-stub is the harness shape-issuer for cmd/smoke-issuer.
 //
-// Sluice POSTs here; the smoke process is not the issuer. Membership is a live
-// SELECT on iss_project_members (superuser, no cache). GET /healthz does not
-// touch that table. Project "outage" answers 503 with Retry-After, so the smoke
-// can watch Sluice treat an issuer outage as no verdict rather than a denial.
+// Sluice POSTs here, every shape of a request in one call; the smoke process
+// is not the issuer. Membership is a live SELECT on iss_project_members
+// (superuser, no cache). GET /healthz does not touch that table. A call with a
+// shape in project "outage" answers 503 with Retry-After, so the smoke can
+// watch Sluice treat an issuer outage as no verdict rather than a denial.
 package main
 
 import (
@@ -109,13 +110,17 @@ type issuerRequest struct {
 		SessionID string          `json:"session_id"`
 		Claims    json.RawMessage `json:"claims"`
 	} `json:"identity"`
-	Requested struct {
-		Schema  string   `json:"schema"`
-		Table   string   `json:"table"`
-		Filter  string   `json:"filter"`
-		Columns []string `json:"columns"`
-		Ops     []string `json:"ops"`
-	} `json:"requested"`
+	Requested []requested `json:"requested"`
+}
+
+// requested is one shape of a request; the response answers each, in order.
+type requested struct {
+	Sub     string   `json:"sub"`
+	Schema  string   `json:"schema"`
+	Table   string   `json:"table"`
+	Filter  string   `json:"filter"`
+	Columns []string `json:"columns"`
+	Ops     []string `json:"ops"`
 }
 
 func (s *stub) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -139,7 +144,7 @@ func (s *stub) handleShapes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "unreadable body", http.StatusBadRequest)
 		return
@@ -159,29 +164,40 @@ func (s *stub) handleShapes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projectID := parseProjectID(req.Requested.Filter)
-	if projectID == outageProject {
-		w.Header().Set("Retry-After", "2")
-		http.Error(w, "issuer down", http.StatusServiceUnavailable)
-		return
+	// A shape in the outage project fails the whole call, as an issuer that is
+	// down would.
+	for _, q := range req.Requested {
+		if parseProjectID(q.Filter) == outageProject {
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "issuer down", http.StatusServiceUnavailable)
+			return
+		}
 	}
-	table := req.Requested.Table
-	if projectID == "" || table != "iss_documents" || req.Identity.Sub == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"allow": false})
-		return
+	results := make([]any, len(req.Requested))
+	for i, q := range req.Requested {
+		res, err := s.decide(r.Context(), req.Identity.Sub, q)
+		if err != nil {
+			http.Error(w, "membership lookup failed", http.StatusInternalServerError)
+			return
+		}
+		results[i] = res
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
 
-	ok, err := s.member(r.Context(), projectID, req.Identity.Sub)
-	if err != nil {
-		http.Error(w, "membership lookup failed", http.StatusInternalServerError)
-		return
+// decide answers one requested shape: a grant for a member of the project, a
+// denial otherwise.
+func (s *stub) decide(ctx context.Context, sub string, q requested) (map[string]any, error) {
+	deny := map[string]any{"allow": false}
+	projectID := parseProjectID(q.Filter)
+	if projectID == "" || q.Table != "iss_documents" || sub == "" {
+		return deny, nil
 	}
-	if !ok {
-		writeJSON(w, http.StatusOK, map[string]any{"allow": false})
-		return
+	ok, err := s.member(ctx, projectID, sub)
+	if err != nil || !ok {
+		return deny, err
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"allow": true,
 		"shape": map[string]any{
 			"schema": "public",
@@ -191,9 +207,9 @@ func (s *stub) handleShapes(w http.ResponseWriter, r *http.Request) {
 		"holds": []map[string]any{{
 			"schema": "public",
 			"table":  "iss_project_members",
-			"filter": "project_id=eq." + projectID + ",user_id=eq." + req.Identity.Sub,
+			"filter": "project_id=eq." + projectID + ",user_id=eq." + sub,
 		}},
-	})
+	}, nil
 }
 
 func (s *stub) member(ctx context.Context, projectID, sub string) (bool, error) {

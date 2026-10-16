@@ -25,20 +25,22 @@ func TestTokenRefreshAsksAboutTheRequestedShape(t *testing.T) {
 	var asked []string // the requested filter of each issuer call
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Requested struct {
+			Requested []struct {
 				Filter string `json:"filter"`
 			} `json:"requested"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		mu.Lock()
-		asked = append(asked, body.Requested.Filter)
+		for _, req := range body.Requested {
+			asked = append(asked, req.Filter)
+		}
 		mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "documents", "filter": "project_id=eq.42"},
 			"holds": []map[string]any{{"schema": "public", "table": "project_members",
 				"filter": "user_id=eq.u1,project_id=eq.42"}},
-		})
+		}}})
 	}))
 	t.Cleanup(srv.Close)
 	cat := catalog.New(nil)
@@ -65,7 +67,7 @@ func TestTokenRefreshAsksAboutTheRequestedShape(t *testing.T) {
 
 	for range 50 {
 		sub := s.reg.Get(st.StreamID(), "docs")
-		if got := s.refreshIssuerShape(ctx, st, sub, id); got != "held" {
+		if got := refreshOne(s, ctx, st, sub, id); got != "held" {
 			t.Fatalf("refresh: %s", got)
 		}
 	}
@@ -92,12 +94,12 @@ func TestTokenRefreshFollowsAGrantThatWidens(t *testing.T) {
 		mu.Lock()
 		f := grant
 		mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{
 			"allow": true,
 			"shape": map[string]any{"schema": "public", "table": "documents", "filter": f},
 			"holds": []map[string]any{{"schema": "public", "table": "project_members",
 				"filter": "user_id=eq.u1,project_id=eq.42"}},
-		})
+		}}})
 	}))
 	t.Cleanup(srv.Close)
 	cat := catalog.New(nil)
@@ -123,7 +125,7 @@ func TestTokenRefreshFollowsAGrantThatWidens(t *testing.T) {
 		mu.Lock()
 		grant = g
 		mu.Unlock()
-		if got := s.refreshIssuerShape(ctx, st, s.reg.Get(st.StreamID(), "docs"), id); got != "held" {
+		if got := refreshOne(s, ctx, st, s.reg.Get(st.StreamID(), "docs"), id); got != "held" {
 			t.Fatalf("refresh: %s", got)
 		}
 		return s.reg.Get(st.StreamID(), "docs").Filter.Describe()
@@ -133,5 +135,70 @@ func TestTokenRefreshFollowsAGrantThatWidens(t *testing.T) {
 	}
 	if got := renew("project_id=eq.42"); got != "project_id=eq.42" {
 		t.Fatalf("a grant that widens back must widen the shape back, got %s", got)
+	}
+}
+
+// A stream that opens with several shapes asks the issuer about all of them
+// in one call, and POST /token renews all of them in one more.
+func TestIssuerShapesOfARequestShareOneCall(t *testing.T) {
+	var mu sync.Mutex
+	var calls []int // the shapes asked about in each issuer call
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Requested []json.RawMessage `json:"requested"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		calls = append(calls, len(body.Requested))
+		mu.Unlock()
+		results := make([]any, len(body.Requested))
+		for i := range results {
+			results[i] = map[string]any{
+				"allow": true,
+				"shape": map[string]any{"schema": "public", "table": "documents", "filter": "project_id=eq.42"},
+				"holds": []map[string]any{{"schema": "public", "table": "project_members",
+					"filter": "user_id=eq.u1,project_id=eq.42"}},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	t.Cleanup(srv.Close)
+	cat := catalog.New(nil)
+	cat.PutForTest(docsRel(), membersRel())
+	iss, err := oracle.NewIssuerWith(oracle.IssuerOptions{
+		URL: srv.URL, Bearer: "issuer-secret", Timeout: 2 * time.Second, Client: srv.Client(),
+		Lookup: cat.Lookup,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, iss)
+	s.cat = cat
+	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
+
+	ctx := context.Background()
+	id := authz.Identity{Sub: "u1", Role: "authenticated"}
+	st := s.hub.Open("n1.1", "", id)
+	specs := []subSpec{
+		{Sub: "a", Shape: &shapeSpec{Table: "documents"}},
+		{Sub: "b", Shape: &shapeSpec{Table: "documents", Columns: []string{"id", "title"}}},
+		{Sub: "c", Shape: &shapeSpec{Table: "documents", Filter: "title=eq.x"}},
+	}
+	for _, r := range s.applySubscriptions(ctx, st, id, specs, nil) {
+		if !r.OK {
+			t.Fatalf("subscribe %s: %+v", r.Sub, r.Error)
+		}
+	}
+	subs := s.reg.StreamSubscriptions(st.StreamID())
+	for k, got := range s.refreshIssuerShapes(ctx, st, subs, id) {
+		if got != "held" {
+			t.Fatalf("refresh of %s: %s", subs[k].Label, got)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 || calls[0] != 3 || calls[1] != 3 {
+		t.Fatalf("issuer calls asked about %v shapes, want [3 3]", calls)
 	}
 }

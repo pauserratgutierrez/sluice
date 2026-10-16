@@ -4,7 +4,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ## 0.10.0
 
-A stream opened while the replication slot was being created could miss changes. A process now refuses new streams until it replicates. Tested with PostgreSQL 18.6.
+A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode every shape of a request goes to the issuer in one call (breaking for issuers). Tested with PostgreSQL 18.6.
 
 ### Fixed
 
@@ -15,6 +15,11 @@ A stream opened while the replication slot was being created could miss changes.
 
 ### Changed
 
+- **Breaking, issuer mode: Sluice asks the issuer about every shape of a request in one call.** A stream opening, `POST /subscribe` and `POST /token` each make one call, instead of one per shape. An issuer must change to the new format.
+  - The request's `requested` is a list, one entry per shape with the client's label as `sub`; the response is `{"results": [...]}`, one result per requested shape, in order, each what a response used to be (`allow`, `shape`, `holds`).
+  - A result with `allow: false` denies its shape only. A call that gets no verdict (unreachable, a timeout, a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each shape) leaves every shape of the call `issuer_unavailable`; a redirect or another `4xx` denies them all.
+  - Before: a stream with 7 shapes made 7 calls, 4 at a time, and `POST /token` renewed them in turn, one after the other. In a reconnect of every stream, the calls queued at the issuer, timed out, and were retried.
+  - Measured on 1 CPU and 512 MB in a reconnect of all of a full node's 5,775 streams, with a test issuer charging 5–20 ms per call plus 2 ms per shape: no `issuer_unavailable` (938 before), a third less CPU in the reconnect (31 s against 44), opens at p50 0.24 s instead of 2.7 s, and message p99 18 ms instead of 95 ms on the streams already back.
 - **New streams are refused with `503 not_replicating` and a `Retry-After` of 1 to 5 s until the process starts replicating**, both while it creates the slot and while it stands by for the reader lock.
   - A process standing by used to accept streams and deliver nothing until it took over.
   - Once replication has started, streams keep opening while the reader reconnects: it resumes from the slot's confirmed position and loses nothing.

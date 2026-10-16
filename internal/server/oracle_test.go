@@ -28,16 +28,30 @@ import (
 type stubOracle struct{ name string }
 
 func (s stubOracle) Name() string { return s.name }
-func (s stubOracle) Resolve(context.Context, oracle.Request) (*oracle.Grant, error) {
-	return nil, &oracle.ErrDenied{Reason: "unused"}
-}
-func (s stubOracle) Refresh(context.Context, oracle.Request) (*oracle.Grant, error) {
-	return nil, &oracle.ErrDenied{Reason: "unused"}
+func (s stubOracle) Resolve(_ context.Context, _ oracle.Action, _ authz.Identity, reqs []oracle.Request) []oracle.Result {
+	return eachShape(reqs, func(oracle.Request) (*oracle.Grant, error) {
+		return nil, &oracle.ErrDenied{Reason: "unused"}
+	})
 }
 func (s stubOracle) LeaseTick(context.Context, *authz.Handle, *catalog.Relation, authz.Identity, map[string]expr.Value) (bool, error) {
 	return true, nil
 }
 func (s stubOracle) SnapshotImpersonate() bool { return s.name != oracle.NameIssuer }
+
+// eachShape answers Oracle.Resolve one shape at a time, for test doubles that
+// decide each shape on its own.
+func eachShape(reqs []oracle.Request, decide func(oracle.Request) (*oracle.Grant, error)) []oracle.Result {
+	out := make([]oracle.Result, len(reqs))
+	for i, req := range reqs {
+		out[i].Grant, out[i].Err = decide(req)
+	}
+	return out
+}
+
+// refreshOne renews one shape the way POST /token renews all of a stream's.
+func refreshOne(s *Server, ctx context.Context, st *hub.Stream, sub *registry.Subscription, id authz.Identity) string {
+	return s.refreshIssuerShapes(ctx, st, []*registry.Subscription{sub}, id)[0]
+}
 
 func testServer(t *testing.T, orc oracle.Oracle) *Server {
 	t.Helper()
@@ -339,20 +353,24 @@ func (r tokenRow) Column(name string) (expr.Value, bool) {
 
 type refreshOracle struct {
 	stubOracle
-	mu    sync.Mutex
-	grant *oracle.Grant
-	err   error
-	last  oracle.Request
+	mu         sync.Mutex
+	grant      *oracle.Grant
+	err        error
+	lastAction oracle.Action
+	last       oracle.Request
 }
 
-func (o *refreshOracle) Refresh(_ context.Context, req oracle.Request) (*oracle.Grant, error) {
+func (o *refreshOracle) Resolve(_ context.Context, action oracle.Action, _ authz.Identity, reqs []oracle.Request) []oracle.Result {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.last = req
-	if o.err != nil {
-		return nil, o.err
-	}
-	return o.grant, nil
+	o.lastAction = action
+	return eachShape(reqs, func(req oracle.Request) (*oracle.Grant, error) {
+		o.last = req
+		if o.err != nil {
+			return nil, o.err
+		}
+		return o.grant, nil
+	})
 }
 
 func issuerLiveSub(t *testing.T, s *Server, st *hub.Stream, filter *shape.Filter, columns []string, holdFilter *shape.Filter) *registry.Subscription {
@@ -457,11 +475,11 @@ func TestTokenRefreshAppliesNarrowerGrant(t *testing.T) {
 	st := s.hub.Open("n1.token-narrow", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	sub := issuerLiveSub(t, s, st, wide, []string{"id", "project_id", "title"}, holdF)
 
-	if s.refreshIssuerShape(context.Background(), st, sub, st.Identity()) != "held" {
+	if refreshOne(s, context.Background(), st, sub, st.Identity()) != "held" {
 		t.Fatal("an allowed refresh must keep the shape")
 	}
-	if orc.last.Action != oracle.ActionRefresh {
-		t.Fatalf("action = %q, want refresh", orc.last.Action)
+	if orc.lastAction != oracle.ActionRefresh {
+		t.Fatalf("action = %q, want refresh", orc.lastAction)
 	}
 
 	live := s.reg.Get(st.StreamID(), "docs")
