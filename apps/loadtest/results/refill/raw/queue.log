@@ -1,0 +1,58 @@
+2026-10-16T12:19:29Z start refill-diag-baseline reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+2026-10-16T12:34:29Z done refill-diag-baseline status=0 took=900s
+2026-10-16T13:21:51Z skip refill-diag-baseline (already measured)
+2026-10-16T13:21:51Z start refill-diag-baseline2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+2026-10-16T13:35:26Z done refill-diag-baseline2 status=0 took=815s
+2026-10-16T13:41:19Z skip refill-diag-baseline (already measured)
+2026-10-16T13:41:19Z skip refill-diag-baseline2 (already measured)
+2026-10-16T13:41:19Z start refill-allowance reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+2026-10-16T13:54:54Z done refill-allowance status=0 took=815s
+2026-10-16T14:35:43Z skip refill-diag-baseline (already measured)
+2026-10-16T14:35:44Z skip refill-diag-baseline2 (already measured)
+2026-10-16T14:35:44Z skip refill-allowance (already measured)
+2026-10-16T14:35:44Z start refill-allowance-prof reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=4m05s LOAD_PPROF_SECONDS=30s LOAD_PPROF_HEAP_AT=3m30s,6m
+2026-10-16T14:49:20Z done refill-allowance-prof status=0 took=816s
+2026-10-16T14:52:23Z skip refill-diag-baseline (already measured)
+2026-10-16T14:52:23Z skip refill-diag-baseline2 (already measured)
+2026-10-16T14:52:23Z skip refill-allowance (already measured)
+2026-10-16T14:52:24Z skip refill-allowance-prof (already measured)
+2026-10-16T14:52:24Z start refill-allowance-conns reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+2026-10-16T15:10:20Z done refill-allowance-conns status=0 took=1076s
+2026-10-16T15:11:32Z skip refill-diag-baseline (already measured)
+2026-10-16T15:11:32Z skip refill-diag-baseline2 (already measured)
+2026-10-16T15:11:32Z skip refill-allowance (already measured)
+2026-10-16T15:11:32Z skip refill-allowance-prof (already measured)
+2026-10-16T15:11:33Z skip refill-allowance-conns (already measured)
+2026-10-16T15:11:33Z start refill-allowance-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+2026-10-16T15:25:09Z done refill-allowance-r2 status=0 took=816s
+2026-10-16T15:45:58Z skip refill-diag-baseline (already measured)
+2026-10-16T15:45:58Z skip refill-diag-baseline2 (already measured)
+2026-10-16T15:45:59Z skip refill-allowance (already measured)
+2026-10-16T15:45:59Z skip refill-allowance-prof (already measured)
+2026-10-16T15:45:59Z skip refill-allowance-conns (already measured)
+2026-10-16T15:45:59Z skip refill-allowance-r2 (already measured)
+2026-10-16T15:45:59Z start refill-batch-oldadm reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-oldadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+2026-10-16T15:59:36Z done refill-batch-oldadm status=0 took=817s
+2026-10-16T15:59:36Z start refill-batch-newadm reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-newadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+2026-10-16T16:13:09Z done refill-batch-newadm status=0 took=813s
+2026-10-16T16:14:06Z skip refill-diag-baseline (already measured)
+2026-10-16T16:14:06Z skip refill-diag-baseline2 (already measured)
+2026-10-16T16:14:06Z skip refill-allowance (already measured)
+2026-10-16T16:14:07Z skip refill-allowance-prof (already measured)
+2026-10-16T16:14:07Z skip refill-allowance-conns (already measured)
+2026-10-16T16:14:07Z skip refill-allowance-r2 (already measured)
+2026-10-16T16:14:08Z skip refill-batch-oldadm (already measured)
+2026-10-16T16:14:08Z skip refill-batch-newadm (already measured)
+2026-10-16T16:14:08Z start refill-batch-newadm-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-newadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+2026-10-16T16:27:42Z done refill-batch-newadm-r2 status=0 took=814s
+2026-10-16T16:32:03Z skip refill-diag-baseline (already measured)
+2026-10-16T16:32:03Z skip refill-diag-baseline2 (already measured)
+2026-10-16T16:32:04Z skip refill-allowance (already measured)
+2026-10-16T16:32:04Z skip refill-allowance-prof (already measured)
+2026-10-16T16:32:04Z skip refill-allowance-conns (already measured)
+2026-10-16T16:32:04Z skip refill-allowance-r2 (already measured)
+2026-10-16T16:32:04Z skip refill-batch-oldadm (already measured)
+2026-10-16T16:32:05Z skip refill-batch-newadm (already measured)
+2026-10-16T16:32:05Z skip refill-batch-newadm-r2 (already measured)
+2026-10-16T16:32:05Z start refill-batch-fit reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-fit SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+2026-10-16T16:45:39Z done refill-batch-fit status=0 took=814s

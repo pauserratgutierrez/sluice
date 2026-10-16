@@ -1,0 +1,36 @@
+# Refill after a full reconnect at the admission threshold. 1 CPU, 512 MB,
+# default admission, the phase 3 storm (plans/phase3-storm.plan). Run with
+#   scripts/queue.sh plans/refill.plan results/refill/raw
+# Baseline with heap profiles before the cut (3m30s) and after the refill (7m30s).
+refill-diag-baseline reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+# The first baseline overlapped another project's load test on the same host
+# (CPU contention: issuer timeouts, 11 ms of CPU per open) and is void. Rerun
+# without the block and mutex profiles.
+refill-diag-baseline2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+# Admission lets the streams that fit come back: up to the most streams a
+# collection found below the threshold in the last 5 minutes, the projection may
+# reach a fifth of the way to the limit (0.6); no hysteresis or hold.
+refill-allowance reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=7m LOAD_PPROF_SECONDS=10s LOAD_PPROF_HEAP_AT=3m30s,7m30s
+# The same, profiled through the refill: CPU from 5 s after the cut for 30 s,
+# then heap and goroutines while the extra goroutines are still there.
+refill-allowance-prof reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first SLUICE_PPROF_ADDR=0.0.0.0:6060 SLUICE_PPROF_BLOCK_RATE=0 SLUICE_PPROF_MUTEX_FRACTION=0 LOAD_PPROF_AT=4m05s LOAD_PPROF_SECONDS=30s LOAD_PPROF_HEAP_AT=3m30s,6m
+# The profiled run above is void as a measurement: the goroutine dump and the
+# execution trace landed in the middle of the refill. Its CPU profile showed
+# half of Sluice's CPU dialing the issuer (no cap on connections per host).
+# The same change plus a cap of 64 connections per host to the issuer and to
+# hooks, without profiling.
+refill-allowance-conns reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+# refill-allowance-conns failed: Go memory 898 MiB, 77,799 issuer_unavailable,
+# message p95 103 s. With the cap, a call's wait for a connection counts
+# against the 2 s issuer timeout, so most calls of the wave timed out inside
+# Sluice without reaching the issuer (2.9% CPU), and every one was retried.
+# The cap is reverted. A second run of the admission change alone:
+refill-allowance-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
+# The issuer is asked about every shape of a request in one call (open,
+# /subscribe, /token). The issuer stub charges 5-20 ms per call plus 2 ms per
+# shape. First with the admission of 0.9 (hysteresis and hold), then with the
+# reconnect headroom.
+refill-batch-oldadm reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-oldadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+refill-batch-newadm reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-newadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+refill-batch-newadm-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-newadm SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+refill-batch-fit reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:refill-batch-fit SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
