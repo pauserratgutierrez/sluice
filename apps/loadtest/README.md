@@ -174,6 +174,7 @@ Production-shaped profiles:
 | `LOAD_PPROF_HEAP_AT` | `2m,9m` | with `LOAD_PPROF_AT`, also heap profiles at these times into the steady phase |
 | `LOAD_ISSUER_NAME` | unset | names the issuer's configuration in the report |
 | `SLUICE_GOMAXPROCS`, `SLUICE_PPROF_ADDR` | unset | Sluice's `GOMAXPROCS` (else Go's default for the quota) and pprof address (`pprof` builds) |
+| `SLUICE_PPROF_BLOCK_RATE`, `SLUICE_PPROF_MUTEX_FRACTION` | unset (`100000`, `100`) | block and mutex profile sampling of a `pprof` build; `0` turns either off, for runs that only need heap profiles |
 | `RESULTS_DIR` | `./results` | where reports go (`scripts/queue.sh` sets it) |
 | `HOST_POWER_PLAN` | detected | recorded in each report; `scripts/run.sh` reads the Windows power plan or the Linux CPU governor |
 | `SLUICE_RECONNECT_SPREAD`, `SLUICE_ISSUER_TIMEOUT`, `SLUICE_CATALOG_REFRESH`, `SLUICE_HEARTBEAT`, `SLUICE_DB_POOL_MAX_CONNS`, `SLUICE_RING_*`, `SLUICE_STREAM_QUEUE`, `SLUICE_LOG_LEVEL`, `SLUICE_GOMEMLIMIT`, `SLUICE_GOGC` | Sluice's defaults | passed to `sluice-rooms` |

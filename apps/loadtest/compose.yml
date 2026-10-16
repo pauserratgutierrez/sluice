@@ -429,6 +429,8 @@ services:
       GOGC: ${SLUICE_GOGC:-}
       GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
       SLUICE_PPROF_ADDR: ${SLUICE_PPROF_ADDR:-}
+      SLUICE_PPROF_BLOCK_RATE: ${SLUICE_PPROF_BLOCK_RATE:-}
+      SLUICE_PPROF_MUTEX_FRACTION: ${SLUICE_PPROF_MUTEX_FRACTION:-}
     healthcheck:
       test: ["CMD", "/sluice", "-readycheck"]
       interval: 2s
