@@ -556,16 +556,8 @@ func TestTokenRefreshAppliesNarrowerGrant(t *testing.T) {
 		t.Fatalf("columns = %v, title must drop from the projection", live.Columns)
 	}
 
-	lookup := func(vals map[string]string) func(string) (expr.Value, bool) {
-		return func(col string) (expr.Value, bool) {
-			v, ok := vals[col]
-			if !ok {
-				return expr.Null, false
-			}
-			return expr.Text(v), true
-		}
-	}
-	if got := s.reg.Candidates(rel.OID, lookup(map[string]string{"project_id": "42"})); len(got) != 1 {
+	key := func(col string) (string, bool) { return "42", col == "project_id" }
+	if got := s.reg.Candidates(rel.OID, key); len(got) != 1 {
 		t.Fatalf("routing must still find the shape, got %d", len(got))
 	}
 

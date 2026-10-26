@@ -1,11 +1,15 @@
 package server
 
 import (
+	"cmp"
 	"encoding/json"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
@@ -27,6 +31,11 @@ import (
 // known=false, which propagates as expr.ErrUnknown and forces the caller to mark
 // the event degraded instead of silently deciding. Reporting it as NULL would be
 // a correctness bug in whichever direction the policy happened to compare.
+//
+// Text is read in place: a value's string is a view of the tuple's bytes, which
+// the decoder never writes again (pgoutput.Column), so reading a column copies
+// nothing. A string kept past the change must be copied (strings.Clone), or it
+// keeps the whole message alive.
 type tupleRow struct {
 	rel *pgoutput.Relation
 	t   *pgoutput.Tuple
@@ -47,12 +56,33 @@ func (r tupleRow) Column(name string) (expr.Value, bool) {
 	case pgoutput.ColUnchanged:
 		return expr.Null, false
 	case pgoutput.ColText:
-		return expr.ParseText(r.rel.Columns[i].TypeName, string(c.Data)), true
+		return expr.ParseText(r.rel.Columns[i].TypeName, inPlace(c.Data)), true
 	}
 	// Binary format is not requested; carry it through as unknown rather than
 	// guessing at an encoding.
 	return expr.Null, false
 }
+
+// key reads a column as the routing indexes list it, by the Value.String() of
+// its value. The text of most types already is that, and is returned in place,
+// without parsing; bool, float and numeric columns are parsed.
+func (r tupleRow) key(name string) (string, bool) {
+	if r.t == nil {
+		return "", false
+	}
+	i := r.rel.ColumnIndex(name)
+	if i < 0 || i >= len(r.t.Columns) {
+		return "", false
+	}
+	if c := r.t.Columns[i]; c.Kind == pgoutput.ColText && expr.TextIsCanonical(r.rel.Columns[i].TypeName) {
+		return inPlace(c.Data), true
+	}
+	v, ok := r.Column(name)
+	return v.String(), ok
+}
+
+// inPlace is a tuple's text as a string, without copying it (see tupleRow).
+func inPlace(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
 // OnStart fixes the start of what the resume buffer can cover, and lets
 // streams open from the first start on.
@@ -94,6 +124,7 @@ func (s *Server) OnCommit(lsn uint64, commitTime time.Time) {
 // rather than letting them quietly serve a stale projection.
 func (s *Server) OnRelation(old, nw *pgoutput.Relation) {
 	metrics.WALMessages.WithLabelValues("relation").Inc()
+	delete(s.relMetrics, nw.OID)
 
 	// Resolve the revocation tables to OIDs here, once, so the per-change check
 	// is an integer comparison.
@@ -257,8 +288,9 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	if len(s.wakes) > 0 && time.Since(s.txnBegan) >= txnWakeDelay {
 		s.wakeQueued()
 	}
-	metrics.WALMessages.WithLabelValues(strings.ToLower(op)).Inc()
-	metrics.Changes.WithLabelValues(rel.Namespace, rel.Name, op).Inc()
+	rm := s.metricsOf(rel)
+	rm.wal[opIndex(m.Type)].Inc()
+	rm.changes[opIndex(m.Type)].Inc()
 
 	// Session revocation rides the same slot, so a sign-out reaches Sluice in
 	// milliseconds with no polling and no extra query.
@@ -267,10 +299,7 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	}
 
 	start := time.Now()
-	defer func() {
-		metrics.DispatchSeconds.WithLabelValues(rel.Namespace, rel.Name).
-			Observe(time.Since(start).Seconds())
-	}()
+	defer func() { rm.dispatch.Observe(time.Since(start).Seconds()) }()
 
 	newRow := tupleRow{rel: rel, t: m.New}
 	oldRow := tupleRow{rel: rel, t: m.Old}
@@ -296,8 +325,8 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 
 	// Route on both tuples. Routing only on the new one would miss a row that
 	// left a shape (supabase/walrus#64).
-	candidates := s.reg.Candidates(rel.OID, newRow.Column, oldRow.Column)
-	metrics.RoutingCandidates.WithLabelValues(rel.Namespace, rel.Name).Observe(float64(len(candidates)))
+	candidates := s.reg.Candidates(rel.OID, newRow.key, oldRow.key)
+	rm.candidates.Observe(float64(len(candidates)))
 
 	// Built once per change and shared by every subscriber: the encodings it
 	// memoises are only computed if some subscription actually needs them.
@@ -310,6 +339,45 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 		s.deliver(sub, m, rel, newRow, oldRow, tuples, commitLSN, commitTime, op, false)
 	}
 	return nil
+}
+
+// relMetrics are the metrics a relation's changes update, each looked up by its
+// labels once rather than for every change. Reader goroutine only; a Relation
+// message drops them, since it may rename the relation.
+type relMetrics struct {
+	wal, changes         [3]prometheus.Counter // by opIndex
+	dispatch, candidates prometheus.Observer
+}
+
+func (s *Server) metricsOf(rel *pgoutput.Relation) *relMetrics {
+	if rm := s.relMetrics[rel.OID]; rm != nil {
+		return rm
+	}
+	rm := &relMetrics{
+		dispatch:   metrics.DispatchSeconds.WithLabelValues(rel.Namespace, rel.Name),
+		candidates: metrics.RoutingCandidates.WithLabelValues(rel.Namespace, rel.Name),
+	}
+	for i, typ := range [3]byte{pgoutput.MsgInsert, pgoutput.MsgUpdate, pgoutput.MsgDelete} {
+		op := opName(typ)
+		rm.wal[i] = metrics.WALMessages.WithLabelValues(strings.ToLower(op))
+		rm.changes[i] = metrics.Changes.WithLabelValues(rel.Namespace, rel.Name, op)
+	}
+	if s.relMetrics == nil {
+		s.relMetrics = map[uint32]*relMetrics{}
+	}
+	s.relMetrics[rel.OID] = rm
+	return rm
+}
+
+// opIndex is a row change's place in relMetrics.
+func opIndex(typ byte) int {
+	switch typ {
+	case pgoutput.MsgInsert:
+		return 0
+	case pgoutput.MsgUpdate:
+		return 1
+	}
+	return 2
 }
 
 // wants reports whether a subscription takes changes of this kind: its ops,
@@ -389,16 +457,16 @@ type projection struct {
 const maxProjections = 8
 
 func (s *Server) newTuples(rel *pgoutput.Relation, m *pgoutput.Message) *tuplePair {
-	pk := primaryKeyOf(rel, m)
+	key := cmp.Or(m.New, m.Old)
 	p := &tuplePair{rel: rel}
 	if s.cat != nil {
 		p.types = s.cat.Types()
 	}
 	if m.New != nil {
-		p.New = &authz.Tuple{Op: m.Type, PK: pk, Rel: rel, Row: m.New}
+		p.New = &authz.Tuple{Op: m.Type, Rel: rel, Row: m.New, Key: key}
 	}
 	if m.Old != nil {
-		p.Old = &authz.Tuple{Op: m.Type, PK: pk, Rel: rel, Row: m.Old}
+		p.Old = &authz.Tuple{Op: m.Type, Rel: rel, Row: m.Old, Key: key}
 	}
 	return p
 }
@@ -682,10 +750,12 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 			return
 		}
 		if v, ok := (tupleRow{rel: rel, t: m.Old}).Column("id"); ok {
-			s.revoker.RevokeSession(v.String())
-			if n := s.closeStreamsForSession(v.String()); n > 0 {
+			// The revoker keeps it, so it is copied out of the message.
+			id := strings.Clone(v.String())
+			s.revoker.RevokeSession(id)
+			if n := s.closeStreamsForSession(id); n > 0 {
 				s.log.Info("session revoked; its streams were closed",
-					"session_id", strings.ToLower(v.String()), "streams", n, "commit_lsn", reader.FormatLSN(commitLSN))
+					"session_id", strings.ToLower(id), "streams", n, "commit_lsn", reader.FormatLSN(commitLSN))
 			}
 		}
 	case s.usersOID.Load():
@@ -706,8 +776,10 @@ func (s *Server) handleRevocation(m *pgoutput.Message, rel *pgoutput.Relation, o
 			s.revoker.UnbanUser(idv.String())
 			return
 		}
-		s.revoker.BanUser(idv.String(), until)
-		if n := s.closeStreamsForUser(idv.String()); n > 0 {
+		// The revoker keeps it, so it is copied out of the message.
+		id := strings.Clone(idv.String())
+		s.revoker.BanUser(id, until)
+		if n := s.closeStreamsForUser(id); n > 0 {
 			s.log.Info("user banned; their streams were closed",
 				"streams", n, "commit_lsn", reader.FormatLSN(commitLSN))
 		}
@@ -829,24 +901,6 @@ func keyOnly(rec *event.Row, keys []string) *event.Row {
 		}
 	}
 	return event.NewRow(out)
-}
-
-func primaryKeyOf(rel *pgoutput.Relation, m *pgoutput.Message) map[string]expr.Value {
-	src := m.New
-	if src == nil {
-		src = m.Old
-	}
-	if src == nil {
-		return nil
-	}
-	row := tupleRow{rel: rel, t: src}
-	out := map[string]expr.Value{}
-	for _, name := range rel.KeyColumns() {
-		if v, ok := row.Column(name); ok && !v.IsNull() {
-			out[name] = v
-		}
-	}
-	return out
 }
 
 // messageFromRing rebuilds a message from a buffered ring entry so that replay

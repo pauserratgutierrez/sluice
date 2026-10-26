@@ -143,13 +143,33 @@ type Row = expr.Row
 // the JSON encoding is memoised.
 type Tuple struct {
 	Op  byte // 'I', 'U' or 'D'
-	PK  map[string]expr.Value
 	Rel *pgoutput.Relation
 	Row *pgoutput.Tuple
+	// Key is the tuple the primary key is read from (see PK): the change's new
+	// tuple when it has one, else its old one.
+	Key *pgoutput.Tuple
 
 	once     sync.Once
 	js       []byte
 	complete bool
+}
+
+// PK returns the key columns the row carries, by name, for the probe by
+// primary key. Only that probe reads it, so it is built when asked rather than
+// for every change.
+func (t *Tuple) PK() map[string]expr.Value {
+	if t.Key == nil || t.Rel == nil {
+		return nil
+	}
+	out := map[string]expr.Value{}
+	for _, name := range t.Rel.KeyColumns() {
+		i := t.Rel.ColumnIndex(name)
+		if i < 0 || i >= len(t.Key.Columns) || t.Key.Columns[i].Kind != pgoutput.ColText {
+			continue
+		}
+		out[name] = expr.ParseText(t.Rel.Columns[i].TypeName, string(t.Key.Columns[i].Data))
+	}
+	return out
 }
 
 // CompleteJSON renders the tuple for jsonb_populate_record, and reports whether
@@ -426,10 +446,11 @@ func (a *Authorizer) Visible(
 	// Fallback: probe the live row by primary key. Correct for INSERT and UPDATE;
 	// impossible for DELETE, which the caller reports as degraded rather than
 	// guessing.
-	if t.Op == 'D' || len(t.PK) == 0 {
+	pk := t.PK()
+	if t.Op == 'D' || len(pk) == 0 {
 		return false, true
 	}
-	ok, err := a.probePK(ctx, id, rel, t.PK)
+	ok, err := a.probePK(ctx, id, rel, pk)
 	if err != nil {
 		return false, true
 	}

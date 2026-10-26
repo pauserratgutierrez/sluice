@@ -24,7 +24,7 @@ type walColumn struct {
 }
 
 // walRelation decodes a Relation message the way the reader does.
-func walRelation(t *testing.T, oid uint32, schema, name string, cols ...walColumn) *pgoutput.Relation {
+func walRelation(t testing.TB, oid uint32, schema, name string, cols ...walColumn) *pgoutput.Relation {
 	t.Helper()
 	var b bytes.Buffer
 	b.WriteByte(pgoutput.MsgRelation)
@@ -181,5 +181,24 @@ func TestProjectionIsSharedAcrossSubscribers(t *testing.T) {
 	}
 	if b, _ := json.Marshal(recs[0]); string(b) != `{"id":7,"title":"hello"}` {
 		t.Errorf("shared record encoded as %s", b)
+	}
+}
+
+// The primary key a Tier C probe looks the row up by is read from the change's
+// new tuple, or from its old one for a DELETE, and only when asked.
+func TestTuplesReadThePrimaryKeyWhenAsked(t *testing.T) {
+	s := testServer(t, stubOracle{name: oracle.NameRLS})
+	wal := walDocs(t)
+	upd := s.newTuples(wal, &pgoutput.Message{Type: pgoutput.MsgUpdate, Old: row("7", "41", "a"), New: row("8", "42", "b")})
+	if pk := upd.Old.PK(); len(pk) != 1 || pk["id"].String() != "8" {
+		t.Fatalf("an UPDATE's key comes from its new tuple: %v", pk)
+	}
+	del := s.newTuples(wal, &pgoutput.Message{Type: pgoutput.MsgDelete, Old: row("7", "41", "a")})
+	if pk := del.Old.PK(); len(pk) != 1 || pk["id"].String() != "7" {
+		t.Fatalf("a DELETE's key comes from its old tuple: %v", pk)
+	}
+	null := &pgoutput.Tuple{Columns: []pgoutput.Column{{Kind: pgoutput.ColNull}, {Kind: pgoutput.ColText, Data: []byte("42")}}}
+	if pk := s.newTuples(wal, &pgoutput.Message{Type: pgoutput.MsgInsert, New: null}).New.PK(); len(pk) != 0 {
+		t.Fatalf("a NULL key column is left out: %v", pk)
 	}
 }

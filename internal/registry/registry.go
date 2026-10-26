@@ -15,7 +15,6 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/event"
-	"github.com/pauserratgutierrez/sluice/internal/expr"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
@@ -321,9 +320,10 @@ func (r *Registry) StreamSubscriptions(streamID string) []*Subscription {
 // Candidates returns the subscriptions that could match a change, using the
 // routing index.
 //
-// Each lookup reads a column value from one tuple of the change -- the new and
-// the old one for an UPDATE, so a row leaving a shape is still routed to it. A
-// lookup returns known=false for a value the WAL did not carry. When no tuple
+// Each lookup reads a column from one tuple of the change -- the new and the
+// old one for an UPDATE, so a row leaving a shape is still routed to it -- as
+// the key the index lists it by: its value's Value.String(). A lookup returns
+// known=false for a value the WAL did not carry. When no tuple
 // carries the routing column, its index cannot be consulted and every
 // subscription under it is added conservatively -- correctness before speed,
 // since the residual filter and the authorizer still run.
@@ -331,7 +331,7 @@ func (r *Registry) StreamSubscriptions(streamID string) []*Subscription {
 // Every subscription sits in exactly one list (one constant of its routing
 // column, or unindexed), and each list is added at most once, so the result
 // has no duplicates without needing a set.
-func (r *Registry) Candidates(oid uint32, lookups ...func(column string) (v expr.Value, known bool)) []*Subscription {
+func (r *Registry) Candidates(oid uint32, lookups ...func(column string) (key string, known bool)) []*Subscription {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -345,11 +345,10 @@ func (r *Registry) Candidates(oid uint32, lookups ...func(column string) (v expr
 		var first string
 		found := false
 		for _, lookup := range lookups {
-			v, known := lookup(col)
+			key, known := lookup(col)
 			if !known {
 				continue
 			}
-			key := v.String()
 			if found && key == first {
 				continue
 			}

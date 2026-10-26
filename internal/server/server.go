@@ -95,6 +95,8 @@ type Server struct {
 	txnBegan time.Time
 	wakes    []*hub.Stream
 	woken    map[*hub.Stream]bool
+	// relMetrics is also the reader goroutine's alone; see metricsOf.
+	relMetrics map[uint32]*relMetrics
 
 	streamSeq atomic.Uint64
 	refreshAt atomic.Int64
@@ -1188,8 +1190,8 @@ func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
 	return func(e *hub.RingEntry) bool {
 		known := false
 		for _, t := range [2]*pgoutput.Tuple{e.New, e.Old} {
-			if v, ok := (tupleRow{rel: e.Relation, t: t}).Column(col); ok {
-				if v.String() == want {
+			if k, ok := (tupleRow{rel: e.Relation, t: t}).key(col); ok {
+				if k == want {
 					return true
 				}
 				known = true

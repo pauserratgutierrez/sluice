@@ -8,7 +8,6 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/event"
-	"github.com/pauserratgutierrez/sluice/internal/expr"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
 )
 
@@ -55,13 +54,13 @@ func sub(t *testing.T, sink Sink, label, filter string) *Subscription {
 	}
 }
 
-func lookup(vals map[string]string) func(string) (expr.Value, bool) {
-	return func(col string) (expr.Value, bool) {
+func lookup(vals map[string]string) func(string) (string, bool) {
+	return func(col string) (string, bool) {
 		v, ok := vals[col]
 		if !ok {
-			return expr.Null, false
+			return "", false
 		}
-		return expr.Text(v), true
+		return v, true
 	}
 }
 

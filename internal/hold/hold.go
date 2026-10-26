@@ -479,8 +479,9 @@ func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 		return nil
 	}
 	var broken []candidate
+	var seen verdicts
 	for _, c := range x.candidates(oid, oldRow, newRow) {
-		if reason, cut := watchBroken(c.holds, oid, op, oldRow, newRow); cut {
+		if reason, cut := seen.watchBroken(c.holds, oid, op, oldRow, newRow); cut {
 			c.reason = reason
 			broken = append(broken, c)
 		}
@@ -504,7 +505,7 @@ func (x *Index) OnChange(oid uint32, op byte, oldRow, newRow expr.Row) []Cut {
 			// replacement been indexed first. (A replacement's grant also
 			// runs EXISTS after Replace, which sees any change the reader has
 			// already received.)
-			reason, cut := watchBroken(w.Holds, oid, op, oldRow, newRow)
+			reason, cut := seen.watchBroken(w.Holds, oid, op, oldRow, newRow)
 			if !cut {
 				continue
 			}
@@ -524,8 +525,12 @@ type candidate struct {
 	reason string
 }
 
-// candidates finds the watches listed under the change's values, and the
-// unindexed ones, under the read lock.
+// candidates finds, under the read lock, the watches listed under the values
+// the change's rows hold, every watch listed by a column neither row carries,
+// and the unindexed ones. A change cuts only holds its old row matched, so
+// those are all it can cut. Each list is added once per change; a watch with
+// holds listed in two lists is a candidate twice, which costs a second look
+// (verdicts remembers the first) and cuts it once.
 func (x *Index) candidates(oid uint32, oldRow, newRow expr.Row) []candidate {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
@@ -534,44 +539,34 @@ func (x *Index) candidates(oid uint32, oldRow, newRow expr.Row) []candidate {
 		return nil
 	}
 
-	seen := map[*Watch]bool{}
 	var out []candidate
 	add := func(list []*Watch) {
+		out = slices.Grow(out, len(list))
 		for _, w := range list {
-			if !seen[w] {
-				seen[w] = true
-				out = append(out, candidate{w: w, holds: w.Holds})
-			}
-		}
-	}
-	lookup := func(row expr.Row) func(string) (expr.Value, bool) {
-		return func(col string) (expr.Value, bool) {
-			if row == nil {
-				return expr.Null, false
-			}
-			return row.Column(col)
+			out = append(out, candidate{w: w, holds: w.Holds})
 		}
 	}
 	for col, byConst := range ri.byColumn {
-		matched := false
-		if newRow != nil {
-			if v, ok := lookup(newRow)(col); ok {
-				add(byConst[v.String()])
-				matched = true
-			} else {
-				for _, list := range byConst {
-					add(list)
+		var first string
+		found := false
+		for _, row := range [2]expr.Row{newRow, oldRow} {
+			if row == nil {
+				continue
+			}
+			v, ok := row.Column(col)
+			if !ok {
+				continue
+			}
+			if key := v.String(); !found || key != first {
+				add(byConst[key])
+				if !found {
+					first, found = key, true
 				}
-				matched = true
 			}
 		}
-		if oldRow != nil {
-			if v, ok := lookup(oldRow)(col); ok {
-				add(byConst[v.String()])
-			} else if !matched {
-				for _, list := range byConst {
-					add(list)
-				}
+		if !found {
+			for _, list := range byConst {
+				add(list)
 			}
 		}
 	}
@@ -616,32 +611,69 @@ func (x *Index) OnTruncate(oid uint32) []Cut {
 	return cuts
 }
 
-func watchBroken(holds []Spec, oid uint32, op byte, oldRow, newRow expr.Row) (string, bool) {
+// verdicts remembers, for one change, which hold filters it breaks. The
+// watches of one stream's shapes, and of one user's streams, usually name the
+// same hold, and identical parsed filters are one shared Filter (shape.Parse),
+// so the change is evaluated against each distinct filter once. Up to
+// maxVerdicts are remembered; past that each is evaluated again.
+type verdicts []verdict
+
+type verdict struct {
+	f      *shape.Filter
+	reason string
+	cut    bool
+}
+
+const maxVerdicts = 16
+
+func (v *verdicts) watchBroken(holds []Spec, oid uint32, op byte, oldRow, newRow expr.Row) (string, bool) {
 	for _, spec := range holds {
 		if spec.Rel == nil || spec.Rel.OID != oid || spec.Filter == nil {
 			continue
 		}
-		switch op {
-		case 'D':
-			match, unk := visible(spec.Filter, oldRow)
-			if unk || match {
-				return "a hold on " + spec.Rel.FullName() + " no longer exists", true
-			}
-		case 'U':
-			// Protocol: Update carries 'K' (old key) or 'O' (old full) or
-			// neither, never both. 'K' only if replica-identity columns changed;
-			// 'N' is always present. With neither, no column a hold reads
-			// changed (see OnChange): nothing to cut. Deciding from the new row
-			// alone would cut other rows' holds, since a watch is a candidate
-			// when one routed column matches, not the whole identity.
-			if oldRow == nil {
-				continue
-			}
-			matchOld, _ := visible(spec.Filter, oldRow)
-			matchNew, unkNew := visible(spec.Filter, newRow)
-			if matchOld && (unkNew || !matchNew) {
-				return "a hold on " + spec.Rel.FullName() + " no longer matches", true
-			}
+		if reason, cut := v.holdBroken(spec, op, oldRow, newRow); cut {
+			return reason, true
+		}
+	}
+	return "", false
+}
+
+func (v *verdicts) holdBroken(spec Spec, op byte, oldRow, newRow expr.Row) (string, bool) {
+	for _, d := range *v {
+		if d.f == spec.Filter {
+			return d.reason, d.cut
+		}
+	}
+	reason, cut := holdBroken(spec, op, oldRow, newRow)
+	if len(*v) < maxVerdicts {
+		*v = append(*v, verdict{f: spec.Filter, reason: reason, cut: cut})
+	}
+	return reason, cut
+}
+
+// holdBroken reports whether a change stops a hold on its relation from
+// matching, and why.
+func holdBroken(spec Spec, op byte, oldRow, newRow expr.Row) (string, bool) {
+	switch op {
+	case 'D':
+		match, unk := visible(spec.Filter, oldRow)
+		if unk || match {
+			return "a hold on " + spec.Rel.FullName() + " no longer exists", true
+		}
+	case 'U':
+		// Protocol: Update carries 'K' (old key) or 'O' (old full) or
+		// neither, never both. 'K' only if replica-identity columns changed;
+		// 'N' is always present. With neither, no column a hold reads
+		// changed (see OnChange): nothing to cut. Deciding from the new row
+		// alone would cut other rows' holds, since a watch is a candidate
+		// when one routed column matches, not the whole identity.
+		if oldRow == nil {
+			return "", false
+		}
+		matchOld, _ := visible(spec.Filter, oldRow)
+		matchNew, unkNew := visible(spec.Filter, newRow)
+		if matchOld && (unkNew || !matchNew) {
+			return "a hold on " + spec.Rel.FullName() + " no longer matches", true
 		}
 	}
 	return "", false

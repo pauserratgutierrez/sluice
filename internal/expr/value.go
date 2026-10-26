@@ -149,7 +149,27 @@ func ParseText(typeName, s string) Value {
 	}
 }
 
+// TextIsCanonical reports whether a value of this type, as PostgreSQL writes
+// it in text, is already its Value.String() after ParseText. It is for every
+// type but bool and the numeric ones whose text ParseText rewrites (float4,
+// float8, numeric), so a key compared against Value.String() can be read
+// without parsing.
+func TextIsCanonical(typeName string) bool {
+	switch normalizeType(typeName) {
+	case "bool", "float4", "float8", "numeric":
+		return false
+	}
+	return true
+}
+
 func normalizeType(t string) string {
+	// The names a decoded relation gives its columns are already normal; a
+	// column is read for every change.
+	switch t {
+	case "bool", "int2", "int4", "int8", "oid", "float4", "float8", "numeric",
+		"json", "jsonb", "uuid", "text", "timestamp", "timestamptz":
+		return t
+	}
 	t = strings.ToLower(strings.TrimSpace(t))
 	t = strings.TrimSuffix(t, "[]")
 	if i := strings.IndexByte(t, '('); i >= 0 {
