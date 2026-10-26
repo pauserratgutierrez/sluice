@@ -46,6 +46,7 @@ export type {
   ClientOptions,
   ColumnOf,
   ConnectionStatus,
+  DelayPayload,
   GenericDatabase,
   GenericSchema,
   GenericTable,

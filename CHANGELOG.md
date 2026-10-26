@@ -4,7 +4,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ## 0.10.0
 
-A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed. Every shape of a request goes to the issuer in one call (breaking for issuers) and has its holds checked with the others in one round trip, and after a reconnect of every stream the streams that fit are back within seconds. Tested with PostgreSQL 18.6.
+A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed. Every shape of a request goes to the issuer in one call (breaking for issuers) and has its holds checked with the others in one round trip, and after a reconnect of every stream the streams that fit are back within seconds. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. Tested with PostgreSQL 18.6.
 
 ### Fixed
 
@@ -17,6 +17,7 @@ A stream opened while the replication slot was being created could miss changes;
   - The check is there to catch a hold row deleted between the issuer's verdict and the watch. It takes a database round trip, and in a reconnect of every stream it waited seconds for a pool connection.
   - A shape is now registered only after its holds were found, and only while its watch has not been cut since; a change dispatched during the check is before the shape's `ready`, as any change before a subscribe is.
   - Present since issuer mode was added (0.1.4).
+- On PostgreSQL 16, the slot's state in `/diagnostics` and `sluice_slot_retained_bytes` stayed empty: their query read `invalidation_reason`, a column PostgreSQL 17 added. It now reads it as the reader does, through `to_jsonb`.
 
 ### Changed
 
@@ -39,6 +40,10 @@ A stream opened while the replication slot was being created could miss changes;
 ### Added
 
 - When creating the slot has taken 10 s, and every minute after, the log says what it waits for: `creating the replication slot is waiting for transactions open when it started`, with `waited` and `blocking_pids`.
+- **Warnings before the slot is lost.** A logical slot keeps the WAL from its restart point, which the oldest transaction open in the database holds back, whatever tables it wrote. On PostgreSQL 18.6, with the slot consumed to 208 bytes from the WAL end, a transaction left open after inserting one row into a table outside the publication lost a slot bounded at 64 MB after 60 MB of other writes; `wal_status` went from `reserved` to `lost` in one checkpoint. Sluice then stops, and every client reads its state again.
+  - `sluice_slot_safe_wal_bytes`: the slot's `safe_wal_size`, read each `SLUICE_CATALOG_REFRESH`; absent while `max_slot_wal_keep_size` is -1.
+  - Once the slot retains half of the WAL it may keep, the process reading it logs `replication slot nears max_slot_wal_keep_size` (a warning; an error from 80%) and `/diagnostics` reports `slot_wal_retention`, with the cause: the oldest open transaction (a session's pid or a prepared transaction, readable by any role), or how much of it Sluice has not confirmed yet.
+- **Clients learn when changes arrive late.** When the reader's lag reaches `SLUICE_LAG_DEGRADED` (5 s), every stream gets a `delay` event with `lag_ms`, and another with `lag_ms: 0` when the lag falls below half of it; a stream opened meanwhile has `lag_ms` in its `ready`. Before, a client could not tell late changes from none: heartbeats keep arriving while the reader is behind. The SDK reports it as a new connection status, `delayed`, between `open` states; a `switch` over `ConnectionStatus` that lists every case needs it.
 
 ## 0.9.1
 

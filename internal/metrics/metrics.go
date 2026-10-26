@@ -64,6 +64,13 @@ var (
 		Help: "WAL retained by the replication slot. Watch this: an unconsumed slot can fill the disk.",
 	})
 
+	// SlotSafeWALBytes has no labels; it is a vector only so that it can be
+	// absent while PostgreSQL reports no bound.
+	SlotSafeWALBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sluice_slot_safe_wal_bytes",
+		Help: "WAL that can still be written before the replication slot is invalidated (pg_replication_slots.safe_wal_size). Absent when max_slot_wal_keep_size is -1. Alert on this.",
+	}, nil)
+
 	WALMessages = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sluice_wal_messages_total",
 		Help: "Decoded pgoutput messages by type.",

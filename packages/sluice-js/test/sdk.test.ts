@@ -867,6 +867,28 @@ test('setAuth reconnects a stream that stopped on an expired token', async () =>
   client.close()
 })
 
+// The server says when changes start and stop arriving late, in the ready of a
+// stream opened meanwhile and with delay events after it.
+test('a server behind the database is reported as delayed', async () => {
+  const statuses: string[] = []
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    onStatusChange: (s) => statuses.push(s),
+    fetch: async () =>
+      sse(openStream(
+        'event: ready\ndata: {"stream_id":"n1.x","lag_ms":6000,"subscriptions":[{"sub":"s1","ok":true}]}\n\n' +
+          'event: delay\ndata: {"lag_ms":0}\n\n' +
+          'event: delay\ndata: {"lag_ms":7000}\n\n',
+      )),
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(statuses, ['connecting', 'delayed', 'open', 'delayed'])
+  assert.equal(client.connectionStatus, 'delayed')
+  client.close()
+})
+
 test('a failed attempt is reported as reconnecting', async () => {
   const statuses: string[] = []
   let calls = 0

@@ -5,6 +5,7 @@ import {
   type ChangePayload,
   type ClientOptions,
   type ConnectionStatus,
+  type DelayPayload,
   type Json,
   type LiveEvent,
   type PresencePayload,
@@ -521,7 +522,7 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       case 'ready': {
         const ready = payload as ReadyPayload
         this.streamId = ready.stream_id
-        this.setStatus('open')
+        this.setStatus(ready.lag_ms ? 'delayed' : 'open')
         this.readyResults.clear()
         // The stream request carried every registration, retries included.
         this.clearRetries()
@@ -552,6 +553,13 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       case 'snapshot_end': {
         const s = payload as SnapshotEndPayload
         this.registrations.get(s.sub)?.onEvent('snapshot_end', s)
+        return
+      }
+      case 'delay': {
+        // Only while the stream is up: a delay queued before the stream ended
+        // must not announce a stream that is gone.
+        const d = payload as DelayPayload
+        if (this.status === 'open' || this.status === 'delayed') this.setStatus(d.lag_ms > 0 ? 'delayed' : 'open')
         return
       }
       case 'warning': {

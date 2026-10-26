@@ -85,6 +85,10 @@ type Server struct {
 	replicated        atomic.Bool
 	notReplicatingLog refusalLog
 
+	// delayMs is the reader's lag when changes started arriving late, 0 while
+	// they are not; see checkDelay. A stream's ready carries it.
+	delayMs atomic.Int64
+
 	// Reader goroutine only: when the transaction being dispatched began, and
 	// the streams it queued events for without waking their writers, which
 	// its commit wakes (see sendChange).
@@ -112,6 +116,9 @@ type Server struct {
 	// /diagnostics and sluice_config_warnings report them for the process's
 	// whole life.
 	startupWarnings []Diagnostic
+	// retention is the slot's WAL retention as of the last catalog tick; see
+	// noteRetention.
+	retention atomic.Pointer[retention]
 
 	// holdCheck, if set, replaces hold.Check. Tests inject it so holds can be
 	// checked without a database pool.
@@ -168,7 +175,10 @@ func New(ctx context.Context, o Options) *Server {
 }
 
 // Run drives the server's background loops until the context is cancelled.
-func (s *Server) Run(ctx context.Context) { s.wheel.Run(ctx) }
+func (s *Server) Run(ctx context.Context) {
+	go s.watchDelay(ctx)
+	s.wheel.Run(ctx)
+}
 
 // SetReader wires the reader after construction, because the reader needs the
 // server as its handler.
@@ -389,6 +399,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if liveFrom != "" {
 		ready["wal_lsn"] = liveFrom
+	}
+	if ms := s.delayMs.Load(); ms > 0 {
+		ready["lag_ms"] = ms
 	}
 	_ = s.writeEvents(w, rc, []event.Event{{Kind: event.KindReady, Data: ready}})
 

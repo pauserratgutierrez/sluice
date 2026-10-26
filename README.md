@@ -46,7 +46,8 @@ Tested with PostgreSQL 18.6. The default `SLUICE_PROTO_VERSION=4` needs PostgreS
 --   wal_level = logical
 --   max_replication_slots >= 1          -- one slot per Sluice deployment
 --   max_wal_senders >= 1
---   max_slot_wal_keep_size = <bounded>  -- the default -1 is unlimited
+--   max_slot_wal_keep_size = <bounded>  -- the default -1 is unlimited; see WAL retention
+--   idle_in_transaction_session_timeout, transaction_timeout  -- an open transaction holds the slot
 
 CREATE ROLE sluice_repl  WITH LOGIN REPLICATION PASSWORD '...';
 CREATE ROLE sluice_authz WITH LOGIN NOINHERIT   PASSWORD '...';
@@ -289,7 +290,7 @@ Each event is an SSE frame `event: <name>` + `data: <one JSON line>`. A heartbea
 
 A subscription result has `sub`, `ok`, and then either an `error` (`{code, message, retryable, retry_after_ms?}`) or: `tier` (RLS) or `oracle: "issuer"` and `filter` (issuer), `indexed`, `routing_key`, `reason`, `warnings`, and `resumed` when the request carried a resume position for the shape's table (see [Resume](#resume)). The same warnings are also sent as `warning` events.
 
-When `ready` is written, its subscriptions are installed: every change from then on reaches them. `wal_lsn` is a resume position for them, taken before they were installed, so resuming from it later replays whatever they missed even if they never received a change.
+When `ready` is written, its subscriptions are installed: every change from then on reaches them. `wal_lsn` is a resume position for them, taken before they were installed, so resuming from it later replays whatever they missed even if they never received a change. `lag_ms` is present while changes arrive late (see `delay`).
 
 **`change`** — `id: <commit_lsn>:<seq>` (not on snapshot rows or `TRUNCATE`):
 
@@ -307,6 +308,8 @@ When `ready` is written, its subscriptions are installed: every change from then
 **`broadcast`** — `{ "sub", "channel", "event", "payload", "from"?, "origin": "client" | "database", "commit_lsn"?, "at" }`. `from` is the publisher's `sub`; `commit_lsn` is set for transactional database messages.
 
 **`presence`** — `{ "sub", "channel", "type": "state", "members": { key: member } }` on join, then `{ …, "type": "diff", "joins"?: {…}, "leaves"?: {…} }`. A member is `{ "meta", "since", "ref" }`.
+
+**`delay`** — `{ "lag_ms" }`: changes have started to arrive late, `lag_ms` behind the database when it was sent; `{ "lag_ms": 0 }` when they arrive on time again. Sent to every stream when the reader's lag reaches `SLUICE_LAG_DEGRADED` and when it falls below half of it, so a client can tell late changes from none (heartbeats keep arriving either way). The SDK reports it as the `delayed` status.
 
 **`warning`** — `{ "sub"?, "code", "message", "effect"?, "remedy"? }`.
 
@@ -416,7 +419,9 @@ Streams are also closed with `token_expired` at the first heartbeat after the to
 
 ## Operating it
 
-**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded, this process is streaming from the slot and it is not shutting down; its body reports `catalog_loaded`, `replicating`, `streams`, `confirmed_lsn`, `reader_lag_seconds`, and `draining` once shutdown has begun. `reader_lag_seconds` is how long ago the transaction the reader is dispatching committed: how late every change is arriving, 0 when it has caught up (also `sluice_reader_lag_seconds`). Past `SLUICE_LAG_DEGRADED` the body adds `"degraded": "reader_lag"` and the status stays `200`; past `SLUICE_READY_MAX_LAG`, when set, it is `503`. A single-node deployment should leave that unset, so that it never takes itself out of its load balancer for being slow.
+**Health.** `/healthz` is `200` while the process runs. `/readyz` is `200` when the catalog is loaded, this process is streaming from the slot and it is not shutting down; its body reports `catalog_loaded`, `replicating`, `streams`, `confirmed_lsn`, `reader_lag_seconds`, and `draining` once shutdown has begun. `reader_lag_seconds` is how long ago the transaction the reader is dispatching committed: how late every change is arriving, 0 when it has caught up (also `sluice_reader_lag_seconds`). Past `SLUICE_LAG_DEGRADED` the body adds `"degraded": "reader_lag"` and the status stays `200`, and every stream gets a [`delay`](#events) event; past `SLUICE_READY_MAX_LAG`, when set, it is `503`. A single-node deployment should leave that unset, so that it never takes itself out of its load balancer for being slow. The lag only sees transactions PostgreSQL has sent: while it is still decoding a large one, before sending it, the lag reads 0.
+
+**WAL retention.** A logical slot keeps the WAL from its restart point, and the oldest transaction open in the database holds that point back, whatever tables it wrote, even while Sluice confirms every change. With `max_slot_wal_keep_size` bounded, as it should be, a transaction left open long enough invalidates the slot, and Sluice stops (see Failures). Measured on PostgreSQL 18.6: with the slot consumed to 208 bytes from the WAL end, a transaction that had inserted one row into a table outside the publication, and stayed open, lost a slot bounded at 64 MB after 60 MB of other writes. Sluice reads the slot's `safe_wal_size` on every `SLUICE_CATALOG_REFRESH` (`sluice_slot_safe_wal_bytes`). Once the slot retains half of what it may keep it logs a warning, an error from 80%, and `/diagnostics` reports `slot_wal_retention` with the cause: the oldest open transaction (a session's pid or a prepared transaction; how long a session has been open shows when the pool role may see it, with `pg_read_all_stats`), or how much of it Sluice has not confirmed yet. Size `max_slot_wal_keep_size` for the WAL the database writes during the longest write transaction you allow, bound open transactions with `idle_in_transaction_session_timeout` and `transaction_timeout`, and alert on `sluice_slot_safe_wal_bytes`: Sluice cannot warn while it is down.
 
 **Shutdown.** On `SIGTERM` or `SIGINT` Sluice stops accepting connections, refuses new streams with `503 server_shutdown`, and ends every open stream with a `server_shutdown` error whose `retry_after_ms` is spread over `SLUICE_RECONNECT_SPREAD`, so clients come back over that window rather than all at once. Requests in flight get up to `SLUICE_SHUTDOWN_GRACE`, after which the process exits; without any it exits at once. Give the container a stop timeout above that grace.
 
@@ -450,13 +455,14 @@ It starts with a warning, kept in `/diagnostics`, for: `max_slot_wal_keep_size =
                   "policy": "invoices_team_member", "reason": "…", "impact": "…", "remedy": "…" } ] }
 ```
 
-Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers. Warning codes, besides the startup ones: `replica_identity_broken`, `replica_identity_full_with_toast`, `policy_unparseable`, `policy_applies_to_public`, `policy_function_not_wrapped`, `unindexed_policy_column`, `tier_c_policy`, `tier_c_subscriptions` (RLS), `hold_replica_identity` (issuer), `unindexed_shape`.
+Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers. Warning codes, besides the startup ones: `replica_identity_broken`, `replica_identity_full_with_toast`, `policy_unparseable`, `policy_applies_to_public`, `policy_function_not_wrapped`, `unindexed_policy_column`, `tier_c_policy`, `tier_c_subscriptions` (RLS), `hold_replica_identity` (issuer), `unindexed_shape`, `slot_wal_retention` (see WAL retention).
 
 **Metrics** (`/metrics`, Prometheus). The one to alert on is `sluice_authz_tier_c_probes_total`; `sluice_authz_downgrades_total` should always be 0.
 
 | Metric | Labels |
 | --- | --- |
-| `sluice_wal_lsn` (gauge), `sluice_wal_lag_bytes`, `sluice_slot_retained_bytes` | `kind` = received, confirmed |
+| `sluice_wal_lsn` (gauge) | `kind` = received, confirmed |
+| `sluice_wal_lag_bytes`, `sluice_slot_retained_bytes`, `sluice_slot_safe_wal_bytes` (absent while `max_slot_wal_keep_size` is -1) | |
 | `sluice_wal_messages_total` | `type` |
 | `sluice_reader_reconnects_total`, `sluice_reader_is_leader`, `sluice_slot_recreated_total` | |
 | `sluice_resume_buffer_bytes` (gauge) | |
@@ -487,7 +493,7 @@ The slot, warning and resume buffer metrics refresh every `SLUICE_CATALOG_REFRES
 **Failures.**
 
 - **PostgreSQL restart or dropped replication connection:** the reader reconnects with backoff (1 s, doubling to about 30 s) from the slot's confirmed position; streams stay open.
-- **Slot gone** (invalidated — `max_slot_wal_keep_size` exceeded, `idle_replication_slot_timeout` — or dropped, as after restoring the database): after a failed stream the reader reads the slot from `pg_replication_slots`, and when it can no longer stream every change since its confirmed position the process exits with an error, because streaming on would hide a gap. Every stream ends with `server_shutdown`, and the container's restart policy brings the process back. A missing slot is created again at startup. Until replication starts, new streams are refused with `503 not_replicating`: a transaction that commits before the new slot is ready is never decoded, so a stream told it was live then would miss it. Creating the slot waits for every transaction that had an xid when it started; past 10 s, and every minute after, the log says so with the `blocking_pids` it waits for. An invalidated one stops the process at startup until it is dropped (`SELECT pg_drop_replication_slot('<slot>')`), unless `SLUICE_SLOT_RECREATE=true`: then the process holding the reader lock drops and recreates it, never while another process is streaming it, logs a warning and counts `sluice_slot_recreated_total`. Either way the changes made while the slot was unusable are never delivered, so clients must read their state again; a client that does so whenever a subscription goes live without `resumed: true` (the SDK's `onLive`) needs nothing more.
+- **Slot gone** (invalidated — `max_slot_wal_keep_size` exceeded, by Sluice falling behind or by an open transaction (see WAL retention), `idle_replication_slot_timeout` — or dropped, as after restoring the database): after a failed stream the reader reads the slot from `pg_replication_slots`, and when it can no longer stream every change since its confirmed position the process exits with an error, because streaming on would hide a gap. Every stream ends with `server_shutdown`, and the container's restart policy brings the process back. A missing slot is created again at startup. Until replication starts, new streams are refused with `503 not_replicating`: a transaction that commits before the new slot is ready is never decoded, so a stream told it was live then would miss it. Creating the slot waits for every transaction that had an xid when it started; past 10 s, and every minute after, the log says so with the `blocking_pids` it waits for. An invalidated one stops the process at startup until it is dropped (`SELECT pg_drop_replication_slot('<slot>')`), unless `SLUICE_SLOT_RECREATE=true`: then the process holding the reader lock drops and recreates it, never while another process is streaming it, logs a warning and counts `sluice_slot_recreated_total`. Either way the changes made while the slot was unusable are never delivered, so clients must read their state again; a client that does so whenever a subscription goes live without `resumed: true` (the SDK's `onLive`) needs nothing more.
 - **Sluice restart:** streams are closed; clients reconnect, and their resume positions are no longer buffered, so their results say `resumed: false` and they read their state again.
 - **A table leaves the publication:** its shapes are dropped with `relation_unpublished`.
 - **A table's definition changes:** its subscriptions get `schema_changed`; dropped columns disappear from events, and new columns are not added until the client resubscribes.
@@ -503,6 +509,8 @@ Every HTTP request has an ID: the value of the `SLUICE_REQUEST_ID_HEADER` header
 | `request refused` | info; warn for a `5xx` other than `server_shutdown` | any error response: `path`, `status`, `code`, `reason` |
 | `streams refused` | warn | new streams refused with `503 too_many_streams` or `503 not_replicating`, at most once a second per code: `code`, `reason`, `refused` (how many since the last line) |
 | `creating the replication slot is waiting for transactions open when it started; …` | warn | creating the slot has taken 10 s, then every minute: `slot`, `waited`, `blocking_pids` |
+| `replication slot nears max_slot_wal_keep_size; …` | warn; error from 80% | the slot retains half of the WAL it may keep, then 80% (see [WAL retention](#operating-it)): `slot`, `share`, `retained_bytes`, `safe_wal_bytes`, and `held_by` (the oldest open transaction) or `unconfirmed_bytes` (what Sluice has not confirmed yet) |
+| `replication slot is back under half of max_slot_wal_keep_size` | info | the share fell below 40% |
 | `subscription refused` | info; warn when the issuer or hook gave no verdict, or a node-wide limit refused it | a shape or channel of `/stream` or `/subscribe` is refused: `sub`, `table` or `channel`, `code`, `reason`. At most 20 per request, then one `more subscriptions refused` with `count` |
 | `subscription revoked` | info; warn for `issuer_unavailable` | `POST /token` drops a shape or hook channel |
 | `channel hook re-check got no verdict; …` | warn | on `POST /token`; the stream keeps the channel |
@@ -581,7 +589,7 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_WRITE_TIMEOUT` | `10s` | per write |
 | `SLUICE_MAX_STREAMS` | `0` | a fixed cap on streams per process, besides the memory-based admission below; `0` sets none |
 | `SLUICE_ADMIT_MEMORY` | `0.5` | refuse new streams (`503 too_many_streams` with `Retry-After`) when the memory a collection cannot give back (the live heap, the stack space goroutines are using and the runtime's own structures, not free or fragmented heap: about 42 KiB per stream with seven shapes), plus what the streams opened since the last collection are expected to hold, reaches this share of the Go memory limit (`GOMEMLIMIT`, which Sluice sets to 90% of the container's). Up to the most streams it admitted below it, for 5 minutes after the node last held that many, a reconnect may take the projection a fifth of the way from this share to the limit (0.6 at `0.5`). At `0.5` the heap can still double between collections. Measured on 1 CPU and 512 MB: at `0.5` it admitted 5,767 of 6,000 streams offered and delivered messages at p95 9 ms, RSS peaking at 452 MiB; a threshold of `0.85` on the live heap alone admitted 7,215 of 12,000, but the collector then ran almost without pause and messages arrived 30-60 s late. `0` turns it off. With no memory limit known it does nothing, and the log warns if `SLUICE_MAX_STREAMS` is `0` too |
-| `SLUICE_LAG_DEGRADED` | `5s` | reader lag at which `/readyz` reports `"degraded": "reader_lag"` (still `200`) |
+| `SLUICE_LAG_DEGRADED` | `5s` | reader lag at which `/readyz` reports `"degraded": "reader_lag"` (still `200`) and streams get a `delay` event, until it falls below half of it; `0` sends none |
 | `SLUICE_READY_MAX_LAG` | unset | reader lag at which `/readyz` turns `503`; for deployments with more than one node behind the balancer |
 | `SLUICE_MAX_SUBS_PER_STREAM` / `SLUICE_MAX_SHAPES_PER_STREAM` | `100` / `20` | shapes and channels / shapes |
 | `SLUICE_MAX_PAYLOAD_BYTES` / `SLUICE_MAX_CHANGE_BYTES` | `262144` / `1048576` | |

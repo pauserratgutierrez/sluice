@@ -20,6 +20,7 @@ const (
 	KindSnapshotEnd Kind = "snapshot_end"
 	KindWarning     Kind = "warning"
 	KindError       Kind = "error"
+	KindDelay       Kind = "delay"
 	// KindHeartbeat is written as a bare SSE comment rather than a named event,
 	// so clients never see it. It exists as a Kind only so the shared timer wheel
 	// can enqueue it like anything else and keep all writing on one goroutine.
@@ -126,6 +127,12 @@ type Error struct {
 	// server spreads it per stream, so a restart is not followed by every
 	// client reconnecting at once.
 	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
+}
+
+// Delay says whether changes are arriving late: LagMs is how far behind the
+// reader was when it was sent, 0 once it has caught up again.
+type Delay struct {
+	LagMs int64 `json:"lag_ms"`
 }
 
 // Warning is non-fatal but actionable. Every warning carries a remedy that is a

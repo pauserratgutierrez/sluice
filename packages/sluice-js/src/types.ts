@@ -126,7 +126,14 @@ export interface ReadyPayload {
   heartbeat_ms: number
   /** A resume position for these subscriptions: resuming from it replays whatever they miss. */
   wal_lsn?: string
+  /** Present while changes arrive late: how far behind the server was when they started to. */
+  lag_ms?: number
   subscriptions: SubscriptionResult[]
+}
+
+/** Changes arrive late (`lag_ms` above 0), or arrive on time again (0). */
+export interface DelayPayload {
+  lag_ms: number
 }
 
 /**
@@ -217,11 +224,12 @@ export interface SnapshotEndPayload {
  * - `idle`: no stream, on purpose: nothing is subscribed, or the document is hidden.
  * - `connecting`: opening the stream, at first or to replace one the server ended (token expiry, shutdown).
  * - `open`: the stream is up.
+ * - `delayed`: the stream is up, but the server is behind the database: changes arrive late.
  * - `reconnecting`: the stream dropped or an attempt to open it failed; retrying with backoff.
  * - `closed`: stopped and not retrying: `close()` was called, or the server refused the stream
  *   (401, 403). `setAuth` reopens a refused stream.
  */
-export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
+export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'delayed' | 'reconnecting' | 'closed'
 
 export interface ClientOptions {
   /**
