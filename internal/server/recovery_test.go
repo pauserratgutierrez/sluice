@@ -10,9 +10,12 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/pauserratgutierrez/sluice/internal/auth"
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/metrics"
 	"github.com/pauserratgutierrez/sluice/internal/oracle"
 	"github.com/pauserratgutierrez/sluice/internal/requestid"
 	"github.com/pauserratgutierrez/sluice/internal/shape"
@@ -31,6 +34,12 @@ func TestResumeIsDecidedInTheResult(t *testing.T) {
 	shapeOn := func(sub string) subSpec {
 		return subSpec{Sub: sub, Shape: &shapeSpec{Table: "documents", Filter: "project_id=eq.42"}}
 	}
+	resumes := func(result string) float64 {
+		var m dto.Metric
+		_ = metrics.Resumes.WithLabelValues(result).Write(&m)
+		return m.GetCounter().GetValue()
+	}
+	resumed, notResumed := resumes("resumed"), resumes("not_resumed")
 	for _, tc := range []struct {
 		sub    string
 		resume map[string]string
@@ -47,6 +56,12 @@ func TestResumeIsDecidedInTheResult(t *testing.T) {
 		if (res.Resumed == nil) != (tc.want == nil) || (res.Resumed != nil && *res.Resumed != *tc.want) {
 			t.Errorf("%s: resumed = %v, want %v", tc.sub, deref(res.Resumed), deref(tc.want))
 		}
+	}
+	if got := resumes("resumed") - resumed; got != 1 {
+		t.Errorf("sluice_resumes_total{result=resumed} rose by %v, want 1", got)
+	}
+	if got := resumes("not_resumed") - notResumed; got != 1 {
+		t.Errorf("sluice_resumes_total{result=not_resumed} rose by %v, want 1", got)
 	}
 	for _, ev := range events(st) {
 		if e, ok := ev.Data.(event.Error); ok {

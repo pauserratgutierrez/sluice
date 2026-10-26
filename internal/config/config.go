@@ -58,10 +58,10 @@ type Config struct {
 	StatusEvery   time.Duration
 	MessagePrefix string
 
-	// RingEvents is the resume buffer's capacity per table; 0 disables it.
-	RingEvents   int
-	RingMaxBytes int
-	RingMaxAge   time.Duration
+	// RingMemory is the resume buffer's budget, as a share of the Go memory
+	// limit; 0 disables it. RingMaxAge is how far back it keeps changes.
+	RingMemory float64
+	RingMaxAge time.Duration
 
 	JWKSURL      string
 	JWKSRefresh  time.Duration
@@ -171,9 +171,8 @@ func Load() (*Config, error) {
 		StatusEvery:   envDur("SLUICE_STATUS_INTERVAL", 10*time.Second),
 		MessagePrefix: env("SLUICE_MESSAGE_PREFIX", "sluice:"),
 
-		RingEvents:   envInt("SLUICE_RING_EVENTS", 4096),
-		RingMaxBytes: envInt("SLUICE_RING_MAX_BYTES", 64<<20),
-		RingMaxAge:   envDur("SLUICE_RING_MAX_AGE", 60*time.Second),
+		RingMemory: envFloat("SLUICE_RING_MEMORY", 0.1),
+		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", 60*time.Second),
 
 		JWKSURL:      env("SLUICE_JWKS_URL", ""),
 		JWKSRefresh:  envDur("SLUICE_JWKS_REFRESH", 5*time.Minute),
@@ -309,14 +308,14 @@ func (c *Config) validate() error {
 	if c.AdmitMemory < 0 || c.AdmitMemory >= 1 {
 		return fmt.Errorf("SLUICE_ADMIT_MEMORY must be at least 0 and below 1 (0: off), got %v", c.AdmitMemory)
 	}
-	if c.RingEvents < 0 {
-		return fmt.Errorf("SLUICE_RING_EVENTS must not be negative")
+	if c.RingMemory < 0 || c.RingMemory >= 1 {
+		return fmt.Errorf("SLUICE_RING_MEMORY must be at least 0 and below 1 (0: off), got %v", c.RingMemory)
 	}
-	if c.RingEvents > 0 && c.RingMaxBytes <= 0 {
-		return fmt.Errorf("SLUICE_RING_MAX_BYTES must be positive")
+	if c.RingMaxAge < 0 {
+		return fmt.Errorf("SLUICE_RING_MAX_AGE must not be negative (0: kept until the budget removes them)")
 	}
-	if c.RingEvents == 0 && c.SnapshotEnabled {
-		return fmt.Errorf("SLUICE_RING_EVENTS=0 needs SLUICE_SNAPSHOT_ENABLED=false: a snapshot " +
+	if c.RingMemory == 0 && c.SnapshotEnabled {
+		return fmt.Errorf("SLUICE_RING_MEMORY=0 needs SLUICE_SNAPSHOT_ENABLED=false: a snapshot " +
 			"replays the resume buffer from its floor, which is what makes it gapless")
 	}
 	if c.SessionLookup && !c.RevocationEnabled {

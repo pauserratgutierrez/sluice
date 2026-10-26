@@ -62,6 +62,21 @@ func parseCgroupMemory(s string) (int64, bool) {
 	return n, true
 }
 
+// resumeBufferBytes is the resume buffer's budget: SLUICE_RING_MEMORY of the Go
+// memory limit, or noLimitResumeBuffer when none is known; 0 when disabled.
+func resumeBufferBytes(share float64) int {
+	limit := debug.SetMemoryLimit(-1)
+	switch {
+	case share == 0:
+		return 0
+	case limit <= 0 || limit == math.MaxInt64:
+		return noLimitResumeBuffer
+	}
+	return int(float64(limit) * share)
+}
+
+const noLimitResumeBuffer = 64 << 20
+
 // logAdmission says how new streams will be admitted: refused when memory
 // nears the Go memory limit (SLUICE_ADMIT_MEMORY), and at a fixed number of
 // streams when SLUICE_MAX_STREAMS is set.

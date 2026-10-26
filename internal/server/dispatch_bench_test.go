@@ -37,12 +37,12 @@ func uid(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i) 
 // newRoomsBench builds the rooms workload's registry and hold index: per room,
 // `members` members of whom `online` hold a stream with 7 shapes, each held by
 // the member's room_members row.
-func newRoomsBench(tb testing.TB, classes [][3]int, ringEvents, ringBytes int) *roomsBench {
+func newRoomsBench(tb testing.TB, classes [][3]int, ringBytes int) *roomsBench {
 	cfg := &config.Config{
 		PathPrefix: "/sluice/v1", ShapeOracle: oracle.NameIssuer, Heartbeat: 20 * time.Second,
 		UnindexedMax: 200, ReplicaIdentity: "warn", MaxChangeBytes: 1 << 20,
 	}
-	h := hub.New(256, ringEvents, ringBytes, time.Minute, time.Second)
+	h := hub.New(256, ringBytes, time.Minute, time.Second)
 	s := New(context.Background(), Options{Config: cfg, Logger: slog.New(slog.DiscardHandler),
 		Catalog: catalog.New(nil), Oracle: stubOracle{name: oracle.NameIssuer}, Hub: h})
 	rb := &roomsBench{s: s}
@@ -165,7 +165,7 @@ var unicorn = [][3]int{{380, 80, 28}, {16, 250, 85}}
 // 7 shapes), on the reader: ns/op is per message; changes/s is the reader's
 // ceiling for this mix on one core.
 func BenchmarkRoomMessage(b *testing.B) {
-	rb := newRoomsBench(b, unicorn, 4096, 64<<20)
+	rb := newRoomsBench(b, unicorn, 64<<20)
 	b.ReportAllocs()
 	changes := 0
 	b.ResetTimer()
@@ -181,11 +181,11 @@ func BenchmarkRoomMessage(b *testing.B) {
 // buffer: the last `since` changes are at or after its position, and 1 in 400
 // of them is its user's.
 func BenchmarkReplay(b *testing.B) {
-	rb := newRoomsBench(b, nil, 1, 1<<30)
+	rb := newRoomsBench(b, nil, 1<<30)
 	at := "2026-10-26 10:00:00.123456+00"
 	for _, c := range []struct{ size, since int }{{4096, 4096}, {131072, 1024}, {131072, 131072}} {
 		b.Run(fmt.Sprintf("ring=%d/since=%d", c.size, c.since), func(b *testing.B) {
-			rings := hub.NewRings(c.size, 1<<40, time.Hour)
+			rings := hub.NewRings(1<<40, time.Hour)
 			rings.SetStart(1)
 			me := uid(1)
 			for i := range c.size {

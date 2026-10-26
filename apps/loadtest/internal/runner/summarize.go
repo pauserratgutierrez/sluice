@@ -125,7 +125,7 @@ func Summarize(w io.Writer, dirs []string) error {
 	fmt.Fprintln(w)
 
 	// Resume buffer coverage.
-	fmt.Fprintf(w, "## Resume buffer coverage (median over the runs' probe rounds)\n\n| Run | Table | Changes/s | Probed s | Probed min s | Derived s |\n| --- | --- | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(w, "## Resume buffer coverage (median over the runs' probe rounds)\n\n| Run | Table | Changes/s | Probed s | Probed min s | Reported s |\n| --- | --- | ---: | ---: | ---: | ---: |\n")
 	for _, g := range order {
 		var rounds []ProbeRound
 		for _, r := range groups[g] {

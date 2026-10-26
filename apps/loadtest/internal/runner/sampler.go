@@ -47,12 +47,15 @@ type Point struct {
 	Changes       float64 `json:"changes"`
 	ChangesPerSec float64 `json:"changes_per_s"`
 	// TableRates is changes decoded per second, per table.
-	TableRates     map[string]float64 `json:"table_changes_per_s,omitempty"`
-	DispatchSum    float64            `json:"dispatch_s"`
-	DispatchCount  float64            `json:"dispatch_count"`
-	ResumeBufMiB   float64            `json:"resume_buffer_mib"`
-	HookRechecks   float64            `json:"hook_rechecks"`
-	SluiceRestarts int                `json:"sluice_restarts,omitempty"`
+	TableRates    map[string]float64 `json:"table_changes_per_s,omitempty"`
+	DispatchSum   float64            `json:"dispatch_s"`
+	DispatchCount float64            `json:"dispatch_count"`
+	ResumeBufMiB  float64            `json:"resume_buffer_mib"`
+	// ResumeBufferS is how far back Sluice says its resume buffer covers every
+	// table (sluice_resume_buffer_seconds).
+	ResumeBufferS  float64 `json:"resume_buffer_s,omitempty"`
+	HookRechecks   float64 `json:"hook_rechecks"`
+	SluiceRestarts int     `json:"sluice_restarts,omitempty"`
 
 	// From Sluice 0.9: the live heap the last GC found (exactly, unlike
 	// NextGCMiB/2), the memory a GC cannot give back (stream admission's
@@ -227,6 +230,7 @@ func (s *sampler) sample(ctx context.Context, phase string) (Point, int) {
 		p.Goroutines = m["go_goroutines"]
 		p.GCPauseMaxMs = m[`go_gc_duration_seconds{quantile="1"}`] * 1000
 		p.ResumeBufMiB = m["sluice_resume_buffer_bytes"] / mib
+		p.ResumeBufferS = m["sluice_resume_buffer_seconds"]
 		p.HeapLiveExactMiB = m["sluice_heap_live_bytes"] / mib
 		p.MemoryFloorMiB = m["sluice_memory_floor_bytes"] / mib
 		p.IndexSize = indexSizes(m)

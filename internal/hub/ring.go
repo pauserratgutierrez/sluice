@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"cmp"
 	"sync"
 	"time"
 	"unsafe"
@@ -22,7 +23,7 @@ type RingEntry struct {
 	OldIsKey   bool
 	At         time.Time
 
-	size int    // bytes held, counted against SLUICE_RING_MAX_BYTES
+	size int    // bytes held, counted against the budget (SLUICE_RING_MEMORY)
 	seq  uint64 // append order across every ring
 }
 
@@ -43,7 +44,7 @@ func tupleSize(t *pgoutput.Tuple) int {
 	return n
 }
 
-// Rings holds one bounded ring buffer per relation.
+// Rings holds one ring buffer per relation.
 //
 // Per relation, not per shape: the number of distinct shapes can be one per user,
 // so a per-shape buffer would be O(shapes x ring) memory. Per-relation is
@@ -51,30 +52,35 @@ func tupleSize(t *pgoutput.Tuple) int {
 // reconnections are rare relative to changes.
 //
 // A ring holds every change the reader dispatched for its relation since the
-// process started replicating, minus what was removed: the oldest entries past
-// SLUICE_RING_EVENTS per relation or SLUICE_RING_MAX_BYTES across all of them,
-// and those older than SLUICE_RING_MAX_AGE (applied by Sweep). Age never removes
-// a relation's newest transaction, so a client that was up to date on a quiet
-// table can always resume. A request that reaches into a removed range is told
-// it was not resumed rather than silently given a partial replay.
+// process started replicating, minus what was removed: changes older than
+// SLUICE_RING_MAX_AGE (applied by Sweep), and, while every ring together holds
+// more than the budget (maxBytes), the oldest change of any relation. So every
+// busy relation reaches back as far as the others, by time rather than by a
+// number of its changes. Neither removes a relation's newest transaction while
+// anything else is left, so a client that was up to date on a quiet table can
+// resume. A request that reaches into a removed range is told it was not
+// resumed rather than silently given a partial replay.
 //
-// A capacity of 0 disables the buffer: nothing is kept and no position is
+// A budget of 0 disables the buffer: nothing is kept and no position is
 // covered.
 type Rings struct {
-	capacity int
 	maxBytes int
 	maxAge   time.Duration
 
 	mu    sync.RWMutex
 	start uint64 // replication start LSN; 0 until the reader has started
-	bytes int    // held by every ring together
-	seq   uint64 // the last append's order
-	rings map[uint32]*ring
+	// startedAt is when replication started, and removedAt when the newest
+	// change removed so far was appended: every position since the later of the
+	// two is covered on every relation.
+	startedAt, removedAt time.Time
+	bytes                int    // held by every ring together
+	seq                  uint64 // the last append's order
+	rings                map[uint32]*ring
+	list                 []*ring // the same rings, for dropOldestOverall to scan
 }
 
-// minRing is the slot count a ring starts with. A ring grows towards the
-// capacity as its relation gets busy, so a quiet table holds a few slots rather
-// than thousands.
+// minRing is the slot count a ring starts with. A ring grows as its relation
+// gets busy, so a quiet table holds a few slots rather than thousands.
 const minRing = 16
 
 type ring struct {
@@ -89,19 +95,23 @@ type ring struct {
 
 func (rg *ring) at(i int) *RingEntry { return &rg.buf[(rg.head+i)%len(rg.buf)] }
 
-// dropOldest removes the oldest entry and returns the bytes it held.
-func (rg *ring) dropOldest() int {
+// dropOldest removes the oldest entry and returns the bytes it held and when
+// it was appended.
+func (rg *ring) dropOldest() (freed int, at time.Time) {
 	e := rg.at(0)
 	if e.LSN > rg.evicted {
 		rg.evicted = e.LSN
 	}
 	rg.evictedSeq = e.seq
-	freed := e.size
+	freed, at = e.size, e.At
 	*e = RingEntry{}
 	rg.head = (rg.head + 1) % len(rg.buf)
 	rg.size--
-	return freed
+	return freed, at
 }
+
+// newestOnly reports whether the ring holds nothing but its newest transaction.
+func (rg *ring) newestOnly() bool { return rg.at(0).LSN == rg.at(rg.size-1).LSN }
 
 // resize moves the entries, oldest first, into a buffer of n slots.
 func (rg *ring) resize(n int) {
@@ -112,8 +122,10 @@ func (rg *ring) resize(n int) {
 	rg.buf, rg.head = buf, 0
 }
 
-func NewRings(capacity, maxBytes int, maxAge time.Duration) *Rings {
-	return &Rings{capacity: max(capacity, 0), maxBytes: maxBytes, maxAge: maxAge, rings: map[uint32]*ring{}}
+// NewRings returns a buffer that keeps changes for maxAge (0: until the budget
+// removes them) in at most maxBytes (0: disabled).
+func NewRings(maxBytes int, maxAge time.Duration) *Rings {
+	return &Rings{maxBytes: max(maxBytes, 0), maxAge: maxAge, rings: map[uint32]*ring{}}
 }
 
 // SetStart records the LSN replication started from. Only the first call
@@ -121,18 +133,18 @@ func NewRings(capacity, maxBytes int, maxAge time.Duration) *Rings {
 // already dispatched, so coverage does not shrink. A disabled buffer covers
 // nothing, so it never starts.
 func (r *Rings) SetStart(lsn uint64) {
-	if r.capacity == 0 {
+	if r.maxBytes == 0 {
 		return
 	}
 	r.mu.Lock()
 	if r.start == 0 {
-		r.start = lsn
+		r.start, r.startedAt = lsn, time.Now()
 	}
 	r.mu.Unlock()
 }
 
 // Enabled reports whether the buffer keeps anything.
-func (r *Rings) Enabled() bool { return r.capacity > 0 }
+func (r *Rings) Enabled() bool { return r.maxBytes > 0 }
 
 // Seq returns the append order the buffer has reached.
 func (r *Rings) Seq() uint64 {
@@ -144,7 +156,7 @@ func (r *Rings) Seq() uint64 {
 // Append records a change and returns its place in the append order, 0 when
 // the buffer is disabled.
 func (r *Rings) Append(e RingEntry) uint64 {
-	if r.capacity == 0 {
+	if r.maxBytes == 0 {
 		return 0
 	}
 	e.At = time.Now()
@@ -157,12 +169,10 @@ func (r *Rings) Append(e RingEntry) uint64 {
 	if rg == nil {
 		rg = &ring{}
 		r.rings[e.Relation.OID] = rg
-	}
-	if rg.size == r.capacity {
-		r.bytes -= rg.dropOldest()
+		r.list = append(r.list, rg)
 	}
 	if rg.size == len(rg.buf) {
-		rg.resize(min(r.capacity, max(minRing, 2*len(rg.buf))))
+		rg.resize(max(minRing, 2*len(rg.buf)))
 	}
 	*rg.at(rg.size) = e
 	rg.size++
@@ -173,42 +183,60 @@ func (r *Rings) Append(e RingEntry) uint64 {
 	return e.seq
 }
 
+// drop removes a ring's oldest entry.
+func (r *Rings) drop(rg *ring) {
+	freed, at := rg.dropOldest()
+	r.bytes -= freed
+	if at.After(r.removedAt) {
+		r.removedAt = at
+	}
+}
+
 // dropOldestOverall removes the entry appended longest ago, whichever relation
-// holds it. Only called while some ring holds bytes.
+// holds it, sparing each relation's newest transaction while anything else is
+// left: past that, the newest transactions alone exceed the budget. Only
+// called while some ring holds bytes.
 func (r *Rings) dropOldestOverall() {
-	var oldest *ring
-	for _, rg := range r.rings {
-		if rg.size > 0 && (oldest == nil || rg.at(0).seq < oldest.at(0).seq) {
+	var oldest, spared *ring
+	for _, rg := range r.list {
+		switch {
+		case rg.size == 0:
+		case rg.newestOnly():
+			if spared == nil || rg.at(0).seq < spared.at(0).seq {
+				spared = rg
+			}
+		case oldest == nil || rg.at(0).seq < oldest.at(0).seq:
 			oldest = rg
 		}
 	}
-	r.bytes -= oldest.dropOldest()
+	r.drop(cmp.Or(oldest, spared))
 }
 
 // Sweep removes entries older than the maximum age, keeping each relation's
 // newest transaction, and shrinks rings that hold far fewer entries than they
 // have room for. It is what bounds the memory held for tables that have gone
-// quiet.
+// quiet. It also reports the buffer's size and how far back it covers every
+// relation.
 func (r *Rings) Sweep() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	cutoff := time.Now().Add(-r.maxAge)
-	for _, rg := range r.rings {
-		if r.maxAge > 0 && rg.size > 0 {
-			newest := rg.at(rg.size - 1).LSN
-			for rg.size > 0 {
-				e := rg.at(0)
-				if e.LSN == newest || !e.At.Before(cutoff) {
-					break
-				}
-				r.bytes -= rg.dropOldest()
-			}
+	now := time.Now()
+	cutoff := now.Add(-r.maxAge)
+	for _, rg := range r.list {
+		for r.maxAge > 0 && rg.size > 0 && !rg.newestOnly() && rg.at(0).At.Before(cutoff) {
+			r.drop(rg)
 		}
 		if n := max(minRing, 2*rg.size); n < len(rg.buf)/2 {
 			rg.resize(n)
 		}
 	}
 	metrics.ResumeBufferBytes.Set(float64(r.bytes))
+	if since := r.startedAt; !since.IsZero() {
+		if r.removedAt.After(since) {
+			since = r.removedAt
+		}
+		metrics.ResumeBufferSeconds.Set(now.Sub(since).Seconds())
+	}
 }
 
 // Replay returns every buffered change of a relation whose commit LSN is at or

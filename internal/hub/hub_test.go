@@ -7,12 +7,15 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/pauserratgutierrez/sluice/internal/authz"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/metrics"
 	"github.com/pauserratgutierrez/sluice/internal/pgoutput"
 )
 
-func newHub(queue int) *Hub { return New(queue, 8, 1<<20, time.Minute, 10*time.Millisecond) }
+func newHub(queue int) *Hub { return New(queue, 1<<20, time.Minute, 10*time.Millisecond) }
 
 func drain(s *Stream) []event.Event {
 	return s.Take(nil)
@@ -346,7 +349,7 @@ func ringEntry(lsn uint64) RingEntry {
 }
 
 func TestRingReplay(t *testing.T) {
-	r := NewRings(4, 1<<20, time.Minute)
+	r := NewRings(1<<20, time.Minute)
 	r.SetStart(5)
 	for i := uint64(1); i <= 3; i++ {
 		r.Append(ringEntry(i * 10))
@@ -372,7 +375,7 @@ func TestRingReplay(t *testing.T) {
 // a client asking for a position that has been evicted must be told to
 // resnapshot rather than silently handed a gap.
 func TestRingReportsGapWhenOverwritten(t *testing.T) {
-	r := NewRings(3, 1<<20, time.Minute)
+	r := NewRings(3*entryOverhead, time.Minute)
 	r.SetStart(5)
 	for i := uint64(1); i <= 10; i++ {
 		r.Append(ringEntry(i * 10))
@@ -391,7 +394,7 @@ func TestRingReportsGapWhenOverwritten(t *testing.T) {
 // nothing is covered; after, a quiet table with no buffered change is covered
 // from the start LSN on.
 func TestRingCoverageStartsWithReplication(t *testing.T) {
-	r := NewRings(4, 1<<20, time.Minute)
+	r := NewRings(1<<20, time.Minute)
 	if _, ok := r.Replay(99, 500); ok {
 		t.Fatal("nothing is covered before replication starts")
 	}
@@ -408,7 +411,7 @@ func TestRingCoverageStartsWithReplication(t *testing.T) {
 // Age is a memory bound, not a coverage rule: a table that went quiet keeps
 // its newest transaction, so a client that saw it can still resume.
 func TestRingSweepKeepsNewestTransaction(t *testing.T) {
-	r := NewRings(8, 1<<20, time.Millisecond)
+	r := NewRings(1<<20, time.Millisecond)
 	r.SetStart(5)
 	r.Append(ringEntry(10))
 	r.Append(ringEntry(20))
@@ -427,7 +430,7 @@ func TestRingSweepKeepsNewestTransaction(t *testing.T) {
 // Since takes over from a replay: a relation's changes appended after a
 // point in the append order, and a gap when the buffer already dropped one.
 func TestRingSinceReturnsWhatWasAppendedAfter(t *testing.T) {
-	r := NewRings(3, 1<<20, time.Minute)
+	r := NewRings(5*entryOverhead, time.Minute)
 	r.SetStart(5)
 	other := ringEntry(15)
 	other.Relation = &pgoutput.Relation{OID: 2, Namespace: "public", Name: "u"}
@@ -447,14 +450,14 @@ func TestRingSinceReturnsWhatWasAppendedAfter(t *testing.T) {
 		t.Fatalf("nothing appended since: %v ok=%v", lsns(got), ok)
 	}
 	r.Append(ringEntry(40))
-	r.Append(ringEntry(50)) // relation 1 holds 3: the change at 10 and then 20 are gone
+	r.Append(ringEntry(50)) // past the budget of 5: relation 1's changes at 10 and then 20 go, relation 2 holding only its newest transaction
 	if _, _, ok := r.Since(1, through, nil); ok {
 		t.Fatal("the change at 20, appended after the point asked for, was dropped: since must report a gap")
 	}
 }
 
 func TestRingDisabledCoversNothing(t *testing.T) {
-	r := NewRings(0, 1<<20, time.Minute)
+	r := NewRings(0, time.Minute)
 	r.SetStart(5)
 	r.Append(ringEntry(10))
 	if got, ok := r.Replay(1, 10); ok || len(got) != 0 {
@@ -462,38 +465,93 @@ func TestRingDisabledCoversNothing(t *testing.T) {
 	}
 }
 
-// The byte limit spans every table: a burst on one evicts the oldest entries
-// wherever they are, and each ring still reports the gap honestly.
-func TestRingByteLimitEvictsOldestOverall(t *testing.T) {
-	wide := func(oid uint32, lsn uint64) RingEntry {
-		e := ringEntry(lsn)
-		e.Relation = &pgoutput.Relation{OID: oid, Namespace: "public", Name: "t"}
-		e.New = &pgoutput.Tuple{Columns: []pgoutput.Column{{Kind: pgoutput.ColText, Data: make([]byte, 1000)}}}
-		return e
-	}
-	one := entryOverhead + tupleSize(wide(1, 0).New)
-	r := NewRings(100, 3*one, time.Minute)
+func wideEntry(oid uint32, lsn uint64) RingEntry {
+	e := ringEntry(lsn)
+	e.Relation = &pgoutput.Relation{OID: oid, Namespace: "public", Name: "t"}
+	e.New = &pgoutput.Tuple{Columns: []pgoutput.Column{{Kind: pgoutput.ColText, Data: make([]byte, 1000)}}}
+	return e
+}
+
+var wideSize = entryOverhead + tupleSize(wideEntry(1, 0).New)
+
+// The budget spans every table: a burst on one evicts the oldest entries
+// wherever they are, so every busy table reaches back as far, and each ring
+// still reports the gap honestly.
+func TestRingBudgetEvictsOldestOverall(t *testing.T) {
+	r := NewRings(3*wideSize, time.Minute)
 	r.SetStart(5)
-	r.Append(wide(1, 10))
-	r.Append(wide(2, 20))
-	r.Append(wide(2, 30))
-	r.Append(wide(2, 40))
+	r.Append(wideEntry(1, 10))
+	r.Append(wideEntry(1, 15))
+	r.Append(wideEntry(2, 20))
+	r.Append(wideEntry(2, 30))
 
 	if _, ok := r.Replay(1, 10); ok {
 		t.Error("the oldest entry, on another table, must be evicted and reported as a gap")
 	}
-	if got, ok := r.Replay(2, 20); !ok || len(got) != 3 {
-		t.Errorf("the entries within the limit must replay: %v ok=%v", lsns(got), ok)
+	if got, ok := r.Replay(1, 15); !ok || len(got) != 1 {
+		t.Errorf("the other table's newer change must replay: %v ok=%v", lsns(got), ok)
 	}
-	if r.bytes != 3*one {
-		t.Errorf("held %d bytes, want %d", r.bytes, 3*one)
+	if got, ok := r.Replay(2, 20); !ok || len(got) != 2 {
+		t.Errorf("the entries within the budget must replay: %v ok=%v", lsns(got), ok)
+	}
+	if r.bytes != 3*wideSize {
+		t.Errorf("held %d bytes, want %d", r.bytes, 3*wideSize)
 	}
 }
 
-// A ring grows from a few slots towards its capacity, wrapping around, without
-// reordering what it holds.
+// A quiet table keeps its newest transaction while the budget can take older
+// changes of other tables, so a client up to date on it can resume. Only when
+// newest transactions alone exceed the budget does one of them go.
+func TestRingBudgetSparesEachTablesNewestTransaction(t *testing.T) {
+	r := NewRings(3*wideSize, time.Minute)
+	r.SetStart(5)
+	r.Append(wideEntry(1, 10))
+	for _, lsn := range []uint64{20, 30, 40} {
+		r.Append(wideEntry(2, lsn))
+	}
+	if got, ok := r.Replay(1, 10); !ok || len(got) != 1 {
+		t.Fatalf("the quiet table's newest transaction must stay: %v ok=%v", lsns(got), ok)
+	}
+	if _, ok := r.Replay(2, 20); ok {
+		t.Fatal("the busy table's oldest change must go instead")
+	}
+
+	r.Append(wideEntry(3, 50))
+	r.Append(wideEntry(3, 50))
+	if _, ok := r.Replay(1, 10); ok {
+		t.Fatal("with only newest transactions left, the oldest of them must go")
+	}
+}
+
+// The buffer reports how far back it covers every table: since the newest
+// change it removed, or since replication started while it removed none.
+func TestRingReportsHowFarBackItCovers(t *testing.T) {
+	covered := func() float64 {
+		var m dto.Metric
+		_ = metrics.ResumeBufferSeconds.Write(&m)
+		return m.GetGauge().GetValue()
+	}
+	r := NewRings(3*wideSize, time.Minute)
+	r.SetStart(5)
+	time.Sleep(100 * time.Millisecond)
+	for _, lsn := range []uint64{10, 20, 30} {
+		r.Append(wideEntry(1, lsn))
+	}
+	r.Sweep()
+	if got := covered(); got < 0.1 {
+		t.Fatalf("covered %.3f s with nothing removed, want the time since replication started", got)
+	}
+	r.Append(wideEntry(1, 40)) // removes the change at 10, appended 100 ms after the start
+	r.Sweep()
+	if got := covered(); got >= 0.05 {
+		t.Fatalf("covered %.3f s, want the time since the change at 10 was appended", got)
+	}
+}
+
+// A ring grows from a few slots, wrapping around, without reordering what it
+// holds.
 func TestRingGrowsInOrder(t *testing.T) {
-	r := NewRings(64, 1<<20, time.Minute)
+	r := NewRings(1<<20, time.Minute)
 	r.SetStart(1)
 	for i := uint64(1); i <= 100; i++ {
 		r.Append(ringEntry(i))
@@ -562,4 +620,31 @@ func lsns(entries []RingEntry) []uint64 {
 		out = append(out, e.LSN)
 	}
 	return out
+}
+
+// BenchmarkAppendAtBudget is the reader's cost of buffering one change once the
+// budget is full, so that every append removes the oldest change of some table.
+func BenchmarkAppendAtBudget(b *testing.B) {
+	for _, tables := range []int{1, 50} {
+		b.Run(fmt.Sprintf("tables=%d", tables), func(b *testing.B) {
+			r := NewRings(4096*wideSize, time.Minute)
+			r.SetStart(1)
+			entries := make([]RingEntry, tables)
+			for i := range entries {
+				entries[i] = wideEntry(uint32(1+i), 0)
+			}
+			for i := range 8192 {
+				e := entries[i%tables]
+				e.LSN = uint64(1 + i)
+				r.Append(e)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				e := entries[i%tables]
+				e.LSN = uint64(8193 + i)
+				r.Append(e)
+			}
+		})
+	}
 }

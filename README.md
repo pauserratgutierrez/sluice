@@ -353,9 +353,9 @@ Warning codes: `columns_not_granted`, `unindexed_shape`, `replica_identity_insuf
 
 A client that reconnects sends `resume: { "schema.table": "<lsn>" }` per table: the last commit LSN it saw there, or, for a table whose shapes have seen no change, the `wal_lsn` of the `ready` (or `/subscribe` response) that installed them. For each shape on that table Sluice replays, from its in-memory buffer, every change whose commit LSN is **at or after** that position, re-filtered and re-authorized; the snapshot is skipped. Changes committed while the replay runs reach the shape after it, in commit order. The result says whether it could: `resumed: true` means nothing was missed; `resumed: false` means the buffer does not reach that far (older than what it holds, or from before this process started), and the subscription is live but the client must read the current state again. The SDK reports both as `onLive`.
 
-The buffer holds up to `SLUICE_RING_EVENTS` changes per table since this process started replicating, and at most `SLUICE_RING_MAX_BYTES` of row data across every table, evicting the oldest first; entries older than `SLUICE_RING_MAX_AGE` are swept, except each table's newest transaction. `SLUICE_RING_EVENTS=0` disables it, which requires `SLUICE_SNAPSHOT_ENABLED=false` (a snapshot replays the buffer from its floor): every resume is then `resumed: false`, for clients that read the current state over HTTP whenever a subscription goes live. Broadcasts, presence and `TRUNCATE` are not replayed.
+The buffer keeps every table's changes for `SLUICE_RING_MAX_AGE` (60 s), since this process started replicating, in at most `SLUICE_RING_MEMORY` of the Go memory limit (a tenth by default; 64 MiB when no limit is known). Past that budget it removes the oldest change of any table, so every busy table reaches back as far as the others. Neither the age nor the budget removes a table's newest transaction while anything else is left, so a client up to date on a quiet table can resume. `sluice_resume_buffer_seconds` says how far back the buffer covers every table, and `sluice_resumes_total{result}` counts the resumes that replayed everything and those that could not. `SLUICE_RING_MEMORY=0` disables it, which requires `SLUICE_SNAPSHOT_ENABLED=false` (a snapshot replays the buffer from its floor): every resume is then `resumed: false`, for clients that read the current state over HTTP whenever a subscription goes live. Broadcasts, presence and `TRUNCATE` are not replayed, and changes to the [revocation](#session-revocation) tables are not kept.
 
-The buffer counts a table's changes, whoever they were for, so on a busy table it reaches back seconds, not minutes. Measured: a table taking 337 changes a second (each message updating every member's row) was covered for about 12 s with `SLUICE_RING_EVENTS=4096`, and at 2,300 a second for about 2 s. A reconnect after a short network cut can therefore come back `resumed: false` for that table, not only after a restart or a long absence. Raise `SLUICE_RING_EVENTS` for such tables (about half a KiB of memory per buffered change), or write fewer rows per action.
+The buffer keeps a table's changes whoever they were for, about half a KiB each (an `UPDATE` of three columns under `REPLICA IDENTITY FULL`, both tuples), and admission counts that memory like the rest (`SLUICE_ADMIT_MEMORY`): a larger buffer admits fewer streams. Estimated from those figures: 60 s of a table taking 337 changes a second hold about 10 MiB; at 2,300 a second they would need about 66 MiB, past a tenth of a 512 MB container's limit, so there the budget decides, at about 40 s. A replay looks through every change to its table since its position, about 40 ns each on one core (`BenchmarkReplay`): about 1 ms per resumed shape after a 15-s cut at 2,000 changes a second. Busy tables are cheaper with fewer rows written per action.
 
 ## Channels: broadcast and presence
 
@@ -465,7 +465,8 @@ Issuer mode adds `"issuer": { "url", "timeout", "holds" }` and reports no tiers.
 | `sluice_wal_lag_bytes`, `sluice_slot_retained_bytes`, `sluice_slot_safe_wal_bytes` (absent while `max_slot_wal_keep_size` is -1) | |
 | `sluice_wal_messages_total` | `type` |
 | `sluice_reader_reconnects_total`, `sluice_reader_is_leader`, `sluice_slot_recreated_total` | |
-| `sluice_resume_buffer_bytes` (gauge) | |
+| `sluice_resume_buffer_bytes`, `sluice_resume_buffer_seconds` (gauges) | |
+| `sluice_resumes_total` | `result` = resumed, not_resumed |
 | `sluice_changes_total` | `schema`, `table`, `op` |
 | `sluice_change_dispatch_seconds`, `sluice_routing_candidates` (histograms) | `schema`, `table` |
 | `sluice_toast_unchanged_total` | `schema`, `table`, `column` |
@@ -558,8 +559,8 @@ Environment variables. Durations use Go syntax (`30s`, `5m`). The runnable templ
 | `SLUICE_MESSAGES` | `true` | deliver `pg_logical_emit_message` |
 | `SLUICE_STATUS_INTERVAL` | `10s` | slot acknowledgement interval |
 | `SLUICE_MESSAGE_PREFIX` | `sluice:` | must not be empty |
-| `SLUICE_RING_EVENTS` / `SLUICE_RING_MAX_AGE` | `4096` / `60s` | resume buffer per table; `0` disables it (needs `SLUICE_SNAPSHOT_ENABLED=false`) |
-| `SLUICE_RING_MAX_BYTES` | `67108864` | row data the resume buffer holds across every table |
+| `SLUICE_RING_MAX_AGE` | `60s` | how long the resume buffer keeps each table's changes; `0` keeps them until the budget removes them |
+| `SLUICE_RING_MEMORY` | `0.1` | the resume buffer's budget across every table, as a share of the Go memory limit (64 MiB when none is known); past it the oldest change of any table goes. `0` disables the buffer (needs `SLUICE_SNAPSHOT_ENABLED=false`) |
 | `SLUICE_JWKS_URL` | required | |
 | `SLUICE_JWKS_REFRESH` | `5m` | |
 | `SLUICE_JWT_ALG` | `ES256` | or `RS256` |

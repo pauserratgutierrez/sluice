@@ -92,7 +92,7 @@ func testServer(t *testing.T, orc oracle.Oracle) *Server {
 		UnindexedMax:       200,
 		ReplicaIdentity:    "warn",
 	}
-	h := hub.New(16, 8, 1<<20, time.Minute, time.Second)
+	h := hub.New(16, 1<<20, time.Minute, time.Second)
 	s := New(context.Background(), Options{
 		Config:  cfg,
 		Logger:  slog.New(slog.DiscardHandler),

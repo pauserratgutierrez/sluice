@@ -91,6 +91,16 @@ var (
 		Help: "Tuple bytes held by the resume buffer across every table.",
 	})
 
+	ResumeBufferSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sluice_resume_buffer_seconds",
+		Help: "How far back the resume buffer covers every table: the time since the newest change it removed, or since replication started. A client away for longer than this may resume with resumed: false.",
+	})
+
+	Resumes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_resumes_total",
+		Help: "Shapes subscribed with a resume position, by result: resumed (every change since it replayed) or not_resumed (the buffer no longer reaches it, so the client reads its state again).",
+	}, []string{"result"})
+
 	ReaderIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_reader_is_leader",
 		Help: "1 when this process holds the single-reader advisory lock; 0 while it stands by.",

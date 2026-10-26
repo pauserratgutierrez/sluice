@@ -704,9 +704,9 @@ func roomsMarkdown(r RoomsReport) string {
 	}
 
 	if r.Probe != nil {
-		fmt.Fprintf(&b, "## Resume buffer\n\nHow far back a stream could resume each table: probed (median and minimum over %d rounds, ages %v), and derived from the table's change rate (`SLUICE_RING_EVENTS`=%d, `SLUICE_RING_MAX_AGE`=%s).\n\n",
-			r.Probe.Rounds, r.Config.ProbeAges, r.Config.RingEvents, r.Config.RingMaxAge)
-		fmt.Fprintf(&b, "| Table | Changes/s | Probed median s | Probed min s | Derived s |\n| --- | ---: | ---: | ---: | ---: |\n")
+		fmt.Fprintf(&b, "## Resume buffer\n\nHow far back a stream could resume each table: probed (median and minimum over %d rounds, ages %v), and as Sluice reports it covers every table (`sluice_resume_buffer_seconds`; `SLUICE_RING_MEMORY`=%v, `SLUICE_RING_MAX_AGE`=%s).\n\n",
+			r.Probe.Rounds, r.Config.ProbeAges, r.Config.RingMemory, r.Config.RingMaxAge)
+		fmt.Fprintf(&b, "| Table | Changes/s | Probed median s | Probed min s | Reported s |\n| --- | ---: | ---: | ---: | ---: |\n")
 		tables := make([]string, 0, len(r.Probe.DerivedMedianS))
 		for tb := range r.Probe.DerivedMedianS {
 			tables = append(tables, tb)

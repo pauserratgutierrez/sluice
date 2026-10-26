@@ -198,6 +198,9 @@ func TestSessionRevocationBySidClaim(t *testing.T) {
 	if err := s.OnChange(m, sessions, 0x10, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if seq := s.hub.Rings().Seq(); seq != 0 {
+		t.Fatalf("a change to the sessions table was buffered (append order %d): no shape may be on it", seq)
+	}
 
 	if code := gone.CloseCode(); code != "session_revoked" {
 		t.Fatalf("signed-out stream closed with %q, want session_revoked", code)

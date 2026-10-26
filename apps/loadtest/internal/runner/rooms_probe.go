@@ -16,12 +16,12 @@ import (
 	"github.com/pauserratgutierrez/sluice/apps/loadtest/internal/sse"
 )
 
-// How far back can a stream resume each table? Sluice keeps the last
-// SLUICE_RING_EVENTS changes of every table (and none older than
-// SLUICE_RING_MAX_AGE), delivered to someone or not, so the answer depends
-// on each table's change rate. The probe asks Sluice itself: it opens short
-// streams that resume each table from positions of known age and reads the
-// `resumed` of every subscription.
+// How far back can a stream resume each table? Sluice keeps every table's
+// changes for SLUICE_RING_MAX_AGE within its budget (SLUICE_RING_MEMORY),
+// delivered to someone or not, and reports how far back that covers every
+// table (sluice_resume_buffer_seconds). The probe asks Sluice itself: it opens
+// short streams that resume each table from positions of known age and reads
+// the `resumed` of every subscription.
 
 // lsnTrail remembers, per table, which commit LSN the run saw at what time.
 type lsnTrail struct {
@@ -87,8 +87,8 @@ type ProbeTable struct {
 	CoverS float64 `json:"cover_s"`
 }
 
-// DerivedCoverage is what the buffer should hold given a table's change
-// rate: the newest SLUICE_RING_EVENTS changes, at most SLUICE_RING_MAX_AGE.
+// DerivedCoverage is a table's change rate, and how far back Sluice reports
+// its buffer covers every table (sluice_resume_buffer_seconds).
 type DerivedCoverage struct {
 	ChangesPerSec float64 `json:"changes_per_s"`
 	CoverS        float64 `json:"cover_s"`
@@ -233,8 +233,8 @@ func (e *engine) probeOnce(ctx context.Context, c *rclient, subs []json.RawMessa
 	return out, nil
 }
 
-// derivedCoverage is each table's coverage from its change rate over the
-// last sampling interval.
+// derivedCoverage is each table's change rate over the last
+// ProbeDerivedWindow, with the coverage Sluice last reported.
 func (e *engine) derivedCoverage() map[string]DerivedCoverage {
 	pts := e.sampler.snapshotPoints()
 	if len(pts) < 2 {
@@ -252,12 +252,7 @@ func (e *engine) derivedCoverage() map[string]DerivedCoverage {
 	}
 	out := map[string]DerivedCoverage{}
 	for tb, total := range sum {
-		rate := total / float64(n)
-		d := DerivedCoverage{ChangesPerSec: rate, CoverS: e.rc.RingMaxAge.Seconds()}
-		if rate > 0 {
-			d.CoverS = min(float64(e.rc.RingEvents)/rate, e.rc.RingMaxAge.Seconds())
-		}
-		out[tb] = d
+		out[tb] = DerivedCoverage{ChangesPerSec: total / float64(n), CoverS: pts[len(pts)-1].ResumeBufferS}
 	}
 	return out
 }
@@ -303,37 +298,4 @@ func summarizeProbes(rounds []ProbeRound, phase string) *ProbeSummary {
 		s.RateMedian[tb] = median(rates[tb])
 	}
 	return s
-}
-
-// RederivedCoverage recomputes, from a report's timeline, the derived
-// coverage of each probe round: each table's mean change rate over the
-// window before the round, against the buffer's bounds. It is how reports
-// written before the live derivation used a window get comparable figures,
-// and how a live one is checked.
-func RederivedCoverage(r RoomsReport, window time.Duration) []map[string]DerivedCoverage {
-	out := make([]map[string]DerivedCoverage, len(r.Probes))
-	for i, round := range r.Probes {
-		sum := map[string]float64{}
-		n := 0
-		for _, p := range r.Timeline {
-			if p.T > round.T || round.T-p.T >= window.Seconds() || p.TableRates == nil {
-				continue
-			}
-			for tb, v := range p.TableRates {
-				sum[tb] += v
-			}
-			n++
-		}
-		m := map[string]DerivedCoverage{}
-		for tb, total := range sum {
-			rate := total / float64(n)
-			d := DerivedCoverage{ChangesPerSec: rate, CoverS: r.Config.RingMaxAge.Seconds()}
-			if rate > 0 {
-				d.CoverS = min(float64(r.Config.RingEvents)/rate, r.Config.RingMaxAge.Seconds())
-			}
-			m[tb] = d
-		}
-		out[i] = m
-	}
-	return out
 }

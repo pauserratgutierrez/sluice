@@ -163,15 +163,18 @@ func TestValidateRingDisabledNeedsSnapshotsOff(t *testing.T) {
 	if err := c.validate(); err != nil {
 		t.Fatalf("a disabled buffer without snapshots is valid: %v", err)
 	}
-	c.RingEvents = -1
-	if err := c.validate(); err == nil {
-		t.Fatal("a negative SLUICE_RING_EVENTS must be rejected")
+	for _, share := range []float64{-0.1, 1} {
+		c.RingMemory = share
+		if err := c.validate(); err == nil {
+			t.Fatalf("SLUICE_RING_MEMORY=%v must be rejected", share)
+		}
 	}
-	c.RingEvents = 4096
+	c.RingMemory = 0.1
+	c.RingMaxAge = -1
 	if err := c.validate(); err == nil {
-		t.Fatal("an enabled buffer needs a positive SLUICE_RING_MAX_BYTES")
+		t.Fatal("a negative SLUICE_RING_MAX_AGE must be rejected")
 	}
-	c.RingMaxBytes = 64 << 20
+	c.RingMaxAge = 0
 	c.SnapshotEnabled = true
 	if err := c.validate(); err != nil {
 		t.Fatal(err)

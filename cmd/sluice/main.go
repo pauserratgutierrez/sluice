@@ -161,7 +161,9 @@ func run() error {
 	revoker := auth.NewRevoker(0)
 
 	// ---- hub, authorizer, server ----------------------------------------
-	h := hub.New(cfg.StreamQueue, cfg.RingEvents, cfg.RingMaxBytes, cfg.RingMaxAge, cfg.PresenceBcast)
+	ringBytes := resumeBufferBytes(cfg.RingMemory)
+	log.Info("resume buffer", "max_age", cfg.RingMaxAge, "budget_bytes", ringBytes)
+	h := hub.New(cfg.StreamQueue, ringBytes, cfg.RingMaxAge, cfg.PresenceBcast)
 	go h.Presence().Run()
 	defer h.Presence().Stop()
 

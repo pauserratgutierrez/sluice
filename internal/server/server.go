@@ -1104,6 +1104,7 @@ func (s *Server) finishShape(st *hub.Stream, p plannedShape, installedAt uint64)
 		}
 		if sub.Backfill == nil {
 			res.Resumed = new(false)
+			metrics.Resumes.WithLabelValues("not_resumed").Inc()
 			return res
 		}
 		entries, through, ok := s.hub.Rings().ReplayThrough(sub.Relation.OID, p.from, routedTo(sub))
@@ -1112,6 +1113,9 @@ func (s *Server) finishShape(st *hub.Stream, p plannedShape, installedAt uint64)
 			// Removed since Covers looked. The client reads its state again;
 			// it still gets what the reader kept from it since the install.
 			entries, through = nil, installedAt
+			metrics.Resumes.WithLabelValues("not_resumed").Inc()
+		} else {
+			metrics.Resumes.WithLabelValues("resumed").Inc()
 		}
 		if len(entries) == 0 {
 			if _, _, _, done := s.handOver(sub, through); done {

@@ -85,11 +85,10 @@ type roomsConfig struct {
 	// ProbeAges asks to resume each table from that far back.
 	ProbeEvery time.Duration   `json:"probe_every,omitempty"`
 	ProbeAges  []time.Duration `json:"probe_ages,omitempty"`
-	RingEvents int             `json:"ring_events,omitempty"`
+	RingMemory float64         `json:"ring_memory,omitempty"`
 	RingMaxAge time.Duration   `json:"ring_max_age,omitempty"`
-	// ProbeDerivedWindow is how far back the derived coverage averages each
-	// table's change rate. Reports written before it existed derived it from
-	// the last sampling interval alone.
+	// ProbeDerivedWindow is how far back each table's change rate is averaged
+	// for a probe round.
 	ProbeDerivedWindow time.Duration `json:"probe_derived_window,omitempty"`
 
 	DockerSocket string `json:"-"`
@@ -176,7 +175,7 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 		DockerSocket: envOr("LOAD_DOCKER_SOCKET", "/var/run/docker.sock"),
 
 		ProbeEvery: envDur("LOAD_PROBE_EVERY", 2*time.Minute),
-		RingEvents: envInt("SLUICE_RING_EVENTS", 4096),
+		RingMemory: envFloat("SLUICE_RING_MEMORY", 0.1),
 		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", time.Minute),
 
 		ProbeDerivedWindow: time.Minute,

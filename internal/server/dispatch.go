@@ -317,11 +317,15 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 
 	// Buffer for reconnect replay regardless of who is currently listening.
 	// Before routing: a subscription installed in between is then either
-	// routed this change or finds it in the buffer when it replays.
-	seq := s.hub.Rings().Append(hub.RingEntry{
-		LSN: commitLSN, CommitTime: commitTime, Op: m.Type,
-		Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
-	})
+	// routed this change or finds it in the buffer when it replays. Not the
+	// revocation tables, which no shape may be on: nothing would replay them.
+	var seq uint64
+	if !s.revocationTable(rel.OID) {
+		seq = s.hub.Rings().Append(hub.RingEntry{
+			LSN: commitLSN, CommitTime: commitTime, Op: m.Type,
+			Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
+		})
+	}
 
 	// Route on both tuples. Routing only on the new one would miss a row that
 	// left a shape (supabase/walrus#64).
@@ -725,6 +729,11 @@ func (s *Server) deliver(
 
 func (s *Server) noteUnknown(rel *pgoutput.Relation, op string) {
 	metrics.AuthzUnknown.WithLabelValues(rel.Namespace, rel.Name, op).Inc()
+}
+
+// revocationTable reports whether a relation is one of the revocation tables.
+func (s *Server) revocationTable(oid uint32) bool {
+	return s.cfg.RevocationEnabled && (oid == s.sessionsOID.Load() || oid == s.usersOID.Load())
 }
 
 // handleRevocation watches the sessions table and, when one is configured, the
