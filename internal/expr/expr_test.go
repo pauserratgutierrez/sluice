@@ -388,3 +388,25 @@ func TestParseTextTypes(t *testing.T) {
 		}
 	}
 }
+
+// Two text values compare as text, as PostgreSQL compares two text operands,
+// even when both read as numbers; a number against text that reads as one
+// compares numerically.
+func TestTextComparesAsText(t *testing.T) {
+	for _, c := range []struct {
+		a, b Value
+		want int
+	}{
+		{Text("10.0"), Text("10"), 1},
+		{Text("9"), Text("10"), 1},
+		{Text("abc"), Text("abd"), -1},
+		{Text("a1b2c3d4-0000-4000-8000-000000000001"), Text("a1b2c3d4-0000-4000-8000-000000000001"), 0},
+		{Int(9), Text("10"), -1},
+		{Text("10.0"), Float(10), 0},
+	} {
+		got, err := compare(c.a, c.b)
+		if err != nil || got != c.want {
+			t.Errorf("compare(%v, %v) = %d, %v; want %d", c.a, c.b, got, err, c.want)
+		}
+	}
+}

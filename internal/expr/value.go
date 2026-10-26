@@ -243,10 +243,14 @@ func Cast(v Value, typeName string) (Value, error) {
 // other parses as a number, compare numerically; otherwise compare as text.
 // This matches what PostgreSQL does for the operator forms `pg_get_expr`
 // actually emits, because it has already inserted explicit casts where the
-// types differ.
+// types differ. Two text values are two text operands, which PostgreSQL
+// compares as text even when both read as numbers ('10.0' <> '10').
 func compare(a, b Value) (int, error) {
 	if a.IsNull() || b.IsNull() {
 		return 0, ErrUnknown
+	}
+	if a.Kind == KindText && b.Kind == KindText {
+		return strings.Compare(a.Str, b.Str), nil
 	}
 	if a.Kind == KindBool || b.Kind == KindBool {
 		ab, bb := a.Truthy(), b.Truthy()

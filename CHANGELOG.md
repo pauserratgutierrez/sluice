@@ -18,6 +18,7 @@ A stream opened while the replication slot was being created could miss changes;
   - A shape is now registered only after its holds were found, and only while its watch has not been cut since; a change dispatched during the check is before the shape's `ready`, as any change before a subscribe is.
   - Present since issuer mode was added (0.1.4).
 - On PostgreSQL 16, the slot's state in `/diagnostics` and `sluice_slot_retained_bytes` stayed empty: their query read `invalidation_reason`, a column PostgreSQL 17 added. It now reads it as the reader does, through `to_jsonb`.
+- **Two text values are compared as text.** The in-process evaluator compared two text values as numbers when both read as one, so `'10.0'` equaled `'10'` and `'9'` sorted below `'10'`, where PostgreSQL compares two text operands as text. Filters and Tier B predicates on text columns holding numbers could decide otherwise than PostgreSQL. A number against text that reads as one still compares numerically.
 
 ### Changed
 
