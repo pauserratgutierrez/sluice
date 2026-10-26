@@ -53,6 +53,31 @@ func refreshOne(s *Server, ctx context.Context, st *hub.Stream, sub *registry.Su
 	return s.refreshIssuerShapes(ctx, st, []*registry.Subscription{sub}, id)[0]
 }
 
+// applyOne applies a refresh grant to one shape the way POST /token applies
+// the grants of all of a stream's.
+func applyOne(s *Server, st *hub.Stream, label string, grant *oracle.Grant) bool {
+	return s.applyIssuerGrants(context.Background(), st, []labeledGrant{{label: label, grant: grant}})[0]
+}
+
+// installOne installs one shape held by holds, the way a request installs all
+// of its shapes, and returns its result.
+func installOne(s *Server, sub *registry.Subscription, holds []hold.Spec) subResult {
+	return s.installShapes(context.Background(), streamOf(sub), []plannedShape{{
+		sub: sub, grant: &oracle.Grant{Holds: holds}, res: subResult{Sub: sub.Label},
+	}})[0]
+}
+
+// holdsAnswer answers every hold check with err.
+func holdsAnswer(err error) func(context.Context, []hold.Spec) []error {
+	return func(_ context.Context, specs []hold.Spec) []error {
+		out := make([]error, len(specs))
+		for i := range out {
+			out[i] = err
+		}
+		return out
+	}
+}
+
 func testServer(t *testing.T, orc oracle.Oracle) *Server {
 	t.Helper()
 	cfg := &config.Config{
@@ -426,7 +451,7 @@ func TestTokenRefreshConcurrentHoldKickDoesNotLeaveShape(t *testing.T) {
 
 	for i := 0; i < 200; i++ {
 		s := testServer(t, stubOracle{name: oracle.NameIssuer})
-		s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+		s.holdCheck = holdsAnswer(nil)
 		st := s.hub.Open("n1.token-kick", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 		issuerLiveSub(t, s, st, wide, grant.Columns, holdF)
 
@@ -434,7 +459,7 @@ func TestTokenRefreshConcurrentHoldKickDoesNotLeaveShape(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			s.applyIssuerGrant(context.Background(), st, "docs", grant)
+			applyOne(s, st, "docs", grant)
 		}()
 		go func() {
 			defer wg.Done()
@@ -444,6 +469,44 @@ func TestTokenRefreshConcurrentHoldKickDoesNotLeaveShape(t *testing.T) {
 
 		if got := s.reg.StreamSubscriptions(st.StreamID()); len(got) != 0 {
 			t.Fatalf("iter %d: hold kick concurrent with /token left the shape live", i)
+		}
+	}
+}
+
+// A hold deleted while its shape is being installed never leaves the shape
+// live without its watch: the cut comes either before the shape is registered,
+// which then is not, or after, and drops it.
+func TestInstallConcurrentHoldKickLeavesNoUnwatchedShape(t *testing.T) {
+	rel := docsRel()
+	docs, err := shape.Parse("project_id=eq.42", rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdF, err := shape.Parse("project_id=eq.42,user_id=eq.u1", membersRel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		s := testServer(t, stubOracle{name: oracle.NameIssuer})
+		s.holdCheck = holdsAnswer(nil)
+		st := s.hub.Open("n1.install-kick", "", authz.Identity{Sub: "u1", Role: "authenticated"})
+		sub := &registry.Subscription{Label: "docs", Sink: st, Relation: rel, Filter: docs,
+			Decision: authz.NewHandle(&authz.Decision{Tier: authz.TierA, Granted: true}), RoutingKey: docs.RoutingKey(rel)}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			installOne(s, sub, []hold.Spec{{Rel: membersRel(), Filter: holdF}})
+		}()
+		go func() {
+			defer wg.Done()
+			kickHold(s, st)
+		}()
+		wg.Wait()
+
+		if s.reg.Get(st.StreamID(), "docs") != nil && s.holds.Count() == 0 {
+			t.Fatalf("iter %d: the shape is live without its watch", i)
 		}
 	}
 }
@@ -471,7 +534,7 @@ func TestTokenRefreshAppliesNarrowerGrant(t *testing.T) {
 		},
 	}
 	s := testServer(t, orc)
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.holdCheck = holdsAnswer(nil)
 	st := s.hub.Open("n1.token-narrow", "", authz.Identity{Sub: "u1", Role: "authenticated"})
 	sub := issuerLiveSub(t, s, st, wide, []string{"id", "project_id", "title"}, holdF)
 

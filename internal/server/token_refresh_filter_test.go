@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -54,13 +55,14 @@ func TestTokenRefreshAsksAboutTheRequestedShape(t *testing.T) {
 	}
 	s := testServer(t, iss)
 	s.cat = cat
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.holdCheck = holdsAnswer(nil)
+	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 
 	ctx := context.Background()
 	id := authz.Identity{Sub: "u1", Role: "authenticated"}
 	st := s.hub.Open("n1.1", "", id)
 	spec := subSpec{Sub: "docs", Shape: &shapeSpec{Table: "documents", Filter: "title=eq.public", Columns: []string{"id", "title"}}}
-	if res := s.subscribeShape(ctx, st, id, spec, s.prepareShape(ctx, id, spec), nil); !res.OK {
+	if res := s.applySubscriptions(ctx, st, id, []subSpec{spec}, nil)[0]; !res.OK {
 		t.Fatalf("subscribe: %+v", res.Error)
 	}
 	first := s.reg.Get(st.StreamID(), "docs").Filter.Describe()
@@ -113,12 +115,13 @@ func TestTokenRefreshFollowsAGrantThatWidens(t *testing.T) {
 	}
 	s := testServer(t, iss)
 	s.cat = cat
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.holdCheck = holdsAnswer(nil)
+	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 	ctx := context.Background()
 	id := authz.Identity{Sub: "u1", Role: "authenticated"}
 	st := s.hub.Open("n1.1", "", id)
 	spec := subSpec{Sub: "docs", Shape: &shapeSpec{Table: "documents", Columns: []string{"id", "title"}}}
-	if res := s.subscribeShape(ctx, st, id, spec, s.prepareShape(ctx, id, spec), nil); !res.OK {
+	if res := s.applySubscriptions(ctx, st, id, []subSpec{spec}, nil)[0]; !res.OK {
 		t.Fatalf("subscribe: %+v", res.Error)
 	}
 	renew := func(g string) string {
@@ -139,7 +142,8 @@ func TestTokenRefreshFollowsAGrantThatWidens(t *testing.T) {
 }
 
 // A stream that opens with several shapes asks the issuer about all of them
-// in one call, and POST /token renews all of them in one more.
+// in one call, and POST /token renews all of them in one more. Each time, the
+// holds of every shape are checked together, in one round trip.
 func TestIssuerShapesOfARequestShareOneCall(t *testing.T) {
 	var mu sync.Mutex
 	var calls []int // the shapes asked about in each issuer call
@@ -174,7 +178,11 @@ func TestIssuerShapesOfARequestShareOneCall(t *testing.T) {
 	}
 	s := testServer(t, iss)
 	s.cat = cat
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	var checks []int // the holds asked about in each check
+	s.holdCheck = func(_ context.Context, specs []hold.Spec) []error {
+		checks = append(checks, len(specs))
+		return make([]error, len(specs))
+	}
 	s.cfg.MaxShapesPerStream, s.cfg.MaxSubsPerStream = 10, 10
 
 	ctx := context.Background()
@@ -200,5 +208,8 @@ func TestIssuerShapesOfARequestShareOneCall(t *testing.T) {
 	defer mu.Unlock()
 	if len(calls) != 2 || calls[0] != 3 || calls[1] != 3 {
 		t.Fatalf("issuer calls asked about %v shapes, want [3 3]", calls)
+	}
+	if !slices.Equal(checks, []int{3, 3}) {
+		t.Fatalf("hold checks asked about %v holds, want [3 3]", checks)
 	}
 }

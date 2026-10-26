@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -80,7 +79,7 @@ func TestRelationMessageDropsHoldsOutsideTheIdentity(t *testing.T) {
 // refused when it is installed and revoked when /token re-grants it.
 func TestGrantsAfterAnIdentityChangeAreCheckedAgainstTheWAL(t *testing.T) {
 	s := testServer(t, stubOracle{name: oracle.NameIssuer})
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.holdCheck = holdsAnswer(nil)
 	members := membersRel()
 	members.ReplicaIdentity = 'f' // what the catalog still says
 	members.Columns = append(members.Columns, catalog.Column{Name: "role", TypeName: "text"})
@@ -109,23 +108,21 @@ func TestGrantsAfterAnIdentityChangeAreCheckedAgainstTheWAL(t *testing.T) {
 	}
 
 	refused := s.hub.Open("n1.1", "", authz.Identity{Sub: "u2", Role: "authenticated"})
-	err = s.installShape(context.Background(), sub(refused), holdOn("user_id=eq.u2,role=eq.admin"))
-	if err == nil || !strings.Contains(err.Error(), "role") {
-		t.Fatalf("installing a hold that reads role must be refused, got %v", err)
+	if res := installOne(s, sub(refused), holdOn("user_id=eq.u2,role=eq.admin")); res.OK || !strings.Contains(res.Error.Message, "role") {
+		t.Fatalf("installing a hold that reads role must be refused, got %+v", res.Error)
 	}
 	if got := s.reg.StreamSubscriptions(refused.StreamID()); len(got) != 0 || s.holds.Count() != 0 {
 		t.Fatalf("a refused grant must leave nothing behind: %d shapes, %d watches", len(got), s.holds.Count())
 	}
 	covered := s.hub.Open("n1.2", "", authz.Identity{Sub: "u1", Role: "authenticated"})
-	err = s.installShape(context.Background(), sub(covered), holdOn("user_id=eq.u1,project_id=eq.42"))
-	if err != nil {
-		t.Fatalf("a hold on key columns must be installed, got %v", err)
+	if res := installOne(s, sub(covered), holdOn("user_id=eq.u1,project_id=eq.42")); !res.OK {
+		t.Fatalf("a hold on key columns must be installed, got %+v", res.Error)
 	}
 
 	renewed := s.hub.Open("n1.3", "", authz.Identity{Sub: "u3", Role: "authenticated"})
 	keyHold := holdOn("user_id=eq.u3,project_id=eq.42")[0].Filter
 	issuerLiveSub(t, s, renewed, docs, []string{"id", "project_id", "title"}, keyHold)
-	if s.applyIssuerGrant(context.Background(), renewed, "docs", &oracle.Grant{
+	if applyOne(s, renewed, "docs", &oracle.Grant{
 		Filter: docs, Columns: []string{"id", "project_id", "title"}, Holds: holdOn("user_id=eq.u3,role=eq.admin"),
 	}) {
 		t.Fatal("a re-grant whose hold reads role must be revoked")

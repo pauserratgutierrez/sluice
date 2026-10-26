@@ -58,7 +58,7 @@ func TestTokenRenewalsRetainNothing(t *testing.T) {
 	orc := &freshGrantOracle{stubOracle: stubOracle{name: oracle.NameIssuer}, project: map[string]int{},
 		docs: docsRel(), members: membersRel()}
 	s := testServer(t, orc)
-	s.holdExists = func(context.Context, []hold.Spec) error { return nil }
+	s.holdCheck = holdsAnswer(nil)
 
 	var all []*hub.Stream
 	for i := range streams {

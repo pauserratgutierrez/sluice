@@ -4,7 +4,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ## 0.10.0
 
-A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode every shape of a request goes to the issuer in one call (breaking for issuers), and after a reconnect of every stream the streams that fit are back within seconds. Tested with PostgreSQL 18.6.
+A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed. Every shape of a request goes to the issuer in one call (breaking for issuers) and has its holds checked with the others in one round trip, and after a reconnect of every stream the streams that fit are back within seconds. Tested with PostgreSQL 18.6.
 
 ### Fixed
 
@@ -12,6 +12,11 @@ A stream opened while the replication slot was being created could miss changes;
   - A stream opened during that wait got its `ready`, and the SDK's `onLive`, with `wal_lsn` `0/0`. A client that then read its state, as it should after `resumed: false`, or that asked for an initial snapshot, missed every change committed between that read and the end of the wait, until its next read.
   - That happened at the first start, and when a lost slot is created again, just as every client reconnects.
   - On PostgreSQL 18.6, with a transaction holding the creation for 3 s, a row committed after the `ready` of two streams, one with an initial snapshot, reached neither. A row committed once replication had started reached both.
+- **Issuer mode: a shape no longer receives changes while its holds are checked.** Sluice registered a shape, then checked that its hold rows exist. A change committed during the check reached the shape even when a hold turned out missing and the shape was refused.
+  - On a stream being opened the change went out right after `ready`; on `POST /subscribe`, at once.
+  - The check is there to catch a hold row deleted between the issuer's verdict and the watch. It takes a database round trip, and in a reconnect of every stream it waited seconds for a pool connection.
+  - A shape is now registered only after its holds were found, and only while its watch has not been cut since; a change dispatched during the check is before the shape's `ready`, as any change before a subscribe is.
+  - Present since issuer mode was added (0.1.4).
 
 ### Changed
 
@@ -20,6 +25,7 @@ A stream opened while the replication slot was being created could miss changes;
   - A result with `allow: false` denies its shape only. A call that gets no verdict (unreachable, a timeout, a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each shape) leaves every shape of the call `issuer_unavailable`; a redirect or another `4xx` denies them all.
   - Before: a stream with 7 shapes made 7 calls, 4 at a time, and `POST /token` renewed them in turn, one after the other. In a reconnect of every stream, the calls queued at the issuer, timed out, and were retried.
   - Measured on 1 CPU and 512 MB in a reconnect of all of a full node's 5,775 streams, with a test issuer charging 5–20 ms per call plus 2 ms per shape: no `issuer_unavailable` (938 before), a third less CPU in the reconnect (31 s against 44), opens at p50 0.24 s instead of 2.7 s, and message p99 18 ms instead of 95 ms on the streams already back.
+- Issuer mode: **the holds of a request are checked in one round trip**, each distinct hold once however many shapes name it. A stream opening, `POST /subscribe` and `POST /token` made one `EXISTS` per hold of each shape, one after another. The load test's streams, whose 7 shapes are held by the same row, made 7 per open and per renewal, about 40,000 in a reconnect of 5,770 streams; they now make one each. A missing hold row still refuses only the shapes it holds.
 - **After a reconnect of every stream, the streams that fit come back.** A reconnect lifts the memory admission measures: streams still being set up, and the garbage of setting them up, counted live because it was allocated during a collection. 0.9 stopped short, at 84% within 30 s and 96% after 4 minutes, and advised capping `SLUICE_MAX_STREAMS` at about 85% of what admission let in; that advice is withdrawn.
   - Up to the most streams admitted below `SLUICE_ADMIT_MEMORY`, for 5 minutes after the node last held that many, the projection may go a fifth of the way from the threshold to the Go memory limit: 0.6 at the default 0.5. Past that count the threshold applies, and past that ceiling a flood is still refused.
   - The 5-point hysteresis and the 10 s hold are gone: admission refuses while the projection is past its ceiling.

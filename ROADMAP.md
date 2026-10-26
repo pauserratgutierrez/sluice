@@ -38,7 +38,6 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 - Model the table-owner bypass using the role memberships the catalog already loads.
 - Detect column-grant revocation (it costs a query per subscription per tick rather than a hash comparison).
 - Batch hook re-checks: one endpoint call for several channels whose verdicts expire on the same tick (needs a multi-channel hook request).
-- Check a request's holds together. Each shape checks its holds with one `EXISTS` each, after installing their watches, and the shapes of a stream often share a hold. One check per request needs every shape's watches installed first, so a `DELETE` between two installs is still caught.
 - Per-namespace hook secrets, or signed hook requests (HMAC over the body with a timestamp) instead of a static bearer.
 - Cap the `ttl` a hook may return.
 - Move Tier C probes off the replication path, so one slow policy does not delay every subscriber. Today each probe is bounded by `SLUICE_TIER_C_TIMEOUT`, which caps the delay but does not remove it.

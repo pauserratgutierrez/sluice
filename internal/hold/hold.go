@@ -119,8 +119,9 @@ func New() *Index {
 }
 
 // Add registers a watch. Returns false if the stream already has that label.
-// Callers must Add the watch before EXISTS so a concurrent DELETE is applied
-// by OnChange rather than racing past a subscribe that has not yet appeared.
+// Callers must Add the watch before checking its holds, so a concurrent DELETE
+// is applied by OnChange rather than racing past a subscribe that has not yet
+// appeared, and register the shape with Activate once the holds were found.
 func (x *Index) Add(streamID, label string, holds []Spec) bool {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -354,16 +355,42 @@ func (x *Index) OutsideIdentity(rel *catalog.Relation) []Cut {
 	return cuts
 }
 
-// CheckIdentity is called after Add or Replace, whose holds were checked
-// against the catalog when they were granted. Until the catalog refreshes, the
-// WAL may already describe a replica identity that does not cover a hold's
-// columns; such a watch is removed and the reason returned. It also fails when
-// the watch is gone, cut by a change or by OutsideIdentity since it was added.
+// CheckIdentity is called after Replace, whose holds were checked against the
+// catalog when they were granted. Until the catalog refreshes, the WAL may
+// already describe a replica identity that does not cover a hold's columns;
+// such a watch is removed and the reason returned. It also fails when the
+// watch is gone, cut by a change or by OutsideIdentity since it was added.
 // OutsideIdentity runs under the same lock, so whichever comes second sees the
 // other.
 func (x *Index) CheckIdentity(streamID, label string) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	return x.checkLocked(streamID, label)
+}
+
+// Activate registers the shape a watch added with Add keeps alive, once its
+// holds were found. register runs under the index's lock, and only after the
+// checks of CheckIdentity pass: the watch is still the one added, and its holds
+// read columns of the replica identity the WAL last described. A change that
+// cuts the watch takes the same lock. If it comes first, the shape is never
+// registered; if it comes after, its cut drops the registered shape before the
+// reader routes another change. So the shape receives no change unless its
+// holds existed when they were checked and none was cut since. When register
+// fails, the watch is removed and register's error returned.
+func (x *Index) Activate(streamID, label string, register func() error) error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if err := x.checkLocked(streamID, label); err != nil {
+		return err
+	}
+	if err := register(); err != nil {
+		x.removeLocked(streamID, label)
+		return err
+	}
+	return nil
+}
+
+func (x *Index) checkLocked(streamID, label string) error {
 	w := x.byStream[streamID][label]
 	if w == nil {
 		return errors.New("a hold of this grant was cut while it was being installed")
@@ -673,7 +700,7 @@ func ExistsSQL(spec Spec) (string, []any) {
 }
 
 // MissingError is a hold row that does not exist: the grant is denied. Any other
-// error from Exists is a check that could not be made.
+// error from Check is a check that could not be made.
 type MissingError struct {
 	Rel, Filter string
 }
@@ -692,29 +719,61 @@ type CheckError struct {
 func (e *CheckError) Error() string { return fmt.Sprintf("hold exists on %s: %v", e.Rel, e.Err) }
 func (e *CheckError) Unwrap() error { return e.Err }
 
-// Querier is the subset of pgxpool.Pool Exists needs.
+// Querier is the subset of pgxpool.Pool Check needs.
 type Querier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
-// Exists verifies every hold row is present. All holds must exist (AND). A
-// missing hold is not "empty shape"; it is a denied grant. Zero rows on the
-// subscribed table are irrelevant here and are never queried.
-func Exists(ctx context.Context, q Querier, specs []Spec) error {
-	for _, spec := range specs {
+// Check verifies that the row of each hold is present, with one round trip:
+// every distinct hold is asked about once, however many grants of a request
+// name it. It returns one error per spec, in order: nil when the row exists, a
+// *MissingError when it does not (a denied grant, not an empty shape), or a
+// *CheckError when the check could not be made. Zero rows on the subscribed
+// table are irrelevant here and are never queried.
+func Check(ctx context.Context, q Querier, specs []Spec) []error {
+	errs := make([]error, len(specs))
+	asked := map[string]int{}
+	query := make([]int, len(specs)) // the query answering each spec
+	var first []int                  // the first spec each query answers
+	var b pgx.Batch
+	for i, spec := range specs {
 		if spec.Rel == nil || spec.Filter == nil {
-			return fmt.Errorf("hold is missing a relation or filter")
+			errs[i], query[i] = fmt.Errorf("hold is missing a relation or filter"), -1
+			continue
 		}
 		sql, args := ExistsSQL(spec)
-		var ok bool
-		if err := q.QueryRow(ctx, sql, args...).Scan(&ok); err != nil {
-			return &CheckError{Rel: spec.Rel.FullName(), Err: err}
-		}
+		key := sql + "\x00" + fmt.Sprintf("%q", args)
+		j, ok := asked[key]
 		if !ok {
-			return &MissingError{Rel: spec.Rel.FullName(), Filter: spec.Filter.Describe()}
+			j = b.Len()
+			asked[key] = j
+			first = append(first, i)
+			b.Queue(sql, args...)
+		}
+		query[i] = j
+	}
+	if b.Len() == 0 {
+		return errs
+	}
+	answers := make([]error, b.Len())
+	br := q.SendBatch(ctx, &b)
+	for j, i := range first {
+		spec := specs[i]
+		var ok bool
+		if err := br.QueryRow().Scan(&ok); err != nil {
+			answers[j] = &CheckError{Rel: spec.Rel.FullName(), Err: err}
+		} else if !ok {
+			answers[j] = &MissingError{Rel: spec.Rel.FullName(), Filter: spec.Filter.Describe()}
 		}
 	}
-	return nil
+	// Every answer was read above; Close's error repeats the first failure.
+	_ = br.Close()
+	for i, j := range query {
+		if j >= 0 {
+			errs[i] = answers[j]
+		}
+	}
+	return errs
 }
 
 // Size counts what the index holds, for tests and diagnostics: watches by

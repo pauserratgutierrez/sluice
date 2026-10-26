@@ -113,9 +113,9 @@ type Server struct {
 	// whole life.
 	startupWarnings []Diagnostic
 
-	// holdExists, if set, replaces hold.Exists. Tests inject it so /token can
-	// verify holds without a database pool.
-	holdExists func(ctx context.Context, specs []hold.Spec) error
+	// holdCheck, if set, replaces hold.Check. Tests inject it so holds can be
+	// checked without a database pool.
+	holdCheck func(ctx context.Context, specs []hold.Spec) []error
 }
 
 // Authorizer is aliased so the package reads naturally and so the concrete type
@@ -635,6 +635,11 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 // applySubscriptions resolves a batch. A partial failure is not a request
 // failure: each subscription gets its own result, so one bad shape does not take
 // down a client's whole stream.
+//
+// Shapes are installed together once every subscription has been looked at
+// (installShapes), so that their holds are checked in one round trip. Until
+// then a planned shape holds its place against the stream's limits; one whose
+// holds turn out missing leaves its place to the next request.
 func (s *Server) applySubscriptions(
 	ctx context.Context,
 	st *hub.Stream,
@@ -643,21 +648,23 @@ func (s *Server) applySubscriptions(
 	resume map[string]string,
 ) []subResult {
 
-	out := make([]subResult, 0, len(specs))
+	out := make([]subResult, len(specs))
 	shapes := len(s.reg.StreamSubscriptions(st.StreamID()))
 	existing := shapes + len(st.Channels())
 	prepared := s.prepareShapes(ctx, id, specs,
 		min(s.cfg.MaxShapesPerStream-shapes, s.cfg.MaxSubsPerStream-existing))
 
+	var planned []plannedShape
+	unindexed := 0
 	for i, spec := range specs {
 		if spec.Sub == "" {
-			out = append(out, subResult{OK: false, Error: &event.Error{
-				Code: "invalid_subscription", Message: "each subscription needs a `sub` label"}})
+			out[i] = subResult{OK: false, Error: &event.Error{
+				Code: "invalid_subscription", Message: "each subscription needs a `sub` label"}}
 			continue
 		}
 		if existing >= s.cfg.MaxSubsPerStream {
-			out = append(out, subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
-				Code: "too_many_subscriptions", Message: "this stream is at its subscription limit"}})
+			out[i] = subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
+				Code: "too_many_subscriptions", Message: "this stream is at its subscription limit"}}
 			continue
 		}
 
@@ -667,31 +674,40 @@ func (s *Server) applySubscriptions(
 			// authorization resolution and a registry entry consulted on every
 			// change to its relation, where a channel costs a map entry.
 			if shapes >= s.cfg.MaxShapesPerStream {
-				out = append(out, subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
+				out[i] = subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
 					Code: "too_many_shapes", Message: fmt.Sprintf(
-						"this stream is at its limit of %d shape subscriptions", s.cfg.MaxShapesPerStream)}})
+						"this stream is at its limit of %d shape subscriptions", s.cfg.MaxShapesPerStream)}}
 				continue
 			}
 			prep, ok := prepared[i]
 			if !ok {
 				prep = s.prepareShape(ctx, id, spec)
 			}
-			res := s.subscribeShape(ctx, st, id, spec, prep, resume)
-			out = append(out, res)
-			if res.OK {
-				existing++
-				shapes++
+			p, res := s.planShape(st, id, spec, prep, resume, unindexed)
+			if res.Error != nil {
+				out[i] = res
+				continue
 			}
+			p.at = i
+			planned = append(planned, p)
+			if !p.sub.Indexed() {
+				unindexed++
+			}
+			existing++
+			shapes++
 		case spec.Channel != "":
 			res := s.subscribeChannel(ctx, st, id, spec)
-			out = append(out, res)
+			out[i] = res
 			if res.OK {
 				existing++
 			}
 		default:
-			out = append(out, subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
-				Code: "invalid_subscription", Message: "provide either `shape` or `channel`"}})
+			out[i] = subResult{Sub: spec.Sub, OK: false, Error: &event.Error{
+				Code: "invalid_subscription", Message: "provide either `shape` or `channel`"}}
 		}
+	}
+	for k, res := range s.installShapes(ctx, st, planned) {
+		out[planned[k].at] = res
 	}
 	s.logRefusals(ctx, st, specs, out)
 	return out
@@ -814,18 +830,37 @@ func (s *Server) checkShape(spec subSpec) preparedShape {
 	return p
 }
 
-func (s *Server) subscribeShape(
-	ctx context.Context,
+// plannedShape is a shape of a request that passed every check before its
+// holds, waiting for installShapes.
+type plannedShape struct {
+	at       int // its place in the request
+	sub      *registry.Subscription
+	grant    *oracle.Grant
+	warnings []event.Warning
+	res      subResult // its result so far: the label, and how a refusal is logged
+	// resume is the request's position for the shape's table, from as parsed.
+	resume   string
+	from     uint64
+	fromErr  error
+	snapshot bool
+}
+
+// planShape builds a resolved shape's subscription and checks it against the
+// node's limits. unindexed counts the unindexed shapes planned earlier in the
+// same request, not yet registered. The result carries a refusal, or only the
+// label when the shape is planned.
+func (s *Server) planShape(
 	st *hub.Stream,
 	id authz.Identity,
 	spec subSpec,
 	prep preparedShape,
 	resume map[string]string,
-) subResult {
+	unindexed int,
+) (plannedShape, subResult) {
 
 	res := prep.res
 	if res.Error != nil {
-		return res
+		return plannedShape{}, res
 	}
 	sp := spec.Shape
 	rel, ops, grant := prep.rel, prep.ops, prep.grant
@@ -896,7 +931,7 @@ func (s *Server) subscribeShape(
 			}
 			if s.cfg.ReplicaIdentity == "strict" {
 				res.Error = &event.Error{Code: w.Code, Message: w.Message + ". Remedy: " + w.Remedy}
-				return res
+				return plannedShape{}, res
 			}
 			warnings = append(warnings, w)
 		}
@@ -922,13 +957,13 @@ func (s *Server) subscribeShape(
 	// cost of admitting one is paid by every other subscriber to that table.
 	// Past a threshold the node stops being O(1) in subscription count, which is
 	// the property the whole design rests on.
-	if sub.RoutingKey == "" && s.reg.UnindexedCount() >= s.cfg.UnindexedMax {
+	if sub.RoutingKey == "" && s.reg.UnindexedCount()+unindexed >= s.cfg.UnindexedMax {
 		res.Error = &event.Error{Code: "too_many_unindexed_shapes", Message: fmt.Sprintf(
 			"this node already has %d unindexed subscriptions, the configured maximum; "+
 				"filter on an indexed column with an equality, or index the filtered column",
 			s.cfg.UnindexedMax)}
 		res.warn = true
-		return res
+		return plannedShape{}, res
 	}
 
 	wantSnapshot := sp.Initial == "snapshot"
@@ -944,45 +979,100 @@ func (s *Server) subscribeShape(
 	// A resume the buffer covers keeps the reader's changes from the
 	// subscription until its replay has caught up (see registry.Backfill).
 	// Decided before the install, so that none goes out ahead of the replay.
-	lsnStr := resume[rel.FullName()]
-	var from uint64
-	var fromErr error
-	if lsnStr != "" {
-		if from, fromErr = reader.ParseLSN(lsnStr); fromErr == nil && s.hub.Rings().Covers(rel.OID, from) {
+	p := plannedShape{sub: sub, grant: grant, warnings: warnings, res: res,
+		resume: resume[rel.FullName()], snapshot: wantSnapshot}
+	if p.resume != "" {
+		if p.from, p.fromErr = reader.ParseLSN(p.resume); p.fromErr == nil && s.hub.Rings().Covers(rel.OID, p.from) {
 			sub.Backfill = &registry.Backfill{}
 		}
 	}
+	return p, res
+}
+
+// installShapes installs a request's planned shapes. The watches of every
+// shape go into the hold index first; then the request's distinct holds are
+// checked in one round trip; then each shape whose holds exist is registered,
+// under the hold index's lock and only while its watch is current
+// (hold.Index.Activate). So a DELETE racing the join is caught, by the check
+// before the watch is added and by the watch after, and a shape receives no
+// change before its holds are confirmed. It returns each shape's result.
+func (s *Server) installShapes(ctx context.Context, st *hub.Stream, planned []plannedShape) []subResult {
+	sid := st.StreamID()
+	failed := make([]error, len(planned))
+	watched := make([][]hold.Spec, len(planned))
+	for k, p := range planned {
+		if len(p.grant.Holds) == 0 {
+			continue
+		}
+		if !s.holds.Add(sid, p.sub.Label, p.grant.Holds) {
+			failed[k] = errDuplicateSub
+			continue
+		}
+		watched[k] = p.grant.Holds
+	}
+	checked := s.checkHolds(ctx, watched)
+	// Before any shape is registered: every change appended from here on is
+	// routed to the shape or found in the buffer by its replay.
 	installedAt := s.hub.Rings().Seq()
 
-	if err := s.installShape(ctx, sub, grant.Holds); err != nil {
-		if errors.Is(err, errDuplicateSub) {
-			res.Error = &event.Error{Code: "duplicate_sub",
-				Message: "this stream already has a subscription labelled " + spec.Sub}
-			return res
+	out := make([]subResult, len(planned))
+	for k, p := range planned {
+		register := func() error {
+			if !s.reg.Add(p.sub) {
+				return errDuplicateSub
+			}
+			return nil
 		}
-		res.Error = holdCheckFailed(err)
-		return res
+		err := failed[k]
+		switch {
+		case err != nil:
+		case checked[k] != nil:
+			err = checked[k]
+			s.holds.Remove(sid, p.sub.Label)
+		case watched[k] != nil:
+			err = s.holds.Activate(sid, p.sub.Label, register)
+		default:
+			err = register()
+		}
+		out[k] = p.res
+		switch {
+		case errors.Is(err, errDuplicateSub):
+			out[k].Error = &event.Error{Code: "duplicate_sub",
+				Message: "this stream already has a subscription labelled " + p.sub.Label}
+		case err != nil:
+			out[k].Error = holdCheckFailed(err)
+		default:
+			out[k] = s.finishShape(st, p, installedAt)
+		}
 	}
+	return out
+}
+
+// finishShape completes the result of a shape just registered, and starts its
+// replay or snapshot. installedAt is the buffer's append order before it was
+// registered.
+func (s *Server) finishShape(st *hub.Stream, p plannedShape, installedAt uint64) subResult {
+	sub, res := p.sub, p.res
 	s.incSubMetric(sub)
 
 	res.OK = true
 	indexed := sub.Indexed()
 	res.Indexed = &indexed
 	res.RoutingKey = sub.RoutingKey
-	res.Reason = grant.Reason
-	res.Warnings = warnings
+	res.Reason = p.grant.Reason
+	res.Warnings = p.warnings
 	if s.oracle.Name() == oracle.NameIssuer {
 		res.Oracle = oracle.NameIssuer
-		if filter != nil {
-			if d := filter.Describe(); d != "" && d != "(none)" {
+		if sub.Filter != nil {
+			if d := sub.Filter.Describe(); d != "" && d != "(none)" {
 				res.Filter = d
 			}
 		}
-	} else if decision != nil {
-		res.Tier = string(decision.Tier)
+	} else if d := p.grant.Decision; d != nil {
+		res.Tier = string(d.Tier)
 	}
 
-	for _, w := range warnings {
+	for _, w := range p.warnings {
 		hub.SendWarning(st, w)
 	}
 
@@ -991,8 +1081,8 @@ func (s *Server) subscribeShape(
 	// the position is decided here, so the result tells the client; one it
 	// cannot cover is not silently replaced by a snapshot, because only the
 	// client knows to discard the state it holds.
-	if lsnStr != "" {
-		if fromErr != nil {
+	if p.resume != "" {
+		if p.fromErr != nil {
 			hub.SendError(st, event.Error{Sub: sub.Label, Code: "invalid_resume",
 				Message: "resume LSN could not be parsed"})
 			return res
@@ -1001,7 +1091,7 @@ func (s *Server) subscribeShape(
 			res.Resumed = new(false)
 			return res
 		}
-		entries, through, ok := s.hub.Rings().ReplayThrough(rel.OID, from, routedTo(sub))
+		entries, through, ok := s.hub.Rings().ReplayThrough(sub.Relation.OID, p.from, routedTo(sub))
 		res.Resumed = &ok
 		if !ok {
 			// Removed since Covers looked. The client reads its state again;
@@ -1019,7 +1109,7 @@ func (s *Server) subscribeShape(
 		go s.catchUp(sub, entries, through)
 		return res
 	}
-	if wantSnapshot {
+	if p.snapshot {
 		go s.snapshot(s.ctx, sub)
 	}
 	return res
@@ -1734,6 +1824,8 @@ func (s *Server) refreshIssuerShapes(ctx context.Context, st *hub.Stream, subs [
 			Filter: req.Filter, Columns: req.Columns, Ops: req.Ops}
 	}
 	out := make([]string, len(subs))
+	var grants []labeledGrant
+	var at []int
 	for k, res := range s.oracle.Resolve(ctx, oracle.ActionRefresh, id, reqs) {
 		label := subs[k].Label
 		var unavailable *oracle.ErrUnavailable
@@ -1745,39 +1837,69 @@ func (s *Server) refreshIssuerShapes(ctx context.Context, st *hub.Stream, subs [
 			s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized",
 				Message: "the refreshed token no longer grants access to this shape"})
 			out[k] = "revoked"
-		case !s.applyIssuerGrant(ctx, st, label, res.Grant):
-			out[k] = "revoked"
 		default:
-			out[k] = "held"
+			grants = append(grants, labeledGrant{label: label, grant: res.Grant})
+			at = append(at, k)
+		}
+	}
+	for j, held := range s.applyIssuerGrants(ctx, st, grants) {
+		out[at[j]] = "revoked"
+		if held {
+			out[at[j]] = "held"
 		}
 	}
 	return out
 }
 
-// applyIssuerGrant installs a refresh grant on a live shape. Holds are
-// replaced under one lock (never Remove then Add), then EXISTS, then the
-// effective filter, columns, and routing key are rebound. A shape already
-// cut during the issuer round-trip is not resurrected.
-func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label string, grant *oracle.Grant) bool {
-	if grant == nil || grant.Filter == nil || len(grant.Columns) == 0 || len(grant.Holds) == 0 {
-		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized",
-			Message: "the refreshed token no longer grants access to this shape"})
-		return false
+// labeledGrant is a refresh grant for the stream's shape with that label.
+type labeledGrant struct {
+	label string
+	grant *oracle.Grant
+}
+
+// applyIssuerGrants installs refresh grants on live shapes and reports which
+// were kept. Each shape's holds are replaced under one lock (never Remove then
+// Add); then the holds of every grant are checked in one round trip; then each
+// shape whose holds exist has its effective filter, columns and routing key
+// rebound, and the others are revoked. A shape already cut during the issuer
+// round trip is not resurrected. Until it is rebound a shape keeps its
+// previous grant, under the new grant's watches.
+func (s *Server) applyIssuerGrants(ctx context.Context, st *hub.Stream, grants []labeledGrant) []bool {
+	held := make([]bool, len(grants))
+	watched := make([][]hold.Spec, len(grants))
+	for j, g := range grants {
+		label, grant := g.label, g.grant
+		if grant == nil || grant.Filter == nil || len(grant.Columns) == 0 || len(grant.Holds) == 0 {
+			s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized",
+				Message: "the refreshed token no longer grants access to this shape"})
+			continue
+		}
+		if s.reg.Get(st.StreamID(), label) == nil {
+			s.holds.Remove(st.StreamID(), label)
+			continue
+		}
+		s.holds.Replace(st.StreamID(), label, grant.Holds)
+		if err := s.holds.CheckIdentity(st.StreamID(), label); err != nil {
+			s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
+			continue
+		}
+		watched[j] = grant.Holds
 	}
-	if s.reg.Get(st.StreamID(), label) == nil {
-		s.holds.Remove(st.StreamID(), label)
-		return false
+	for j, err := range s.checkHolds(ctx, watched) {
+		switch {
+		case watched[j] == nil:
+		case err != nil:
+			e := holdCheckFailed(err)
+			s.revokeShape(ctx, st, grants[j].label, e.Retryable, *e)
+		default:
+			held[j] = s.rebindGrant(st, grants[j].label, grants[j].grant)
+		}
 	}
-	s.holds.Replace(st.StreamID(), label, grant.Holds)
-	if err := s.holds.CheckIdentity(st.StreamID(), label); err != nil {
-		s.revokeShape(ctx, st, label, false, event.Error{Code: "shape_not_authorized", Message: err.Error()})
-		return false
-	}
-	if err := s.verifyHolds(ctx, grant.Holds); err != nil {
-		e := holdCheckFailed(err)
-		s.revokeShape(ctx, st, label, e.Retryable, *e)
-		return false
-	}
+	return held
+}
+
+// rebindGrant rebinds a live shape to a refresh grant whose holds were found.
+func (s *Server) rebindGrant(st *hub.Stream, label string, grant *oracle.Grant) bool {
 	live := s.reg.Get(st.StreamID(), label)
 	if live == nil {
 		s.holds.Remove(st.StreamID(), label)
@@ -1803,48 +1925,40 @@ func (s *Server) applyIssuerGrant(ctx context.Context, st *hub.Stream, label str
 	return true
 }
 
-func (s *Server) verifyHolds(ctx context.Context, specs []hold.Spec) error {
+// checkHolds checks the holds of a request's grants in one round trip, each
+// distinct hold once (hold.Check). It returns, per grant, nil when every hold
+// row exists (or the grant names none), else the first hold's error.
+func (s *Server) checkHolds(ctx context.Context, grants [][]hold.Spec) []error {
+	out := make([]error, len(grants))
+	var specs []hold.Spec
+	for _, g := range grants {
+		specs = append(specs, g...)
+	}
 	if len(specs) == 0 {
-		return fmt.Errorf("issuer grant has no holds")
+		return out
 	}
-	if s.holdExists != nil {
-		return s.holdExists(ctx, specs)
-	}
-	if s.pool == nil {
-		return fmt.Errorf("cannot verify holds without a database pool")
-	}
-	return hold.Exists(ctx, s.pool, specs)
-}
-
-// installShape registers hold watches and the shape atomically, then EXISTS
-// the holds. A DELETE already in the reader is applied by the watch.
-func (s *Server) installShape(ctx context.Context, sub *registry.Subscription, holds []hold.Spec) error {
-	sid := sub.Sink.StreamID()
-	if len(holds) > 0 {
-		if !s.holds.Add(sid, sub.Label, holds) {
-			return errDuplicateSub
+	var errs []error
+	switch {
+	case s.holdCheck != nil:
+		errs = s.holdCheck(ctx, specs)
+	case s.pool == nil:
+		errs = make([]error, len(specs))
+		for i := range errs {
+			errs[i] = fmt.Errorf("cannot verify holds without a database pool")
 		}
+	default:
+		errs = hold.Check(ctx, s.pool, specs)
 	}
-	if !s.reg.Add(sub) {
-		s.holds.Remove(sid, sub.Label)
-		return errDuplicateSub
+	for i, g := range grants {
+		for _, err := range errs[:len(g)] {
+			if err != nil {
+				out[i] = err
+				break
+			}
+		}
+		errs = errs[len(g):]
 	}
-	if len(holds) == 0 {
-		return nil
-	}
-	// The holds were checked against the catalog, which lags a replica identity
-	// change the reader may already have seen.
-	if err := s.holds.CheckIdentity(sid, sub.Label); err != nil {
-		s.reg.Remove(sid, sub.Label)
-		s.holds.Remove(sid, sub.Label)
-		return err
-	}
-	if err := s.verifyHolds(ctx, holds); err != nil {
-		s.reg.Remove(sid, sub.Label)
-		s.holds.Remove(sid, sub.Label)
-		return err
-	}
-	return nil
+	return out
 }
 
 func (s *Server) dropShape(st *hub.Stream, label string, err event.Error) {
