@@ -2,16 +2,12 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
-## 0.10.0
+## 0.11.0
 
-A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed. Every shape of a request goes to the issuer in one call (breaking for issuers) and has its holds checked with the others in one round trip, and after a reconnect of every stream the streams that fit are back within seconds. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. The resume buffer keeps 60 s of every table within a share of memory (breaking for its configuration), and the reader does half the work per change. Tested with PostgreSQL 18.6.
+In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed, and the holds of a request are checked in one round trip. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. The resume buffer keeps 60 s of every table within a share of memory (breaking for its configuration), and the reader does half the work per change. Tested with PostgreSQL 18.6.
 
 ### Fixed
 
-- **A stream opened while the slot was being created no longer misses changes.** The process opened streams before its reader had created the slot. Creating it waits for every transaction that had an xid when it started, and a transaction that commits before the slot is ready is never decoded.
-  - A stream opened during that wait got its `ready`, and the SDK's `onLive`, with `wal_lsn` `0/0`. A client that then read its state, as it should after `resumed: false`, or that asked for an initial snapshot, missed every change committed between that read and the end of the wait, until its next read.
-  - That happened at the first start, and when a lost slot is created again, just as every client reconnects.
-  - On PostgreSQL 18.6, with a transaction holding the creation for 3 s, a row committed after the `ready` of two streams, one with an initial snapshot, reached neither. A row committed once replication had started reached both.
 - **Issuer mode: a shape no longer receives changes while its holds are checked.** Sluice registered a shape, then checked that its hold rows exist. A change committed during the check reached the shape even when a hold turned out missing and the shape was refused.
   - On a stream being opened the change went out right after `ready`; on `POST /subscribe`, at once.
   - The check is there to catch a hold row deleted between the issuer's verdict and the watch. It takes a database round trip, and in a reconnect of every stream it waited seconds for a pool connection.
@@ -22,23 +18,44 @@ A stream opened while the replication slot was being created could miss changes;
 
 ### Changed
 
-- **Breaking, issuer mode: Sluice asks the issuer about every shape of a request in one call.** A stream opening, `POST /subscribe` and `POST /token` each make one call, instead of one per shape. An issuer must change to the new format.
-  - The request's `requested` is a list, one entry per shape with the client's label as `sub`; the response is `{"results": [...]}`, one result per requested shape, in order, each what a response used to be (`allow`, `shape`, `holds`).
-  - A result with `allow: false` denies its shape only. A call that gets no verdict (unreachable, a timeout, a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each shape) leaves every shape of the call `issuer_unavailable`; a redirect or another `4xx` denies them all.
-  - Before: a stream with 7 shapes made 7 calls, 4 at a time, and `POST /token` renewed them in turn, one after the other. In a reconnect of every stream, the calls queued at the issuer, timed out, and were retried.
-  - Measured on 1 CPU and 512 MB in a reconnect of all of a full node's 5,775 streams, with a test issuer charging 5–20 ms per call plus 2 ms per shape: no `issuer_unavailable` (938 before), a third less CPU in the reconnect (31 s against 44), opens at p50 0.24 s instead of 2.7 s, and message p99 18 ms instead of 95 ms on the streams already back.
 - Issuer mode: **the holds of a request are checked in one round trip**, each distinct hold once however many shapes name it. A stream opening, `POST /subscribe` and `POST /token` made one `EXISTS` per hold of each shape, one after another. The load test's streams, whose 7 shapes are held by the same row, made 7 per open and per renewal, about 40,000 in a reconnect of 5,770 streams; they now make one each. A missing hold row still refuses only the shapes it holds.
 - **Breaking, configuration: the resume buffer keeps changes by time, within a share of memory.** It kept the last `SLUICE_RING_EVENTS` (4,096) changes of each table, which on a busy table reached back seconds: about 2 s at 2,300 changes a second, and in the load test's 8-hour run 44% of the resumes of a table taking 337 a second came back `resumed: false`, each a client reading its state again.
   - It now keeps every table's changes for `SLUICE_RING_MAX_AGE` (60 s), within `SLUICE_RING_MEMORY` (new; default `0.1`) of the Go memory limit, 64 MiB when none is known. Past that budget it removes the oldest change of any table, so every busy table reaches back as far as the others, and it keeps each table's newest transaction while anything else is left.
   - `SLUICE_RING_EVENTS` and `SLUICE_RING_MAX_BYTES` are gone. `SLUICE_RING_MEMORY=0` disables the buffer, as `SLUICE_RING_EVENTS=0` did, and needs `SLUICE_SNAPSHOT_ENABLED=false`.
   - The buffer's memory counts toward admission like the rest of the live heap: estimated from about half a KiB per change, 60 s at 337 changes a second hold about 10 MiB; at 2,300 a second the budget of a 512 MB container decides, at about 40 s.
   - Changes to the revocation tables are no longer kept: no shape may be on them.
-- New metrics: `sluice_resumes_total{result}` (`resumed` or `not_resumed`), and `sluice_resume_buffer_seconds`, how far back the buffer covers every table.
 - **The reader does half the work per change.** One message of the load test's largest mix (12,000 streams of 7 shapes, each shape held by its member's row), dispatched on one core: 9.4 µs per change before, 4.1 after, with 31 allocations instead of 68 (`BenchmarkRoomMessage`).
   - A change is checked once against each distinct hold filter: the shapes of a stream share one, which was checked once per shape.
   - The primary key is read only when a Tier C probe needs it, not for every change.
   - Columns are read without copying their text, routing keys are matched as the text PostgreSQL sent, and each relation's metrics are looked up once.
-  - A resumed shape's replay from a full buffer of 4,096 changes: 850 µs before, 163 after (`BenchmarkReplay`).
+  - A resumed shape's replay reads its table's changes from its position on, not the whole buffer, and finds its routing column once per table instead of once per change: from a buffer of 4,096 changes, 850 µs before, 75 after; from the last 1,024 of 131,072, 13 µs (`BenchmarkReplay`).
+
+### Added
+
+- **Warnings before the slot is lost.** A logical slot keeps the WAL from its restart point, which the oldest transaction open in the database holds back, whatever tables it wrote. On PostgreSQL 18.6, with the slot consumed to 208 bytes from the WAL end, a transaction left open after inserting one row into a table outside the publication lost a slot bounded at 64 MB after 60 MB of other writes; `wal_status` went from `reserved` to `lost` in one checkpoint. Sluice then stops, and every client reads its state again.
+  - `sluice_slot_safe_wal_bytes`: the slot's `safe_wal_size`, read each `SLUICE_CATALOG_REFRESH`; absent while `max_slot_wal_keep_size` is -1.
+  - Once the slot retains half of the WAL it may keep, the process reading it logs `replication slot nears max_slot_wal_keep_size` (a warning; an error from 80%) and `/diagnostics` reports `slot_wal_retention`, with the cause: the oldest open transaction (a session's pid or a prepared transaction, readable by any role), or how much of it Sluice has not confirmed yet.
+- **Clients learn when changes arrive late.** When the reader's lag reaches `SLUICE_LAG_DEGRADED` (5 s), every stream gets a `delay` event with `lag_ms`, and another with `lag_ms: 0` when the lag falls below half of it; a stream opened meanwhile has `lag_ms` in its `ready`. Before, a client could not tell late changes from none: heartbeats keep arriving while the reader is behind. The SDK reports it as a new connection status, `delayed`, between `open` states; a `switch` over `ConnectionStatus` that lists every case needs it.
+- New metrics: `sluice_resumes_total{result}` (`resumed` or `not_resumed`), and `sluice_resume_buffer_seconds`, how far back the buffer covers every table.
+
+## 0.10.0
+
+A stream opened while the replication slot was being created could miss changes; a process now refuses new streams until it replicates. In issuer mode every shape of a request goes to the issuer in one call (breaking for issuers), and after a reconnect of every stream the streams that fit are back within seconds. Tested with PostgreSQL 18.6.
+
+### Fixed
+
+- **A stream opened while the slot was being created no longer misses changes.** The process opened streams before its reader had created the slot. Creating it waits for every transaction that had an xid when it started, and a transaction that commits before the slot is ready is never decoded.
+  - A stream opened during that wait got its `ready`, and the SDK's `onLive`, with `wal_lsn` `0/0`. A client that then read its state, as it should after `resumed: false`, or that asked for an initial snapshot, missed every change committed between that read and the end of the wait, until its next read.
+  - That happened at the first start, and when a lost slot is created again, just as every client reconnects.
+  - On PostgreSQL 18.6, with a transaction holding the creation for 3 s, a row committed after the `ready` of two streams, one with an initial snapshot, reached neither. A row committed once replication had started reached both.
+
+### Changed
+
+- **Breaking, issuer mode: Sluice asks the issuer about every shape of a request in one call.** A stream opening, `POST /subscribe` and `POST /token` each make one call, instead of one per shape. An issuer must change to the new format.
+  - The request's `requested` is a list, one entry per shape with the client's label as `sub`; the response is `{"results": [...]}`, one result per requested shape, in order, each what a response used to be (`allow`, `shape`, `holds`).
+  - A result with `allow: false` denies its shape only. A call that gets no verdict (unreachable, a timeout, a `5xx`, `408` or `429`, an unreadable body, or `results` that do not answer each shape) leaves every shape of the call `issuer_unavailable`; a redirect or another `4xx` denies them all.
+  - Before: a stream with 7 shapes made 7 calls, 4 at a time, and `POST /token` renewed them in turn, one after the other. In a reconnect of every stream, the calls queued at the issuer, timed out, and were retried.
+  - Measured on 1 CPU and 512 MB in a reconnect of all of a full node's 5,775 streams, with a test issuer charging 5–20 ms per call plus 2 ms per shape: no `issuer_unavailable` (938 before), a third less CPU in the reconnect (31 s against 44), opens at p50 0.24 s instead of 2.7 s, and message p99 18 ms instead of 95 ms on the streams already back.
 - **After a reconnect of every stream, the streams that fit come back.** A reconnect lifts the memory admission measures: streams still being set up, and the garbage of setting them up, counted live because it was allocated during a collection. 0.9 stopped short, at 84% within 30 s and 96% after 4 minutes, and advised capping `SLUICE_MAX_STREAMS` at about 85% of what admission let in; that advice is withdrawn.
   - Up to the most streams admitted below `SLUICE_ADMIT_MEMORY`, for 5 minutes after the node last held that many, the projection may go a fifth of the way from the threshold to the Go memory limit: 0.6 at the default 0.5. Past that count the threshold applies, and past that ceiling a flood is still refused.
   - The 5-point hysteresis and the 10 s hold are gone: admission refuses while the projection is past its ceiling.
@@ -52,10 +69,6 @@ A stream opened while the replication slot was being created could miss changes;
 ### Added
 
 - When creating the slot has taken 10 s, and every minute after, the log says what it waits for: `creating the replication slot is waiting for transactions open when it started`, with `waited` and `blocking_pids`.
-- **Warnings before the slot is lost.** A logical slot keeps the WAL from its restart point, which the oldest transaction open in the database holds back, whatever tables it wrote. On PostgreSQL 18.6, with the slot consumed to 208 bytes from the WAL end, a transaction left open after inserting one row into a table outside the publication lost a slot bounded at 64 MB after 60 MB of other writes; `wal_status` went from `reserved` to `lost` in one checkpoint. Sluice then stops, and every client reads its state again.
-  - `sluice_slot_safe_wal_bytes`: the slot's `safe_wal_size`, read each `SLUICE_CATALOG_REFRESH`; absent while `max_slot_wal_keep_size` is -1.
-  - Once the slot retains half of the WAL it may keep, the process reading it logs `replication slot nears max_slot_wal_keep_size` (a warning; an error from 80%) and `/diagnostics` reports `slot_wal_retention`, with the cause: the oldest open transaction (a session's pid or a prepared transaction, readable by any role), or how much of it Sluice has not confirmed yet.
-- **Clients learn when changes arrive late.** When the reader's lag reaches `SLUICE_LAG_DEGRADED` (5 s), every stream gets a `delay` event with `lag_ms`, and another with `lag_ms: 0` when the lag falls below half of it; a stream opened meanwhile has `lag_ms` in its `ready`. Before, a client could not tell late changes from none: heartbeats keep arriving while the reader is behind. The SDK reports it as a new connection status, `delayed`, between `open` states; a `switch` over `ConnectionStatus` that lists every case needs it.
 
 ## 0.9.1
 

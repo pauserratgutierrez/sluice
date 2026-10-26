@@ -45,7 +45,11 @@ func (r tupleRow) Column(name string) (expr.Value, bool) {
 	if r.t == nil {
 		return expr.Null, false
 	}
-	i := r.rel.ColumnIndex(name)
+	return r.columnAt(r.rel.ColumnIndex(name))
+}
+
+// columnAt is Column for the relation's column at i.
+func (r tupleRow) columnAt(i int) (expr.Value, bool) {
 	if i < 0 || i >= len(r.t.Columns) {
 		return expr.Null, false
 	}
@@ -71,13 +75,19 @@ func (r tupleRow) key(name string) (string, bool) {
 		return "", false
 	}
 	i := r.rel.ColumnIndex(name)
-	if i < 0 || i >= len(r.t.Columns) {
+	return r.keyAt(i, i >= 0 && expr.TextIsCanonical(r.rel.Columns[i].TypeName))
+}
+
+// keyAt is key for the relation's column at i, whose text is its key when
+// canonical (expr.TextIsCanonical of its type).
+func (r tupleRow) keyAt(i int, canonical bool) (string, bool) {
+	if r.t == nil || i < 0 || i >= len(r.t.Columns) {
 		return "", false
 	}
-	if c := r.t.Columns[i]; c.Kind == pgoutput.ColText && expr.TextIsCanonical(r.rel.Columns[i].TypeName) {
+	if c := r.t.Columns[i]; c.Kind == pgoutput.ColText && canonical {
 		return inPlace(c.Data), true
 	}
-	v, ok := r.Column(name)
+	v, ok := r.columnAt(i)
 	return v.String(), ok
 }
 

@@ -371,6 +371,37 @@ func TestRingReplay(t *testing.T) {
 	}
 }
 
+// A reader reconnect starts again from the slot, which can be behind what was
+// already buffered: the transactions after it are appended a second time. The
+// search for the start may land on either copy, and a replay still gets every
+// change from its position on.
+func TestRingReplayAfterReaderReconnect(t *testing.T) {
+	r := NewRings(1<<20, time.Minute)
+	r.SetStart(5)
+	for _, lsn := range []uint64{10, 20, 30, 40, 50, 30, 40, 50, 60} {
+		r.Append(ringEntry(lsn))
+	}
+	for from := uint64(10); from <= 60; from += 5 {
+		got, ok := r.Replay(1, from)
+		if !ok {
+			t.Fatalf("replay from %d should succeed", from)
+		}
+		want := map[uint64]bool{}
+		for lsn := (from + 9) / 10 * 10; lsn <= 60; lsn += 10 {
+			want[lsn] = true
+		}
+		for _, e := range got {
+			if e.LSN < from {
+				t.Errorf("replay from %d returned %d", from, e.LSN)
+			}
+			delete(want, e.LSN)
+		}
+		if len(want) > 0 {
+			t.Errorf("replay from %d = %v, misses %v", from, lsns(got), want)
+		}
+	}
+}
+
 // The buffer is bounded, and being honest about that boundary is the whole point:
 // a client asking for a position that has been evicted must be told to
 // resnapshot rather than silently handed a gap.

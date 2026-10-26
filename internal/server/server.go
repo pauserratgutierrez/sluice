@@ -36,6 +36,7 @@ import (
 	"github.com/pauserratgutierrez/sluice/internal/catalog"
 	"github.com/pauserratgutierrez/sluice/internal/config"
 	"github.com/pauserratgutierrez/sluice/internal/event"
+	"github.com/pauserratgutierrez/sluice/internal/expr"
 	"github.com/pauserratgutierrez/sluice/internal/hold"
 	"github.com/pauserratgutierrez/sluice/internal/hub"
 	"github.com/pauserratgutierrez/sluice/internal/metrics"
@@ -1185,16 +1186,28 @@ func (s *Server) handOver(sub *registry.Subscription, through uint64) (rest []hu
 // thousands that resume after a cut held tens of MiB while they waited for
 // their queues; with no admission to spread them, a node of 512 MB went past
 // its memory limit.
+//
+// A resume reads every change to its table since its position, so the
+// column's place and type are looked up once per version of the relation,
+// not per change: a lookup by name per change was most of a replay's cost.
+// The function keeps that state and is for one replay at a time.
 func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
 	col := sub.RoutingKey
 	if col == "" {
 		return nil
 	}
 	want := sub.Filter.Equalities[col].String()
+	var rel *pgoutput.Relation
+	var i int
+	var canonical bool
 	return func(e *hub.RingEntry) bool {
+		if e.Relation != rel {
+			rel, i = e.Relation, e.Relation.ColumnIndex(col)
+			canonical = i >= 0 && expr.TextIsCanonical(rel.Columns[i].TypeName)
+		}
 		known := false
 		for _, t := range [2]*pgoutput.Tuple{e.New, e.Old} {
-			if k, ok := (tupleRow{rel: e.Relation, t: t}).key(col); ok {
+			if k, ok := (tupleRow{rel: rel, t: t}).keyAt(i, canonical); ok {
 				if k == want {
 					return true
 				}

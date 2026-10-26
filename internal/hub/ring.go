@@ -2,6 +2,7 @@ package hub
 
 import (
 	"cmp"
+	"sort"
 	"sync"
 	"time"
 	"unsafe"
@@ -269,7 +270,13 @@ func (r *Rings) ReplayThrough(oid uint32, from uint64, match func(*RingEntry) bo
 		return nil, r.seq, false
 	}
 	if rg := r.rings[oid]; rg != nil {
-		for i := 0; i < rg.size; i++ {
+		// Entries are in commit order, so the scan starts at the first one at
+		// or after from instead of reading the whole buffer of a busy table. A
+		// reader reconnect appends again, in order, the transactions after the
+		// slot's position: whichever copy the search lands on, the rest of the
+		// buffer holds every change at or after from.
+		first := sort.Search(rg.size, func(i int) bool { return rg.at(i).LSN >= from })
+		for i := first; i < rg.size; i++ {
 			if e := rg.at(i); e.LSN >= from && (match == nil || match(e)) {
 				entries = append(entries, *e)
 			}
