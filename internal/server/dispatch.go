@@ -91,6 +91,29 @@ func (r tupleRow) keyAt(i int, canonical bool) (string, bool) {
 	return v.String(), ok
 }
 
+// routeKeys records a change's values of the columns its relation is routed
+// by, for the resume buffer to match replays against (routedTo).
+func routeKeys(rel *pgoutput.Relation, cols []string, newRow, oldRow tupleRow) hub.RouteKeys {
+	var rk hub.RouteKeys
+	for _, col := range cols {
+		i := rel.ColumnIndex(col)
+		if i < 0 {
+			continue
+		}
+		canonical := expr.TextIsCanonical(rel.Columns[i].TypeName)
+		var vals [2]string
+		n := 0
+		for _, row := range [2]tupleRow{newRow, oldRow} {
+			if k, ok := row.keyAt(i, canonical); ok {
+				vals[n] = k
+				n++
+			}
+		}
+		rk.Add(i, vals[:n]...)
+	}
+	return rk
+}
+
 // inPlace is a tuple's text as a string, without copying it (see tupleRow).
 func inPlace(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
@@ -330,10 +353,11 @@ func (s *Server) OnChange(m *pgoutput.Message, rel *pgoutput.Relation, commitLSN
 	// routed this change or finds it in the buffer when it replays. Not the
 	// revocation tables, which no shape may be on: nothing would replay them.
 	var seq uint64
-	if !s.revocationTable(rel.OID) {
-		seq = s.hub.Rings().Append(hub.RingEntry{
+	if rings := s.hub.Rings(); rings.Enabled() && !s.revocationTable(rel.OID) {
+		seq = rings.Append(hub.RingEntry{
 			LSN: commitLSN, CommitTime: commitTime, Op: m.Type,
 			Relation: rel, New: m.New, Old: m.Old, OldIsKey: m.OldIsKey,
+			Keys: routeKeys(rel, s.reg.RoutedColumns(rel.OID), newRow, oldRow),
 		})
 	}
 

@@ -679,3 +679,24 @@ func BenchmarkAppendAtBudget(b *testing.B) {
 		})
 	}
 }
+
+// A column's values are recorded whole or not at all: a replay that finds one
+// of them may rule a change out by them.
+func TestRouteKeysRecordAColumnWholeOrNotAtAll(t *testing.T) {
+	var rk RouteKeys
+	rk.Add(1, "a", "a")
+	if rk.RulesOut(1, RouteHash("a")) || !rk.RulesOut(1, RouteHash("b")) {
+		t.Fatal("column 1 holds a, and only a")
+	}
+	if rk.RulesOut(2, RouteHash("b")) {
+		t.Fatal("a column with no values recorded rules nothing out")
+	}
+	rk.Add(2, "x", "y")
+	if rk.RulesOut(2, RouteHash("x")) || rk.RulesOut(2, RouteHash("y")) || !rk.RulesOut(2, RouteHash("z")) {
+		t.Fatal("column 2 holds x and y")
+	}
+	rk.Add(3, "p", "q") // no room for both
+	if rk.RulesOut(3, RouteHash("z")) {
+		t.Fatal("a column that did not fit must leave the decision to the tuples")
+	}
+}

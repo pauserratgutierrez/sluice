@@ -141,6 +141,13 @@ type Registry struct {
 	// byStream lets a disconnect remove everything a stream held in O(subs).
 	byStream map[string]map[string]*Subscription
 
+	// routed lists, per relation, the columns subscriptions have been routed
+	// by. It only grows, so that the changes buffered while every stream is
+	// away, as in a reconnect of all of them, still carry their routing keys
+	// for the resumes (see RoutedColumns). A slice is never written once
+	// published.
+	routed map[uint32][]string
+
 	unindexedCount int
 }
 
@@ -148,7 +155,17 @@ func New() *Registry {
 	return &Registry{
 		rels:     map[uint32]*relIndex{},
 		byStream: map[string]map[string]*Subscription{},
+		routed:   map[uint32][]string{},
 	}
+}
+
+// RoutedColumns lists the columns subscriptions on a relation have been
+// routed by, whether or not any still is. The resume buffer keeps a hash of
+// each in every change it holds. The slice must not be modified.
+func (r *Registry) RoutedColumns(oid uint32) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.routed[oid]
 }
 
 // Add registers a subscription. Returns false if the stream already has a
@@ -195,6 +212,9 @@ func (r *Registry) indexRelLocked(s *Subscription) {
 	if byConst == nil {
 		byConst = map[string][]*Subscription{}
 		ri.byColumn[s.RoutingKey] = byConst
+		if cols := r.routed[s.Relation.OID]; !slices.Contains(cols, s.RoutingKey) {
+			r.routed[s.Relation.OID] = append(cols[:len(cols):len(cols)], s.RoutingKey)
+		}
 	}
 	byConst[key] = append(byConst[key], s)
 }

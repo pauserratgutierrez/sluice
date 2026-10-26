@@ -322,3 +322,27 @@ func ids(subs []*Subscription) []string {
 	}
 	return out
 }
+
+// The columns a relation was routed by outlive its subscriptions: changes
+// buffered while every stream is away still carry their keys for the resumes.
+func TestRoutedColumnsOutliveTheirSubscriptions(t *testing.T) {
+	r := New()
+	sink := &fakeSink{id: "s1"}
+	r.Add(sub(t, sink, "a", "owner_id=eq.7f3a"))
+	first := r.RoutedColumns(16400)
+	if len(first) != 1 || first[0] != "owner_id" {
+		t.Fatalf("routed columns %v, want [owner_id]", first)
+	}
+	r.Remove("s1", "a")
+	if got := r.RoutedColumns(16400); len(got) != 1 || got[0] != "owner_id" {
+		t.Fatalf("after the last subscription left: %v", got)
+	}
+	r.Add(sub(t, sink, "b", "title=eq.x"))
+	r.Add(sub(t, sink, "c", "owner_id=eq.9"))
+	if got := r.RoutedColumns(16400); len(got) != 2 || got[1] != "title" {
+		t.Fatalf("routed columns %v, want [owner_id title]", got)
+	}
+	if len(first) != 1 {
+		t.Fatal("a returned slice changed")
+	}
+}

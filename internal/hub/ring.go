@@ -2,6 +2,7 @@ package hub
 
 import (
 	"cmp"
+	"hash/maphash"
 	"sort"
 	"sync"
 	"time"
@@ -23,9 +24,70 @@ type RingEntry struct {
 	Old        *pgoutput.Tuple
 	OldIsKey   bool
 	At         time.Time
+	Keys       RouteKeys
 
 	size int    // bytes held, counted against the budget (SLUICE_RING_MEMORY)
 	seq  uint64 // append order across every ring
+}
+
+// RouteKeys holds, for the routing columns of a buffered change, a hash of the
+// column's value in each tuple that has one. A resume reads every change to
+// its table since its position, and after a cut thousands resume at once:
+// comparing hashes held in the buffer spares each of them reading the tuples
+// of the changes that are not for it. Measured before: in a reconnect of
+// 4,500 streams, reading the routing column of every change was half of
+// Sluice's CPU over that minute, and the reader waited 16 s in all for those
+// scans to release the buffer.
+//
+// Room for one or two columns, and both tuples' values when an UPDATE changes
+// one: 32 bytes per change.
+type RouteKeys struct {
+	hash [3]uint64
+	col  [3]int16 // each hash's column, by its place in the change's relation
+	n    uint8
+}
+
+var routeSeed = maphash.MakeSeed()
+
+// RouteHash is the hash RouteKeys hold for a routing key's text.
+func RouteHash(key string) uint64 { return maphash.String(routeSeed, key) }
+
+// Add records the value a column has in each of a change's tuples that has
+// one, one or two (the same value twice counts once). When they do not fit it
+// records neither, so a column it holds a value of has all of them.
+func (rk *RouteKeys) Add(col int, values ...string) {
+	if len(values) == 0 || len(values) > 2 {
+		return
+	}
+	hs, n := [2]uint64{RouteHash(values[0])}, 1
+	if len(values) == 2 {
+		if h := RouteHash(values[1]); h != hs[0] {
+			hs[1], n = h, 2
+		}
+	}
+	if int(rk.n)+n > len(rk.hash) {
+		return
+	}
+	for _, h := range hs[:n] {
+		rk.hash[rk.n], rk.col[rk.n] = h, int16(col)
+		rk.n++
+	}
+}
+
+// RulesOut reports whether the change holds col's values and none of them
+// hashes to h: then it is not for a shape whose routing constant hashes to h.
+// False means the tuples decide.
+func (rk *RouteKeys) RulesOut(col int, h uint64) bool {
+	held := false
+	for j := range rk.n {
+		if rk.col[j] == int16(col) {
+			if rk.hash[j] == h {
+				return false
+			}
+			held = true
+		}
+	}
+	return held
 }
 
 const (

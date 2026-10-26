@@ -28,7 +28,7 @@ In issuer mode a shape could receive changes while its holds were checked, and w
   - A change is checked once against each distinct hold filter: the shapes of a stream share one, which was checked once per shape.
   - The primary key is read only when a Tier C probe needs it, not for every change.
   - Columns are read without copying their text, routing keys are matched as the text PostgreSQL sent, and each relation's metrics are looked up once.
-  - A resumed shape's replay reads its table's changes from its position on, not the whole buffer, and finds its routing column once per table instead of once per change: from a buffer of 4,096 changes, 850 µs before, 75 after; from the last 1,024 of 131,072, 13 µs (`BenchmarkReplay`).
+  - A resumed shape's replay reads its table's changes from its position on, not the whole buffer, and passes over the changes that are not for it by a hash of their routing columns kept in the buffer (32 bytes per change), without reading their tuples: from a buffer of 4,096 changes, 850 µs before, 18 after (`BenchmarkReplay`).
 
 ### Added
 

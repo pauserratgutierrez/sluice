@@ -1187,9 +1187,10 @@ func (s *Server) handOver(sub *registry.Subscription, through uint64) (rest []hu
 // their queues; with no admission to spread them, a node of 512 MB went past
 // its memory limit.
 //
-// A resume reads every change to its table since its position, so the
-// column's place and type are looked up once per version of the relation,
-// not per change: a lookup by name per change was most of a replay's cost.
+// A resume reads every change to its table since its position. A change
+// whose buffered routing keys (hub.RouteKeys) rule the constant out is passed
+// over without reading its tuples; the others are decided on the tuples, with
+// the column's place and type looked up once per version of the relation.
 // The function keeps that state and is for one replay at a time.
 func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
 	col := sub.RoutingKey
@@ -1197,6 +1198,7 @@ func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
 		return nil
 	}
 	want := sub.Filter.Equalities[col].String()
+	h := hub.RouteHash(want)
 	var rel *pgoutput.Relation
 	var i int
 	var canonical bool
@@ -1204,6 +1206,9 @@ func routedTo(sub *registry.Subscription) func(*hub.RingEntry) bool {
 		if e.Relation != rel {
 			rel, i = e.Relation, e.Relation.ColumnIndex(col)
 			canonical = i >= 0 && expr.TextIsCanonical(rel.Columns[i].TypeName)
+		}
+		if e.Keys.RulesOut(i, h) {
+			return false
 		}
 		known := false
 		for _, t := range [2]*pgoutput.Tuple{e.New, e.Old} {

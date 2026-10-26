@@ -193,8 +193,10 @@ func BenchmarkReplay(b *testing.B) {
 				if i%400 == 0 {
 					u = me
 				}
-				rings.Append(hub.RingEntry{LSN: uint64(0x1000 + i), Op: pgoutput.MsgUpdate, Relation: rb.walMem,
-					Old: text("1", u, at), New: text("1", u, at)})
+				e := hub.RingEntry{LSN: uint64(0x1000 + i), Op: pgoutput.MsgUpdate, Relation: rb.walMem,
+					Old: text("1", u, at), New: text("1", u, at)}
+				e.Keys = routeKeys(rb.walMem, []string{"user_id"}, tupleRow{rb.walMem, e.New}, tupleRow{rb.walMem, e.Old})
+				rings.Append(e)
 			}
 			f, err := shape.Parse("user_id=eq."+me, rb.mem)
 			if err != nil {
