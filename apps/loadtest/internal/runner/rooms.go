@@ -608,8 +608,8 @@ func (e *engine) startTraffic() {
 }
 
 // roomWriter commits one message every LOAD_MSG_EVERY, from a random phase:
-// one INSERT and an UPDATE of every member's last_message_at, as one
-// transaction.
+// one INSERT and, with LOAD_MEMBER_UPDATES, an UPDATE of every member's
+// last_message_at, as one transaction.
 func (e *engine) roomWriter(r *room) {
 	ctx := e.trafficCtx
 	if !sleepCtx(ctx, time.Duration(rand.Int64N(int64(e.rc.MsgEvery)))) {
@@ -625,7 +625,9 @@ func (e *engine) roomWriter(r *room) {
 		b := &pgx.Batch{}
 		b.Queue(`insert into public.room_messages (room_id, seq, author_id, body, created_at) values ($1, $2, $3, $4, $5)`,
 			r.id, seq, author, "message body of a typical length for a chat, about sixty bytes", at)
-		b.Queue(`update public.room_members set last_message_at = $2 where room_id = $1`, r.id, at)
+		if e.rc.MemberUpdates {
+			b.Queue(`update public.room_members set last_message_at = $2 where room_id = $1`, r.id, at)
+		}
 		err := e.pool.SendBatch(ctx, b).Close()
 		e.lat.Record(latTxn, time.Since(at))
 		if err != nil {
@@ -636,7 +638,7 @@ func (e *engine) roomWriter(r *room) {
 		} else {
 			e.messages.Add(1)
 			e.expect[latMessage].Add(open)
-			if e.rc.Shapes >= 2 {
+			if e.rc.MemberUpdates && e.rc.Shapes >= 2 {
 				e.expect[latMember].Add(open)
 			}
 		}

@@ -24,6 +24,9 @@ type roomsConfig struct {
 	Classes        []roomClass   `json:"classes"`
 	Shapes         int           `json:"shapes"`
 	MsgEvery       time.Duration `json:"msg_every"`
+	// MemberUpdates makes each message also update every member's
+	// last_message_at (1 + N rows); without it a message is its one row.
+	MemberUpdates  bool          `json:"member_updates"`
 	TypingEvery    time.Duration `json:"typing_every"`
 	TypingEnabled  bool          `json:"typing_enabled"`
 	Duration       time.Duration `json:"duration"`
@@ -134,10 +137,13 @@ func (c roomsConfig) expectedRates() (changes, messages, members, typing float64
 	per := c.MsgEvery.Seconds()
 	for _, k := range c.Classes {
 		r := float64(k.Count)
-		changes += r * float64(1+k.Members) / per
+		changes += r / per
 		messages += r * float64(k.Streams) / per
-		if c.Shapes >= 2 {
-			members += r * float64(k.Streams) / per
+		if c.MemberUpdates {
+			changes += r * float64(k.Members) / per
+			if c.Shapes >= 2 {
+				members += r * float64(k.Streams) / per
+			}
 		}
 		if c.TypingEnabled && c.TypingEvery > 0 && k.Streams > 1 {
 			typing += float64(typistsUpTo(k.Typing, k.Count)) * float64(k.Streams-1) / c.TypingEvery.Seconds()
@@ -150,6 +156,7 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 	c := roomsConfig{
 		Shapes:          envInt("LOAD_SHAPES", 7),
 		MsgEvery:        envDur("LOAD_MSG_EVERY", 15*time.Second),
+		MemberUpdates:   envBool("LOAD_MEMBER_UPDATES", true),
 		TypingEvery:     envDur("LOAD_TYPING_EVERY", 2*time.Second),
 		TypingEnabled:   envBool("LOAD_TYPING_ENABLED", true),
 		Duration:        envDur("LOAD_DURATION", 10*time.Minute),

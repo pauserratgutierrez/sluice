@@ -604,7 +604,7 @@ func roomsMarkdown(r RoomsReport) string {
 	fmt.Fprintf(&b, "- **Verdict: %s**\n\n", verdict)
 
 	fmt.Fprintf(&b, "## Load\n\n")
-	fmt.Fprintf(&b, "| Rooms (count × members / streams / typing) | Shapes | Message every | Typing | Replica identity | Arrival | Duration |\n| --- | ---: | ---: | --- | --- | ---: | ---: |\n")
+	fmt.Fprintf(&b, "| Rooms (count × members / streams / typing) | Shapes | Message every | Member updates | Typing | Replica identity | Arrival | Duration |\n| --- | ---: | ---: | --- | --- | --- | ---: | ---: |\n")
 	var classes []string
 	for _, k := range r.Config.Classes {
 		classes = append(classes, fmt.Sprintf("%d × %d / %d / %g", k.Count, k.Members, k.Streams, k.Typing))
@@ -613,8 +613,12 @@ func roomsMarkdown(r RoomsReport) string {
 	if r.Config.TypingEnabled {
 		typing = "every " + r.Config.TypingEvery.String()
 	}
-	fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %s | %s |\n\n", strings.Join(classes, ", "), r.Config.Shapes,
-		r.Config.MsgEvery, typing, r.Config.ReplicaIdentity, r.Config.Arrival, r.Config.Duration)
+	memberUpdates := "off"
+	if r.Config.MemberUpdates {
+		memberUpdates = "every member"
+	}
+	fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %s | %s | %s |\n\n", strings.Join(classes, ", "), r.Config.Shapes,
+		r.Config.MsgEvery, memberUpdates, typing, r.Config.ReplicaIdentity, r.Config.Arrival, r.Config.Duration)
 	x := r.Expected
 	fmt.Fprintf(&b, "Expected with every stream open: %d streams, %.0f changes/s, %.0f events/s (%.0f messages, %.0f member updates, %.0f typing).\n\n",
 		x.Streams, x.ChangesPerSec, x.EventsPerSec, x.MessagesPerSec, x.MembersPerSec, x.TypingPerSec)

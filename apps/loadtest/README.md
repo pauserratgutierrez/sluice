@@ -148,6 +148,7 @@ Production-shaped profiles:
 | `LOAD_TOKEN_EVERY`, `LOAD_TOKEN_TTL` | `15m`, `1h` | `POST /token` per stream, from a random first offset; lifetime of each token |
 | `LOAD_CHURN` | `0` | share of the open streams ended and reopened every minute, chosen at random; each reopens as after any disconnect, with its resume positions |
 | `LOAD_REPLICA_IDENTITY` | `full` | `room_members`' replica identity: `full` or `pk` |
+| `LOAD_MEMBER_UPDATES` | `true` | each message also updates every member's `last_message_at` (1 + N rows); `false` writes the message alone |
 | `LOAD_BACKOFF` | `500ms,1s,2s,5s,10s` | the reconnect schedule (the SDK's default) |
 | `LOAD_SSE_BUFFER` | `16` | (capacity profiles) events a stream buffers in the runner |
 | `LOAD_STATS_EVERY` | `1m` | latency window of the timeline |

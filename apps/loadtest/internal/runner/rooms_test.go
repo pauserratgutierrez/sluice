@@ -59,15 +59,21 @@ func TestParseRoomClasses(t *testing.T) {
 
 func TestExpectedRates(t *testing.T) {
 	rc := roomsConfig{
-		Classes:     []roomClass{{Count: 5, Members: 80, Streams: 20, Typing: 0.5}},
-		Shapes:      7,
-		MsgEvery:    15 * time.Second,
-		TypingEvery: 2 * time.Second, TypingEnabled: true,
+		Classes:       []roomClass{{Count: 5, Members: 80, Streams: 20, Typing: 0.5}},
+		Shapes:        7,
+		MsgEvery:      15 * time.Second,
+		MemberUpdates: true,
+		TypingEvery:   2 * time.Second, TypingEnabled: true,
 	}
 	ch, msg, mem, typ := rc.expectedRates()
 	near := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 	if !near(ch, 5*81/15.0) || !near(msg, 5*20/15.0) || !near(mem, 5*20/15.0) || !near(typ, 2*19/2.0) {
 		t.Fatalf("rates = %v %v %v %v", ch, msg, mem, typ)
+	}
+	// Without member updates a message is its one row, and no member event.
+	rc.MemberUpdates = false
+	if ch, _, mem, _ := rc.expectedRates(); !near(ch, 5/15.0) || mem != 0 {
+		t.Fatalf("without member updates: changes %v, member events %v", ch, mem)
 	}
 }
 
