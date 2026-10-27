@@ -1,7 +1,0 @@
-# 0.8.2 candidate (fix/token-filter, f9b9864): /token asks the issuer about the requested shape. The same run as
-# p3-token-unicorn-1cpu (released 0.8.1): the unicorn at 1 CPU, tokens every 2 min, live heap after each GC.
-#
-#   docker build --build-arg VERSION=0.8.2-rc1 -t sluice:0.8.2-rc1 ../sluice-0.8.2
-#   scripts/queue.sh plans/v0.8.2.plan results/phase3/raw
-
-v082-token-unicorn-1cpu rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=10m LOAD_ARRIVAL=2m LOAD_TOKEN_EVERY=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:0.8.2-rc1 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

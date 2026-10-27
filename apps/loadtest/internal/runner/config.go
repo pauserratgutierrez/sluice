@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	Scenario string
+	Label    string // names the report
 	Axis     string // all | users | conns
 	Hunt     bool
 
@@ -44,6 +45,7 @@ type Config struct {
 func LoadConfig() Config {
 	c := Config{
 		Scenario:        envOr("LOAD_SCENARIO", "rls-a"),
+		Label:           envOr("LOAD_LABEL", ""),
 		Axis:            envOr("LOAD_AXIS", "all"),
 		SluiceURL:       strings.TrimRight(envOr("SLUICE_URL", "http://sluice-rls:4000/sluice/v1"), "/"),
 		DBURL:           envOr("LOAD_DB_URL", ""),
@@ -52,7 +54,7 @@ func LoadConfig() Config {
 		SlotName:        envOr("LOAD_SLOT", "load_rooms"),
 		PrivateJWK:      envOr("LOAD_PRIVATE_JWK", "/keys/private.jwk"),
 		ResultsDir:      envOr("LOAD_RESULTS", "/results"),
-		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.8.0"),
+		TargetImage:     envOr("SLUICE_IMAGE", "ghcr.io/pauserratgutierrez/sluice:0.11.0"),
 		Start:           envInt("LOAD_START", 100),
 		Cap:             envInt("LOAD_MAX_STREAMS", 0),
 		Granularity:     envInt("LOAD_GRANULARITY", 50),

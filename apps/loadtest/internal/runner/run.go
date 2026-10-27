@@ -77,6 +77,7 @@ func Main() error {
 	rep := Report{
 		Target:    cfg.TargetImage,
 		Scenario:  cfg.Scenario,
+		Label:     cfg.Label,
 		Host:      res,
 		Cap:       cfg.Cap,
 		StartedAt: time.Now().UTC(),

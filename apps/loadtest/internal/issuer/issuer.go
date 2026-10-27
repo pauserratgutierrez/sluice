@@ -81,10 +81,10 @@ type server struct {
 	queueMax int
 	gate     chan struct{}
 	hookTTL  int
-	// roomFirst writes membership holds as room_id=eq.R,user_id=eq.U. Sluice
-	// 0.8.1 indexes a hold by the first of its equally good columns (0.8.0 by
-	// either, at random), so this order puts every member of a room in one
-	// list; the default, user first, gives each member a list of their own.
+	// roomFirst writes membership holds as room_id=eq.R,user_id=eq.U. From
+	// 0.9.0 Sluice indexes a hold by the column with the shortest lists,
+	// whatever the order; on 0.8.1, which took the first of its equally good
+	// columns, this order put every member of a room in one list.
 	roomFirst bool
 
 	mu      sync.RWMutex

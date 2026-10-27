@@ -1,8 +1,0 @@
-# Phase 3, item 4: automatic admission by memory (branch phase3, 7ba330b). The unicorn's 12 000 streams offered
-# to 1 CPU and 512 MB with SLUICE_MAX_STREAMS=0: on 0.8.1 with a cap of 15 000 the process was killed for memory
-# 11 times (v081f-unicorn-1cpu-512m). Expected: streams admitted up to SLUICE_ADMIT_MEMORY, the rest refused, no kill.
-p3i4-unicorn-1cpu-512m rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=5m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-i4 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first
-
-# The same with admission measured on the memory floor (live heap + stacks + runtime) at the new default 0.5
-# (branch phase3, 3fd5f1c).
-p3i6-unicorn-1cpu-512m rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=5m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p3-i6 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

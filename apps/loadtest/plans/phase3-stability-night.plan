@@ -1,6 +1,0 @@
-# Phase 3: the long stability run, for a night (about 8 h 10 min). Same as phase3-stability.plan, with a cut
-# every hour and tokens every 15 min (the SDK's usual cadence) to see hours of uptime, not only renewals.
-#
-#   docker build --build-arg VERSION=0.9.0-rc7 -t sluice:p3-final7 .   # from the repository root, branch phase3
-#   scripts/queue.sh plans/phase3-stability-night.plan results/phase3/raw
-p3-stability-8h reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=8h LOAD_ARRIVAL=30s LOAD_TOKEN_EVERY=15m LOAD_CHURN=0.02 LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=1h LOAD_RECONNECT_EVERY=1h LOAD_RECONNECT_COUNT=7 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_IMAGE=sluice:p3-final7 SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

@@ -14,6 +14,7 @@ import (
 type Report struct {
 	Target          string         `json:"target"`
 	Scenario        string         `json:"scenario"`
+	Label           string         `json:"label,omitempty"`
 	Host            host.Resources `json:"host"`
 	Cap             int            `json:"stream_cap"`
 	MaxUsers        int            `json:"max_concurrent_users"`
@@ -27,8 +28,13 @@ func writeReport(dir, scenario string, r Report) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	stamp := r.FinishedAt.UTC().Format("20060102T150405Z")
-	base := fmt.Sprintf("%s-%s", scenario, stamp)
+	// The label is in the name, as in the production-shaped reports, so that
+	// scripts/queue.sh finds a run it already measured.
+	base := scenario
+	if r.Label != "" {
+		base += "-" + sanitize(r.Label)
+	}
+	base += "-" + r.FinishedAt.UTC().Format("20060102T150405Z")
 	jsonPath := filepath.Join(dir, base+".json")
 	mdPath := filepath.Join(dir, base+".md")
 	raw, err := json.MarshalIndent(r, "", "  ")
@@ -48,7 +54,11 @@ func writeReport(dir, scenario string, r Report) (string, error) {
 
 func markdown(r Report) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Sluice load-test — %s\n\n", r.Scenario)
+	fmt.Fprintf(&b, "# Sluice load-test — %s", r.Scenario)
+	if r.Label != "" {
+		fmt.Fprintf(&b, " — %s", r.Label)
+	}
+	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "- Target: `%s`\n", r.Target)
 	fmt.Fprintf(&b, "- Host: %.0f CPUs, %d MiB visible\n", r.Host.CPUs, r.Host.MemoryBytes/1024/1024)
 	fmt.Fprintf(&b, "- Stream cap (safety): %d\n", r.Cap)

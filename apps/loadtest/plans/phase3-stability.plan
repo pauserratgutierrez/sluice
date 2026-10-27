@@ -1,7 +1,0 @@
-# Phase 3: accelerated stability run before 0.9.0. The very high tier at the production limits (1 CPU, 512 MB,
-# automatic admission), tokens renewed every 2 min, 2% of the streams ended and reopened every minute, and one
-# network cut halfway (reconnect profile, through the proxy). The report compares Sluice's indexes and memory at
-# the start and end of the steady phase and lists the live heap after each collection.
-#
-#   scripts/queue.sh plans/phase3-stability.plan results/phase3/raw
-p3-stability-30m reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=30m LOAD_ARRIVAL=30s LOAD_TOKEN_EVERY=2m LOAD_CHURN=0.02 LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=15m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_IMAGE=sluice:p3-final SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first

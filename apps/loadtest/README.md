@@ -2,9 +2,9 @@
 
 An independent Docker app that load-tests a **published** Sluice image. It is not the `deploy/` harness and it does not import Sluice's Go module. It speaks the public protocol the way a product would: mint JWTs, `POST /stream`, insert rows, count SSE events, and (for signalling) `POST /publish`, `POST /presence`, and `pg_logical_emit_message`.
 
-Default target: [`ghcr.io/pauserratgutierrez/sluice:0.8.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) against `postgres:18.6-trixie`. `SLUICE_IMAGE` and `POSTGRES_IMAGE` point it at other tags, and `scripts/run.sh -l <profile>` builds the working tree and runs a profile against that.
+Default target: [`ghcr.io/pauserratgutierrez/sluice:0.11.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) against `postgres:18.6-trixie`. `SLUICE_IMAGE` and `POSTGRES_IMAGE` point it at other tags, and `scripts/run.sh -l <profile>` builds the working tree and runs a profile against that.
 
-**Sluice runs with a production container's limits by default:** 1 CPU (`SLUICE_CPUS`), 512 MB (`SLUICE_MEM_LIMIT`) and `SLUICE_MAX_STREAMS=5000`. The capacity hunts below were measured without those limits; to reproduce them, raise all three (for example `SLUICE_CPUS=16 SLUICE_MEM_LIMIT=6g SLUICE_MAX_STREAMS=50000`).
+**Sluice runs with a production container's limits by default:** 1 CPU (`SLUICE_CPUS`), 512 MB (`SLUICE_MEM_LIMIT`) and `SLUICE_MAX_STREAMS=5000`. To hunt for a ceiling past them, raise all three (for example `SLUICE_CPUS=16 SLUICE_MEM_LIMIT=6g SLUICE_MAX_STREAMS=50000`).
 
 ## Profiles
 
@@ -83,11 +83,11 @@ scripts/run.sh -e env/pin-20cpu.env rooms LOAD_LABEL=alto LOAD_ROOMS=20 LOAD_DUR
 
 Run **one profile at a time**. Each starts PostgreSQL, a JWKS server, the matching Sluice, and one runner; the issuer family also starts the issuer, and `reconnect` the proxy. Compose inlines every default; an optional `.env` next to `compose.yml` overrides them. `scripts/run.sh` also drops the load test's replication slots before starting Sluice, so a run never inherits WAL a previous one left undispatched.
 
-A series of runs is a plan, one run per line (`<label> <profile> [-e FILE] [VAR=value ...]`); `scripts/queue.sh` runs it in order into a results directory, skipping labels that already have a report, so an interrupted plan resumes where it stopped. [`plans/`](plans/) holds the ones the published results came from:
+A series of runs is a plan, one run per line (`<label> <profile> [-e FILE] [VAR=value ...]`); `scripts/queue.sh` runs it in order into a results directory, skipping labels that already have a report, so an interrupted plan resumes where it stopped. [`plans/characterization.plan`](plans/characterization.plan) is the one behind [Performance and sizing](../../docs/performance.md):
 
 ```bash
-scripts/queue.sh plans/phase2-tiers.plan results/phase2/raw
-docker compose run --rm --no-deps runner-rooms summarize /results/phase2/raw   # results/ is /results
+scripts/queue.sh plans/characterization.plan results/characterization
+docker compose run --rm --no-deps runner-rooms summarize /results/characterization   # results/ is /results
 ```
 
 `summarize` (also `go run ./cmd/loadtest summarize DIR...`) prints Markdown tables of the production-shaped reports in a directory, with the median of each label's repetitions (`-r1`, `-r2`, …): the steady phase, resume-buffer coverage, reconnect waves, big transactions and ramps.
@@ -128,7 +128,7 @@ Capacity profiles:
 | `LOAD_IDLE_HOLD` | `60s` | how long `idle` holds its streams open |
 | `LOAD_IDLE_SHAPES` | `5` | shapes per `idle` stream, besides its channel |
 | `LOAD_SAMPLE_EVERY` | `1s` (`5s` in the production-shaped profiles) | resource sampling interval |
-| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.8.0` | the target |
+| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.11.0` | the target |
 | `SLUICE_PULL_POLICY` | `missing` | `never` for a locally built image |
 
 Production-shaped profiles:
@@ -159,7 +159,7 @@ Production-shaped profiles:
 | `LOAD_ISSUER_LATENCY`, `LOAD_ISSUER_JITTER` | `5ms-20ms`, `0.2` | the issuer's (and hook's) answer time |
 | `LOAD_ISSUER_CONCURRENCY`, `LOAD_ISSUER_QUEUE_MAX` | `32`, `0` | calls served at once (0: no limit); queued calls before `503` (0: no bound) |
 | `LOAD_HOOK_TTL` | `0` | the hook's `ttl` |
-| `LOAD_HOLD_ORDER` | `user-first` | how membership holds are written: `user_id=eq.U,room_id=eq.R` (`user-first`) or `room_id=eq.R,user_id=eq.U` (`room-first`). From 0.8.1 Sluice indexes a hold by the first of its equally good columns, so `room-first` puts every member of a room in one list; 0.8.0 picks either column at random. Runs before this knob existed were `room-first` |
+| `LOAD_HOLD_ORDER` | `user-first` | how membership holds are written: `user_id=eq.U,room_id=eq.R` (`user-first`) or `room_id=eq.R,user_id=eq.U` (`room-first`). From 0.9.0 Sluice indexes a hold by the column with the shortest lists, whatever the order; 0.8.1 took the first of its equally good columns, and 0.8.0 either at random |
 | `LOAD_BIGTXN_ROWS` | `1500,10000,100000` | rows per commit |
 | `LOAD_BIGTXN_STREAMED` | `0.25` | fraction of the rows whose recipient has a stream |
 | `LOAD_BIGTXN_AFTER`, `LOAD_BIGTXN_EVERY`, `LOAD_BIGTXN_REPEAT` | `1m`, `2m`, `3` | first commit, spacing, commits per size |
@@ -188,71 +188,9 @@ LOAD_AXIS=users LOAD_MAX_STREAMS=2000 docker compose --profile rls-a up --build 
 
 ## Results
 
-Results are written to `results/` (`*.json` and `*.md`): the capacity profiles' steps, and for the production-shaped ones a summary, the verdict, and the whole timeline (one point every `LOAD_SAMPLE_EVERY`, one latency window every `LOAD_STATS_EVERY`, delivered events and issuer calls per second). Runs straight under `results/` stay out of git, and `scripts/run.sh` also keeps Sluice's log in `results/logs/`, which stays out too. A phase's runs that are kept (`results/phaseN/`) go in with their Markdown reports in clear and their JSON reports gzipped (`gzip -9n`, `*.json.gz`; `summarize` and `scripts/queue.sh` read them as they are). Profiles (`*.pprof`) stay out of git.
+Results are written to `results/` (`*.json` and `*.md`): the capacity profiles' steps, and for the production-shaped ones a summary, the verdict, and the whole timeline (one point every `LOAD_SAMPLE_EVERY`, one latency window every `LOAD_STATS_EVERY`, delivered events and issuer calls per second). Runs straight under `results/` stay out of git, and `scripts/run.sh` also keeps Sluice's log in `results/logs/`, which stays out too.
 
-### Resources: 0.3.0 against 0.4.0 (this machine, 2026-10-03)
-
-Same machine and runner, one profile at a time, fresh database each run, no container limits on Sluice. Memory per stream is measured from the fresh process (see [Capacity profiles](#capacity-profiles)).
-
-| Run | 0.3.0 | 0.4.0 |
-| --- | ---: | ---: |
-| `idle`, 1 shape + channel: memory per stream | 52 KiB | 37–41 KiB |
-| `idle`, 20 000 streams: peak RSS | 980 MiB | 783 MiB |
-| `idle`, 20 000 streams: CPU over the step | 14.1 s | 11.5 s |
-| `idle`, longest GC pause | 26 ms | 2.6 ms |
-| `idle`, 5 shapes + channel, 512 MB container: memory per stream | 66 KiB | 48 KiB |
-| … streams that fit without swap or GC pressure | about 6 000 | about 8 000 |
-| … opening 8 000 streams | 3.1 s (swapping) | 0.74 s |
-| `issuer`, 8 000 users: opening every stream | 1.12 s | 0.87 s |
-| `issuer`, 8 000 users: CPU per 1000 events | 150 ms | 135 ms |
-| `rls-a` fan-out to 16 000 connections, mean of 6: events/s | 152k | 157k |
-| … CPU per 1000 events | 83 ms | 77 ms |
-
-Fan-out throughput at 16 000 connections varies by ±20% between runs on this VM; the two are equal within that noise. Past about 10 000 streams in 512 MB 0.4.0 reaches its `GOMEMLIMIT` and spends CPU on collection instead of being OOM-killed, so a stream cap below that is the brake to set.
-
-### Results (0.1.4, this machine)
-
-Measured 2026-09-12 against `ghcr.io/pauserratgutierrez/sluice:0.1.4` in Docker Desktop on a Windows laptop (20 CPUs visible to the VM, ~6 GiB cgroup), without limits on Sluice. Bursts of 20 `INSERT`s, not a multi-minute soak. Delivery of **opened** streams was 100% on every step below; none were closed as `stream_lagging`.
-
-The numbers are **Sluice on this host**, not a product SLA. The hunt bar is ≥95% of streams *open*, so it can report a higher N than the last 100%-open point.
-
-#### Fan-out (1 user, N connections — one change, N subscribers)
-
-This is the design claim. Wall time stays flat until the machine is busy shipping SSE frames:
-
-| Subscribers | Wall (20 changes) | Events/s | p95 | Opened |
-| ---: | ---: | ---: | ---: | --- |
-| 100 | 406 ms | 4.9k | 269 ms | 100% |
-| 800 | 407 ms | 39k | 294 ms | 100% |
-| 1 600 | 408 ms | 78k | 284 ms | 100% |
-| 3 200 | 606 ms | 106k | 579 ms | 100% |
-| 12 000 | 2.0 s | 120k | 762 ms | 100% |
-| 16 000 | 2.6 s | 122k | 895 ms | 100% |
-| 28 000 | 5.0 s | 112k | 1.0 s | 100% |
-
-100–1 600: the wall time stays flat (~410 ms) and events/s scales with N. Past ~3 000 the cost is writing and flushing N sockets, not authorizing.
-
-#### Concurrent users (1 connection each — routed, not fan-out)
-
-| Profile | 100% open | Hunt (≥95% open) | Notes |
-| --- | ---: | ---: | --- |
-| RLS A | 28 000 | 29 700 | Opens stuck at **28 231** — Linux default ephemeral ports (`32768–60999`), a limit of the **runner**, not of Sluice. Those 28 231 still delivered 100%. |
-| RLS B | 1 500 (ladder top) | — | Not a max hunt. Fan-out 1 500: 74k events/s, p95 256 ms, wall 405 ms. |
-| RLS C | 200 (ladder top) | — | p95 1.75 s, ~1.9k events/s. Impersonated probes; this is the slow path on purpose. |
-| Issuer | 16 000 users | 16 350 | Failures above that are **join denies** (issuer HTTP + hold `EXISTS`), not lost events. Fan-out 16 000 conns: 100% delivery, ~114k events/s. Hunt on conns: 17 100. |
-
-#### Signalling (same machine, same image, 2026-09-13)
-
-Ladders, not hunts. 100% open and 100% delivery at every step.
-
-| Profile | Top of ladder | What 100% means | Wall / p95 at the top |
-| --- | --- | --- | --- |
-| Broadcast | 1 500 users and 1 500 conns | 20 client publishes **and** 20 `pg_logical_emit_message` each reach every stream (60k + 60k events at 1 500) | ~0.7 s / p95 286–346 ms; ~81–83k events/s combined |
-| Presence | 800 users (1 conn) | Every roster converges after `track()`, then half disconnect and the rest see the leaves | ~1.5 s (one coalescing tick). Events/s here is members / wait, not a flood. |
-| Mixed | 1 500 users and 1 500 conns | 20 `INSERT`s **and** 20 publishes on the **same** SSE stream, no `stream_lagging` | Fan-out 1 500: 81k events/s, p95 326 ms |
-| Kick | 200 issuer users | One change, then `DELETE` the hold → `shape_not_authorized` on every stream | ~0.8 s / p95 378 ms |
-
-Broadcast from the database matches the client path at these sizes: no outbox table, same fan-out. Presence is deliberately not a throughput race — diffs are coalesced (~1.5 s), which is why 800 members settle in one tick rather than 800×800 messages.
+The runs behind [Performance and sizing](../../docs/performance.md) are kept in [`results/characterization/`](results/characterization/), with their Markdown reports in clear and their JSON reports gzipped (`gzip -9n`, `*.json.gz`; `summarize` and `scripts/queue.sh` read them as they are). Profiles (`*.pprof`) stay out of git. A new characterization replaces them; earlier ones are in the history.
 
 ## Stack
 
@@ -282,7 +220,7 @@ The capacity profiles' schema ([`sql/01-schema.sql`](sql/01-schema.sql)) is a sm
 compose.yml          profiles + shared YAML anchors
 Dockerfile           one binary: jwks | issuer | proxy | run | summarize
 env/                 core layouts (cpusets) for a 20-vCPU and a 4-vCPU machine
-plans/               the series of runs behind the published results (scripts/queue.sh)
+plans/               the series of runs behind docs/performance.md (scripts/queue.sh)
 scripts/run.sh       run one profile, keep Sluice's log, take the stack down
 scripts/queue.sh     run a plan in order, resumable
 scripts/build-pprof.sh  build sluice:pprof from the working tree
@@ -294,7 +232,7 @@ internal/proxy       the TCP proxy that drops connections on command
 internal/dockerapi   container stats and restart over the Docker socket
 internal/sse         SSE parsing
 internal/authn       ES256 minting
-results/             run reports (local)
+results/             run reports (local); characterization/ is kept
 ```
 
 `go test ./...` covers the SSE parser, JWT mint, Prometheus scrape, presence diffs, the hunt search, the latency histogram, the room configuration and the issuer's rules. It does not start Sluice; the compose profiles are the real tests.

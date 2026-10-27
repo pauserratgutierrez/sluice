@@ -47,9 +47,10 @@ x-loadtest: &loadtest
 x-runner-env: &runner-env
   LOAD_PRIVATE_JWK: /keys/private.jwk
   LOAD_RESULTS: /results
+  LOAD_LABEL: ${LOAD_LABEL:-}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loadtest-pg}
   SLUICE_ISSUER_BEARER: ${SLUICE_ISSUER_BEARER:-loadtest-issuer}
-  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.8.0}
+  SLUICE_IMAGE: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.11.0}
   LOAD_DB_URL: postgres://postgres:${POSTGRES_PASSWORD:-loadtest-pg}@db:5432/postgres
   ISSUER_URL: http://issuer:8080
   LOAD_AXIS: ${LOAD_AXIS:-all}
@@ -71,7 +72,6 @@ x-runner-env: &runner-env
 # default (README.md lists them).
 x-rooms-env: &rooms-env
   <<: *runner-env
-  LOAD_LABEL: ${LOAD_LABEL:-}
   LOAD_SEED: ${LOAD_SEED:-}
   LOAD_ROOMS: ${LOAD_ROOMS:-}
   LOAD_ROOM_MEMBERS: ${LOAD_ROOM_MEMBERS:-}
@@ -128,7 +128,7 @@ x-rooms-env: &rooms-env
   POSTGRES_SYNCHRONOUS_COMMIT: ${POSTGRES_SYNCHRONOUS_COMMIT:-on}
   SLUICE_GOMAXPROCS: ${SLUICE_GOMAXPROCS:-}
   SLUICE_RING_MEMORY: ${SLUICE_RING_MEMORY:-0.1}
-  SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-60s}
+  SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-30s}
   LOAD_SLOT: load_rooms
   # Recorded in the report; the containers' limits are set below.
   SLUICE_CPUS: ${SLUICE_CPUS:-1}
@@ -204,7 +204,7 @@ x-runner-rooms: &runner-rooms
   networks: [loadtest]
 
 x-sluice: &sluice
-  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.8.0}
+  image: ${SLUICE_IMAGE:-ghcr.io/pauserratgutierrez/sluice:0.11.0}
   pull_policy: ${SLUICE_PULL_POLICY:-missing}
   restart: unless-stopped
   logging: *default-logging
@@ -423,7 +423,7 @@ services:
       SLUICE_STREAM_QUEUE: ${SLUICE_STREAM_QUEUE:-256}
       SLUICE_WRITE_TIMEOUT: ${SLUICE_WRITE_TIMEOUT:-10s}
       SLUICE_RING_MEMORY: ${SLUICE_RING_MEMORY:-0.1}
-      SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-60s}
+      SLUICE_RING_MAX_AGE: ${SLUICE_RING_MAX_AGE:-30s}
       SLUICE_STATUS_INTERVAL: ${SLUICE_STATUS_INTERVAL:-10s}
       SLUICE_METRICS_ENABLED: "true"
       SLUICE_DIAGNOSTICS_ENABLED: "true"

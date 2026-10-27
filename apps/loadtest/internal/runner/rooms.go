@@ -81,13 +81,13 @@ type engine struct {
 	expect [nLat]atomic.Int64
 	meter  atomic.Int64 // events delivered since the last second tick
 
-	liveClients  atomic.Int64
-	firstReady   atomic.Int64
-	openAttempts atomic.Int64
-	openFails    atomic.Int64
+	liveClients     atomic.Int64
+	firstReady      atomic.Int64
+	openAttempts    atomic.Int64
+	openFails       atomic.Int64
 	refusedCapacity atomic.Int64
-	messages     atomic.Int64
-	publishes    atomic.Int64
+	messages        atomic.Int64
+	publishes       atomic.Int64
 
 	ctr counters
 

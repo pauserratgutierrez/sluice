@@ -21,9 +21,9 @@ type roomClass struct {
 // roomsConfig drives the production-shaped profiles: rooms, bigtxn,
 // reconnect and calibrate.
 type roomsConfig struct {
-	Classes        []roomClass   `json:"classes"`
-	Shapes         int           `json:"shapes"`
-	MsgEvery       time.Duration `json:"msg_every"`
+	Classes  []roomClass   `json:"classes"`
+	Shapes   int           `json:"shapes"`
+	MsgEvery time.Duration `json:"msg_every"`
 	// MemberUpdates makes each message also update every member's
 	// last_message_at (1 + N rows); without it a message is its one row.
 	MemberUpdates  bool          `json:"member_updates"`
@@ -183,7 +183,7 @@ func loadRoomsConfig(scenario string) (roomsConfig, error) {
 
 		ProbeEvery: envDur("LOAD_PROBE_EVERY", 2*time.Minute),
 		RingMemory: envFloat("SLUICE_RING_MEMORY", 0.1),
-		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", time.Minute),
+		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", 30*time.Second),
 
 		ProbeDerivedWindow: time.Minute,
 

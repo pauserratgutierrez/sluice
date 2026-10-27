@@ -1,0 +1,77 @@
+# The characterization of Sluice 0.11.0 behind docs/performance.md, on a
+# 14-core laptop with the core layout of env/pin-20cpu.env. Run with
+#   scripts/queue.sh plans/characterization.plan results/characterization
+#
+# Images, built before the queue starts (nothing is compiled while a run
+# measures):
+#   docker build --target runner -t sluice:<tag> .   (from the repository root)
+#   scripts/build-pprof.sh                           (sluice:pprof)
+# Each run names the local image it ran with. To characterize a release, point
+# SLUICE_IMAGE at its published image instead.
+#
+# Exploratory, on main at bee4bc8, before the resume buffer by time: a CPU
+# profile of the whole process at the unicorn on 1 CPU, and the refill at the
+# admission threshold with the buffer by events (the comparison for the
+# buffer by time).
+p4-pprof-unicorn-1cpu rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=10m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never SLUICE_PPROF_ADDR=0.0.0.0:6060 LOAD_PPROF_AT=4m LOAD_PPROF_SECONDS=60s
+p4-refill reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+#
+# The steady characterization, on main at d38471e (sluice:p4-main), with the
+# resume buffer at 60 s. The commits after it change what a resume costs, add
+# 32 bytes to each buffered change and keep 30 s by default.
+#
+# The unicorn (12,000 streams, 2,320 changes/s) on 1 CPU and 4 GB: CPU per
+# change and per event, latency, memory per stream, the resume probe.
+p4-unicorn-1cpu rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_DURATION=10m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# The very high tier (1,500 streams, 337 changes/s) at production limits
+# (1 CPU, 512 MB): REPLICA IDENTITY FULL against the primary key, and the
+# message as its one row against 1 + N rows.
+p4-veryhigh-full rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=10m LOAD_ARRIVAL=30s SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-veryhigh-pk rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=10m LOAD_ARRIVAL=30s LOAD_REPLICA_IDENTITY=pk SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-veryhigh-nomembers rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=10m LOAD_ARRIVAL=30s LOAD_MEMBER_UPDATES=false SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# Changes per second against CPUs: the unicorn's 12,000 streams with a message
+# every 7.5, 5 and 3 s (4,640, 6,960 and 11,600 changes/s) on 1 CPU, the last
+# two on 2. The unicorn's own run is the 15-s point.
+p4-rate-1cpu-x2 rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_MSG_EVERY=7500ms LOAD_DURATION=6m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rate-1cpu-x3 rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_MSG_EVERY=5s LOAD_DURATION=6m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rate-1cpu-x5 rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_MSG_EVERY=3s LOAD_DURATION=6m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rate-2cpu-x3 rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_MSG_EVERY=5s LOAD_DURATION=6m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_CPUS=2 SLUICE_CPUSET=2-5 SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rate-2cpu-x5 rooms -e env/pin-20cpu.env LOAD_ROOM_MIX=380:80:28:0.24,16:250:85:1 LOAD_MSG_EVERY=3s LOAD_DURATION=6m LOAD_ARRIVAL=2m SLUICE_MAX_STREAMS=15000 SLUICE_MEM_LIMIT=4g SLUICE_CPUS=2 SLUICE_CPUSET=2-5 SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# Memory per open, quiet stream (7 shapes and a hook channel), in steps of
+# 3,000 up to 15,000.
+p4-idle-ramp ramp -e env/pin-20cpu.env LOAD_ROOM_MIX=600:80:25:0 LOAD_MSG_EVERY=0 LOAD_TYPING_ENABLED=false LOAD_RAMP_STEP=3000 LOAD_RAMP_HOLD=60s LOAD_RAMP_SETTLE=15s LOAD_RAMP_ARRIVAL=30s SLUICE_MAX_STREAMS=16000 SLUICE_MEM_LIMIT=4g SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# RLS mode, by tier: A (a constant), B (in-process evaluation), C (a query per
+# subscriber per change). Their reports are rls-<tier>-<time>: the capacity
+# profiles named reports by scenario alone until this load test.
+p4-rls-a rls-a -e env/pin-20cpu.env SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rls-b rls-b -e env/pin-20cpu.env SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+p4-rls-c rls-c -e env/pin-20cpu.env SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# Big transactions (1,500, 10,000 and 100,000 rows) beside the high tier.
+p4-bigtxn-high bigtxn -e env/pin-20cpu.env LOAD_ROOM_MIX=14:80:25:0.3,1:200:50:1 LOAD_ARRIVAL=30s LOAD_BIGTXN_ROWS=1500,10000,100000 LOAD_BIGTXN_REPEAT=3 LOAD_BIGTXN_EVERY=2m LOAD_BIGTXN_AFTER=1m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+#
+# Reconnects with the buffer by time: the refill at the admission threshold
+# (1 CPU, 512 MB, 6,000 streams offered, a cut of the proxy), and the cut at
+# the very high tier.
+#
+# On d38471e (sluice:p4-main): each resume read the whole buffer of its table.
+p4-refill-r1 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-refill-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-resume-veryhigh reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=8m LOAD_ARRIVAL=30s LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-main SLUICE_PULL_POLICY=never
+# On b2f457c (sluice:p4-fix): a replay reads from its position. Twice, the
+# very high tier, the refill with half the memory share and with half the age,
+# and a CPU profile of the refill from 10 s before the cut (diagnosis only).
+p4-fix-refill-r1 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-fix SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-fix-refill-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-fix SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-fix-resume-veryhigh reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=8m LOAD_ARRIVAL=30s LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-fix SLUICE_PULL_POLICY=never
+p4-fix-refill-mem005 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_RING_MEMORY=0.05 SLUICE_IMAGE=sluice:p4-fix SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-fix-refill-age30 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_RING_MAX_AGE=30s SLUICE_IMAGE=sluice:p4-fix SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-fix-pprof-refill reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PULL_POLICY=never SLUICE_PPROF_ADDR=0.0.0.0:6060 LOAD_PPROF_AT=3m50s LOAD_PPROF_SECONDS=60s LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+# On 320dff3 (sluice:p4-keys): buffered changes carry a hash of their routing
+# keys, as released. 0.11.0 keeps 30 s by default, as p4-keys-refill-age30
+# did; the others kept 60 s. Twice, the very high tier, the refill with 30 s,
+# and a profile of the refill.
+p4-keys-refill-r1 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-keys SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-keys-refill-r2 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-keys SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-keys-resume-veryhigh reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=50:80:25:0.3,5:200:50:1 LOAD_DURATION=8m LOAD_ARRIVAL=30s LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:p4-keys SLUICE_PULL_POLICY=never
+p4-keys-refill-age30 reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_RING_MAX_AGE=30s SLUICE_IMAGE=sluice:p4-keys SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
+p4-keys-pprof-refill reconnect -e env/pin-20cpu.env LOAD_ROOM_MIX=190:80:28:0.24,8:250:85:1 LOAD_DURATION=8m LOAD_ARRIVAL=2m LOAD_RECONNECT_MODE=cut LOAD_RECONNECT_AFTER=4m LOAD_RECONNECT_COUNT=1 LOAD_PROXY_DOWN=5s SLUICE_MAX_STREAMS=0 SLUICE_MEM_LIMIT=512m SLUICE_IMAGE=sluice:pprof SLUICE_PPROF_ADDR=0.0.0.0:6060 LOAD_PPROF_AT=3m50s LOAD_PPROF_SECONDS=60s SLUICE_PULL_POLICY=never LOAD_HOLD_ORDER=user-first LOAD_ISSUER_SHAPE_LATENCY=2ms
