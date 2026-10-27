@@ -51,6 +51,7 @@ Current behavior that is deliberate or accepted for now, with its consequence.
 
 - A bus between processes (for example NATS), with control requests forwarded to the process that owns a stream (the stream id already carries the node id).
 - Presence across processes, which needs reconciliation between nodes.
+- Route changes on more than the reader goroutine. One slot's changes are decoded and routed in commit order on one goroutine, so its ceiling is one core's. In the load test's largest mix that work is about 3–4 µs per change, about 5% of the process's CPU at 2,300 changes a second ([docs/performance.md](docs/performance.md)): far from the ceiling, so not worth its ordering problems yet.
 
 ### Deferred on purpose
 

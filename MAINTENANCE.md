@@ -57,3 +57,5 @@ If you ever create a different package name: publish once from a machine with `n
 The release workflows run `go vet`, `go test -race` and the SDK's `npm test`, but not the harness suites. Run them by hand first (see [Development and testing](README.md#development-and-testing)): `cmd/smoke`, `cmd/smoke-issuer`, `cmd/audit` and `packages/sluice-js/test/live.mjs`.
 
 Add the version's entry to [CHANGELOG.md](CHANGELOG.md), with anything that changes behavior for clients or hook endpoints called out.
+
+Point the load test's default image (`SLUICE_IMAGE` in [`apps/loadtest/compose.yml`](apps/loadtest/compose.yml) and its README) at the version being tagged. When the version changes what Sluice costs, run [`plans/characterization.plan`](apps/loadtest/plans/characterization.plan) again and update [docs/performance.md](docs/performance.md) with it.

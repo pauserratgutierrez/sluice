@@ -18,6 +18,7 @@ It is built to replace `supabase/realtime` in a self-hosted stack. It is not pro
 - [Session revocation](#session-revocation)
 - [Delivery guarantees and backpressure](#delivery-guarantees-and-backpressure)
 - [Operating it](#operating-it)
+- [Performance](#performance)
 - [Security model](#security-model)
 - [Configuration reference](#configuration-reference)
 - [Clients](#clients)
@@ -523,6 +524,15 @@ Work that no request started has no request ID, and Sluice does not make one up.
 
 Sluice does not log tokens, bearer secrets, claims, payloads, presence `meta` or row data. Lines name what a request asked for (a table, a channel, a subscription label, a stream id) and a revoked session's id. Strings the client chose are cut to 256 bytes.
 
+## Performance
+
+Measured on 1 CPU with the load test's chat workload, in issuer mode with 7 shapes and a channel per stream:
+- 12,000 streams and 2,300 changes a second at 0.19 cores, with a message p95 of 7 ms;
+- 11,400 changes a second at 0.36 cores;
+- 55–65 KiB of live heap per quiet stream.
+
+[Performance and sizing](docs/performance.md) has the figures, how they were measured and how to size a node. [Designing tables for realtime](docs/realtime-design.md) turns them into rules for schemas and shapes: the cost follows the changes in the WAL, not the events delivered.
+
 ## Security model
 
 - **Tokens.** The algorithm is pinned (`SLUICE_JWT_ALG`, ES256 or RS256; HS256 is not offered), `exp` is required, the `role` must be in `SLUICE_ALLOWED_ROLES` (see below for tokens without one), `iss` is checked when `SLUICE_JWT_ISSUER` is set, and `aud` for tokens that have a `sub`. `sb_*` opaque keys are refused. The JWKS is refetched every `SLUICE_JWKS_REFRESH` (checked on the catalog tick), on `POST /admin/jwks/refresh`, and when a token names an unknown `kid`, at most once every 10 seconds.
@@ -679,6 +689,7 @@ internal/timer      the shared heartbeat wheel
 internal/metrics    Prometheus collectors
 internal/event      wire event types
 deploy/             compose harness, database bootstrap and fixtures, Caddy, env template
+docs/               performance and sizing; designing tables for realtime
 packages/sluice-js  TypeScript client
 apps/loadtest       independent load test of a published image
 ```
