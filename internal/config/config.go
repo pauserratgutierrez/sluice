@@ -172,7 +172,7 @@ func Load() (*Config, error) {
 		MessagePrefix: env("SLUICE_MESSAGE_PREFIX", "sluice:"),
 
 		RingMemory: envFloat("SLUICE_RING_MEMORY", 0.1),
-		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", 60*time.Second),
+		RingMaxAge: envDur("SLUICE_RING_MAX_AGE", 30*time.Second),
 
 		JWKSURL:      env("SLUICE_JWKS_URL", ""),
 		JWKSRefresh:  envDur("SLUICE_JWKS_REFRESH", 5*time.Minute),

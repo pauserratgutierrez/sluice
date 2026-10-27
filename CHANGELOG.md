@@ -4,7 +4,7 @@ One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`)
 
 ## 0.11.0
 
-In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed, and the holds of a request are checked in one round trip. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. The resume buffer keeps 60 s of every table within a share of memory (breaking for its configuration), and the reader does half the work per change. Tested with PostgreSQL 18.6.
+In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed, and the holds of a request are checked in one round trip. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. The resume buffer keeps 30 s of every table within a share of memory (breaking for its configuration), so busy tables resume too, and the reader does half the work per change. Tested with PostgreSQL 18.6.
 
 ### Fixed
 
@@ -20,15 +20,16 @@ In issuer mode a shape could receive changes while its holds were checked, and w
 
 - Issuer mode: **the holds of a request are checked in one round trip**, each distinct hold once however many shapes name it. A stream opening, `POST /subscribe` and `POST /token` made one `EXISTS` per hold of each shape, one after another. The load test's streams, whose 7 shapes are held by the same row, made 7 per open and per renewal, about 40,000 in a reconnect of 5,770 streams; they now make one each. A missing hold row still refuses only the shapes it holds.
 - **Breaking, configuration: the resume buffer keeps changes by time, within a share of memory.** It kept the last `SLUICE_RING_EVENTS` (4,096) changes of each table, which on a busy table reached back seconds: about 2 s at 2,300 changes a second, and in the load test's 8-hour run 44% of the resumes of a table taking 337 a second came back `resumed: false`, each a client reading its state again.
-  - It now keeps every table's changes for `SLUICE_RING_MAX_AGE` (60 s), within `SLUICE_RING_MEMORY` (new; default `0.1`) of the Go memory limit, 64 MiB when none is known. Past that budget it removes the oldest change of any table, so every busy table reaches back as far as the others, and it keeps each table's newest transaction while anything else is left.
+  - It now keeps every table's changes for `SLUICE_RING_MAX_AGE` (30 s; removed on the catalog tick after, so 30–60 s), within `SLUICE_RING_MEMORY` (new; default `0.1`) of the Go memory limit, 64 MiB when none is known. Past that budget it removes the oldest change of any table, so every busy table reaches back as far as the others, and it keeps each table's newest transaction while anything else is left.
   - `SLUICE_RING_EVENTS` and `SLUICE_RING_MAX_BYTES` are gone. `SLUICE_RING_MEMORY=0` disables the buffer, as `SLUICE_RING_EVENTS=0` did, and needs `SLUICE_SNAPSHOT_ENABLED=false`.
-  - The buffer's memory counts toward admission like the rest of the live heap: estimated from about half a KiB per change, 60 s at 337 changes a second hold about 10 MiB; at 2,300 a second the budget of a 512 MB container decides, at about 40 s.
+  - The buffer's memory counts toward admission like the rest of the live heap. Measured on 1 CPU and 512 MB with a table taking 1,150 changes a second: 30 s of buffer held 17 MiB, and admission let in 4,900 streams of the load test where a buffer of 2 MiB let in 5,770; with 60 s, 34 MiB and 4,460.
+  - In a reconnect of every one of those streams, all of them resumed, where the table taking 1,150 changes a second had read its state again; the node was full again within 10 s of the cut, as before.
   - Changes to the revocation tables are no longer kept: no shape may be on them.
 - **The reader does half the work per change.** One message of the load test's largest mix (12,000 streams of 7 shapes, each shape held by its member's row), dispatched on one core: 9.4 µs per change before, 4.1 after, with 31 allocations instead of 68 (`BenchmarkRoomMessage`).
   - A change is checked once against each distinct hold filter: the shapes of a stream share one, which was checked once per shape.
   - The primary key is read only when a Tier C probe needs it, not for every change.
   - Columns are read without copying their text, routing keys are matched as the text PostgreSQL sent, and each relation's metrics are looked up once.
-  - A resumed shape's replay reads its table's changes from its position on, not the whole buffer, and passes over the changes that are not for it by a hash of their routing columns kept in the buffer (32 bytes per change), without reading their tuples: from a buffer of 4,096 changes, 850 µs before, 18 after (`BenchmarkReplay`).
+  - A resumed shape's replay reads its table's changes from its position on, not the whole buffer, and passes over the changes that are not for it by a hash of their routing columns kept in the buffer (32 bytes per change), without reading their tuples: from a buffer of 4,096 changes, 850 µs before, 18 after (`BenchmarkReplay`). Without that, a reconnect of 4,500 streams that all resumed a table taking 1,150 changes a second spent half its CPU reading the buffer, and live changes waited seconds behind it.
 
 ### Added
 
