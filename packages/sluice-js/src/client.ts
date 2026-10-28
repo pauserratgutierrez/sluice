@@ -383,22 +383,12 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
       body: JSON.stringify(body),
     })
     const text = await res.text()
-    let parsed: Record<string, unknown> = {}
+    if (!res.ok) throw refusal(res, text)
     try {
-      if (text) parsed = JSON.parse(text) as Record<string, unknown>
+      return text ? (JSON.parse(text) as Record<string, unknown>) : {}
     } catch {
-      // A proxy error page, not a Sluice response; reported by status below.
-      if (res.ok) throw new SluiceError({ code: 'bad_response', message: 'the server did not return JSON', retryable: true })
+      throw new SluiceError({ code: 'bad_response', message: 'the server did not return JSON', retryable: true })
     }
-    if (!res.ok) {
-      throw new SluiceError({
-        code: (parsed.error as string) ?? `http_${res.status}`,
-        message: (parsed.message as string) ?? res.statusText,
-        retryable: res.status >= 500 || res.status === 429,
-        retry_after_ms: retryAfterMs(res),
-      })
-    }
-    return parsed
   }
 
   /**
@@ -446,15 +436,9 @@ export class SluiceClient<DB extends GenericDatabase = AnyDatabase> {
             signal: abort.signal,
           })
 
-          if (!res.ok || !res.body) {
-            const text = await res.text().catch(() => '')
-            throw new SluiceError({
-              code: `http_${res.status}`,
-              message: text || res.statusText,
-              // 401 means the token is wrong, not that the server is busy.
-              retryable: res.status !== 401 && res.status !== 403,
-              retry_after_ms: retryAfterMs(res),
-            })
+          if (!res.ok) throw refusal(res, await res.text().catch(() => ''))
+          if (!res.body) {
+            throw new SluiceError({ code: 'bad_response', message: 'the stream response has no body', retryable: true })
           }
 
           this.attempt = 0
@@ -654,6 +638,27 @@ export function createClient<DB extends GenericDatabase = AnyDatabase>(
 }
 
 export type { ShapeSubscription }
+
+/**
+ * The error for a request the server refused: the code and message it sent,
+ * or the HTTP status for a body that is not Sluice's (a proxy's error page).
+ * A 4xx other than 408 and 429 is the request's own fault: sending it again
+ * gets the same answer.
+ */
+function refusal(res: Response, text: string): SluiceError {
+  let body: { error?: string; message?: string } | null = null
+  try {
+    body = JSON.parse(text) as { error?: string; message?: string } | null
+  } catch {
+    // Reported by its status below.
+  }
+  return new SluiceError({
+    code: body?.error ?? `http_${res.status}`,
+    message: body?.message ?? res.statusText,
+    retryable: res.status >= 500 || res.status === 408 || res.status === 429,
+    retry_after_ms: retryAfterMs(res),
+  })
+}
 
 /**
  * The delay a 429 or 503 asked for in `Retry-After` (seconds or an HTTP date),

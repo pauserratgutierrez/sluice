@@ -167,7 +167,7 @@ const sluice = createClient<Database>(url, {
 })
 ```
 
-**Reconnection is automatic.** A server that refuses the stream for capacity (`429`, or `503 too_many_streams`), or because it is not replicating yet (`503 not_replicating`), is retried after the longer of the `Retry-After` it sends (plus up to a tenth at random) and the current backoff step, so a refusal that lasts is retried less and less often; other failures back off over `backoff` (default 0.5, 1, 2, 5 and 10 s, each with full jitter). The client keeps a resume position per table — the last commit LSN it saw there, or the position the server gave when the table's shapes went live — and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). Each shape then gets `onLive` with `resumed: true`. If the server no longer has that position (it restarted, or you were away too long), `onLive` says `resumed: false`: read the current state again, or, for a shape whose state you hold from its changes, discard it and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, instead of its own backoff, before reconnecting.
+**Reconnection is automatic.** A server that refuses the stream for capacity (`429`, or `503 too_many_streams`), or because it is not replicating yet (`503 not_replicating`), is retried after the longer of the `Retry-After` it sends (plus up to a tenth at random) and the current backoff step, so a refusal that lasts is retried less and less often; other failures back off over `backoff` (default 0.5, 1, 2, 5 and 10 s, each with full jitter). The client keeps a resume position per table — the last commit LSN it saw there, or the position the server gave when the table's shapes went live — and resumes from it, so changes missed while disconnected are replayed (the last transaction you saw may arrive again). Each shape then gets `onLive` with `resumed: true`. If the server no longer has that position (it restarted, or you were away too long), `onLive` says `resumed: false`: read the current state again, or, for a shape whose state you hold from its changes, discard it and subscribe again, for example with `withInitialSnapshot()`. A server that is shutting down ends the stream with `server_shutdown` and a `retry_after_ms`; the client waits that long, or its backoff step if that is longer, before reconnecting.
 
 **Status.** `onStatusChange` and `.connectionStatus` report `idle` (nothing is subscribed, or the tab is hidden), `connecting`, `open`, `delayed` (the stream is up but the server is behind the database, so changes arrive late; back to `open` when they are on time), `reconnecting` (the stream dropped or an attempt to open it failed) and `closed` (`close()` was called, or the server refused the stream). A stream the server ends on purpose, such as `token_expired` or `server_shutdown`, goes to `connecting`, not `reconnecting`: `reconnecting` always means the connection is failing.
 
@@ -213,11 +213,14 @@ Subscription errors go to that subscription's `onError`; stream errors go to the
 | `resume_too_old` | the buffer no longer reaches an initial snapshot's floor; resnapshot |
 | `snapshot_failed` | the initial snapshot failed (retryable) |
 | `stream_lagging` | the client did not keep up; the stream reconnects with a resume |
-| `server_shutdown` | the server is restarting; the stream reconnects after `retryAfterMs`, with a resume |
+| `server_shutdown` | the server is restarting; the stream reconnects with a resume, after the longer of `retryAfterMs` and its backoff |
 | `token_expired` | the token expired; the stream closed |
 | `session_revoked`, `user_banned` | the identity was revoked; the stream closed |
-| `http_401`, `http_403` | the stream request was refused; the client stops retrying |
-| `http_503` | the server is full, shutting down, or could not check the session; the client retries |
+| `unauthorized` | opening the stream was refused for its token (invalid, expired, or its session signed out); the client stops retrying, and `setAuth` reconnects it |
+| `too_many_streams`, `not_replicating` | the server is full, or not replicating yet; the client retries after its `Retry-After` |
+| `session_check_unavailable` | the server could not check the token's session; the client retries |
+| `bad_request` | the server could not read the stream request; the client stops retrying |
+| `http_<status>` | a response that is not Sluice's, such as a proxy's error page; the client retries a `5xx`, `408` or `429` and stops on any other |
 
 The full list is in the main README's [event reference](../../README.md#events).
 

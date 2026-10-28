@@ -2,6 +2,15 @@
 
 One version number covers the server image (`ghcr.io/pauserratgutierrez/sluice`) and the SDK (`@pauserratgutierrez/sluice-js`).
 
+## 0.12.0
+
+The SDK reports a refused stream by the code the server sent (breaking for code that matched `http_503`), and stops on a refusal that sending the request again would not change.
+
+### Changed
+
+- **Breaking, SDK: a refused stream reports the server's code.** The client's `onError` got `http_<status>` for every refusal of `POST /stream`, with the response body as its message: `too_many_streams`, `not_replicating`, `server_shutdown` and `session_check_unavailable` all read `http_503`, and a bad token and a signed-out session both `http_401`. It now gets the `error` and `message` the server sent, as control requests already did. A response that is not Sluice's, such as a proxy's error page, is still `http_<status>`, with the status text as its message.
+  - Opening the stream is retried after a `5xx`, `408` or `429` only. Any other `4xx` stops the client, as `401` and `403` did; a `400 bad_request`, which a stream request over 1 MiB gets, was retried forever. A control request's error is retryable on the same statuses, `408` included.
+
 ## 0.11.0
 
 In issuer mode a shape could receive changes while its holds were checked, and was refused only after; it now receives nothing before they are confirmed, and the holds of a request are checked in one round trip. Sluice warns before its slot is lost, naming the transaction that holds it, and tells clients when changes arrive late. The resume buffer keeps 30 s of every table within a share of memory (breaking for its configuration), so busy tables resume too, and the reader does half the work per change. Tested with PostgreSQL 18.6.

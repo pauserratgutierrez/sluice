@@ -459,11 +459,12 @@ test('a shutdown error sets the delay before the reconnect', async () => {
 
 test('a stream refused with 503 and Retry-After waits that long before trying again', async () => {
   const opened: number[] = []
+  const errors: string[] = []
   const client = createClient<Database>('https://example.test/sluice/v1', {
     accessToken: 'tok',
     pauseWhenHidden: false,
     backoff: [1],
-    onError: () => {},
+    onError: (e) => errors.push(`${e.code}: ${e.message}`),
     fetch: async () => {
       opened.push(Date.now())
       if (opened.length === 1) {
@@ -480,6 +481,34 @@ test('a stream refused with 503 and Retry-After waits that long before trying ag
   await live
   assert.equal(opened.length, 2)
   assert.ok(opened[1]! - opened[0]! >= 990, `retried after ${opened[1]! - opened[0]!} ms, want the 1 s Retry-After asked for`)
+  assert.deepEqual(errors, ['too_many_streams: near its memory limit'])
+  client.close()
+})
+
+// The server's code says why, where the status alone does not: four refusals
+// share 503. A proxy's error page has only its status.
+test('a refused stream reports the server code, or the status of a page that is not Sluice', async () => {
+  const errors: { code: string; message: string; retryable: boolean }[] = []
+  let calls = 0
+  const client = createClient<Database>('https://example.test/sluice/v1', {
+    accessToken: 'tok',
+    pauseWhenHidden: false,
+    backoff: [1],
+    onError: (e) => errors.push({ code: e.code, message: e.message, retryable: e.retryable }),
+    fetch: async () => {
+      if (++calls === 1) return new Response('<html>502 Bad Gateway</html>', { status: 502, statusText: 'Bad Gateway' })
+      return new Response('{"error":"bad_request","message":"unexpected EOF"}', { status: 400 })
+    },
+  })
+  await client.from('documents').as('s1').on('*', () => {}).subscribe().catch(() => {})
+  await new Promise((r) => setTimeout(r, 30))
+  assert.deepEqual(errors, [
+    { code: 'http_502', message: 'Bad Gateway', retryable: true },
+    // Sent again, the same request gets the same answer: the client stops.
+    { code: 'bad_request', message: 'unexpected EOF', retryable: false },
+  ])
+  assert.equal(calls, 2)
+  assert.equal(client.connectionStatus, 'closed')
   client.close()
 })
 
