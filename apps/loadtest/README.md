@@ -2,7 +2,7 @@
 
 An independent Docker app that load-tests a **published** Sluice image. It is not the `deploy/` harness and it does not import Sluice's Go module. It speaks the public protocol the way a product would: mint JWTs, `POST /stream`, insert rows, count SSE events, and (for signalling) `POST /publish`, `POST /presence`, and `pg_logical_emit_message`.
 
-Default target: [`ghcr.io/pauserratgutierrez/sluice:0.11.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) against `postgres:18.6-trixie`. `SLUICE_IMAGE` and `POSTGRES_IMAGE` point it at other tags, and `scripts/run.sh -l <profile>` builds the working tree and runs a profile against that.
+Default target: [`ghcr.io/pauserratgutierrez/sluice:0.12.0`](https://github.com/pauserratgutierrez/sluice/pkgs/container/sluice) against `postgres:18.6-trixie`. `SLUICE_IMAGE` and `POSTGRES_IMAGE` point it at other tags, and `scripts/run.sh -l <profile>` builds the working tree and runs a profile against that.
 
 **Sluice runs with a production container's limits by default:** 1 CPU (`SLUICE_CPUS`), 512 MB (`SLUICE_MEM_LIMIT`) and `SLUICE_MAX_STREAMS=5000`. To hunt for a ceiling past them, raise all three (for example `SLUICE_CPUS=16 SLUICE_MEM_LIMIT=6g SLUICE_MAX_STREAMS=50000`).
 
@@ -128,7 +128,7 @@ Capacity profiles:
 | `LOAD_IDLE_HOLD` | `60s` | how long `idle` holds its streams open |
 | `LOAD_IDLE_SHAPES` | `5` | shapes per `idle` stream, besides its channel |
 | `LOAD_SAMPLE_EVERY` | `1s` (`5s` in the production-shaped profiles) | resource sampling interval |
-| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.11.0` | the target |
+| `SLUICE_IMAGE` | `ghcr.io/pauserratgutierrez/sluice:0.12.0` | the target |
 | `SLUICE_PULL_POLICY` | `missing` | `never` for a locally built image |
 
 Production-shaped profiles:
